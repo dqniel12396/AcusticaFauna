@@ -1,0 +1,23 @@
+{
+  "input_csv": "manifests\\boana_boans_pugnax_v1_scored_by_frog_detector_taxfixed.csv",
+  "output_csv": "manifests\\boana_boans_pugnax_v3_quality045_manifest.csv",
+  "rows_before": 840,
+  "rows_after": 398,
+  "min_frog_score": 0.45,
+  "min_duration": 1.0,
+  "max_per_class": null,
+  "balance_strategy": "min_class",
+  "count_by_class_before": {
+    "Boana_pugnax": 425,
+    "Boana_boans": 415
+  },
+  "count_by_class_after": {
+    "Boana_boans": 199,
+    "Boana_pugnax": 199
+  },
+  "discarded_by_score_low": 375,
+  "discarded_by_error": 0,
+  "discarded_by_duration": 23,
+  "discarded_by_excluded_label": 0,
+  "discarded_by_not_species_or_genus": 0
+}

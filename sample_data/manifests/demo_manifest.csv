@@ -1,0 +1,2 @@
+audio_path,normalized_label,split,duration_seconds,notes
+sample_data/audios/coloque_aqui_su_audio.wav,demo,train,0,Reemplace por un audio propio

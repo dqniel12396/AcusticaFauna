@@ -1,0 +1,12 @@
+name: frog_detector_v1
+description: Detector experimental general rana_sapo vs ruido/background desde manifest balanceado.
+target_mode: multiclass
+recommended_manifest: frog_detector_v1_included.csv
+clip_duration: 5.0
+sample_rate: 32000
+batch_size: 16
+epochs: 5
+device: auto
+notes:
+  - general_detector_v1 actual tiene ave_general con pocos ejemplos; evitar entrenamiento de 3 clases hasta balancear aves.
+  - Para detector binario inicial usar rana_sapo y otros_ruidos, o crear una version sin ave_general.

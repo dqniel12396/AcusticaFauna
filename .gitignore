@@ -1,0 +1,88 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv*/
+venv/
+env/
+.env
+.env.*
+!.env.example
+
+# Node
+node_modules/
+dist/
+dist-ssr/
+.vite/
+*.local
+
+# Logs/temp
+logs/
+*.log
+tmp/
+*.tmp
+
+# Local data and audio
+data/
+dataset_curado/
+**/dataset_curado/
+Articulos/
+Birdnet/
+ESC-50-master/
+PROYECTOGIT/
+pruebas de audio/
+segmentos entrenamiento-*/
+videos/
+wetransfer_*/
+dataset_ranas-*/
+models/
+storage/audio_lab/uploads/
+storage/audio_lab/clips/
+storage/audio_lab/processed/
+storage/audio_lab/batch_jobs/
+storage/audio_lab/quality_reports/
+storage/audio_lab/logs/
+*.wav
+*.flac
+*.mp3
+*.ogg
+*.m4a
+
+# Backend generated storage
+acusticafauna-General/acusticafauna-Back/backend/storage/
+
+# ML generated/heavy artifacts
+acusticafauna-ML/outputs/
+acusticafauna-ML/ml_runs/
+acusticafauna-ML/models/
+acusticafauna-ML/tmp/
+acusticafauna-ML/manifests/*.csv
+acusticafauna-ML/manifests/clean/
+*.model
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.pkl
+
+# Keep lightweight release scaffolding
+!sample_data/**
+!docs/**
+!acusticafauna-ML/manifests/
+!acusticafauna-ML/manifests/README.md
+!acusticafauna-ML/manifests/.gitkeep
+!acusticafauna-ML/manifests/clean/
+!acusticafauna-ML/manifests/clean/.gitkeep
+!acusticafauna-ML/models/
+!acusticafauna-ML/models/.gitkeep
+!acusticafauna-ML/outputs/
+!acusticafauna-ML/outputs/.gitkeep
+!acusticafauna-ML/ml_runs/
+!acusticafauna-ML/ml_runs/.gitkeep
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json

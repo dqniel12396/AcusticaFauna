@@ -1,0 +1,15 @@
+# Dependencias opcionales para entrenamiento ML.
+# No instalar en el entorno del backend FastAPI.
+opensoundscape==0.12.1
+fastapi>=0.110
+uvicorn>=0.29
+python-multipart>=0.0.9
+pandas>=2.2,<3
+numpy>=1.24
+scikit-learn>=1.3
+PyYAML>=6.0
+torch>=2.0
+torchvision>=0.15
+tqdm>=4.66
+soundfile>=0.12
+matplotlib>=3.8

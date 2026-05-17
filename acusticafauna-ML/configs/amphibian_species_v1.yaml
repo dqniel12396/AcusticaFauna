@@ -1,0 +1,13 @@
+name: amphibian_species_v1
+description: Clasificador experimental multiclase de especies anfibias desde dataset versionado incluido.
+target_mode: multiclass
+recommended_manifest: amphibian_species_v1_included.csv
+clip_duration: 5.0
+sample_rate: 32000
+batch_size: 16
+epochs: 5
+device: auto
+notes:
+  - No usar dataset_v0_1 directamente para entrenamiento final.
+  - Conserva normalized_label como especie.
+  - Incluye otros_ruidos como background controlado si viene en el manifest incluido.

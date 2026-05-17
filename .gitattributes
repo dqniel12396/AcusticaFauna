@@ -1,0 +1,8 @@
+# Optional Git LFS patterns for releases that decide to track models with LFS.
+# Install/configure Git LFS before enabling model files in Git history.
+*.model filter=lfs diff=lfs merge=lfs -text
+*.pt filter=lfs diff=lfs merge=lfs -text
+*.pth filter=lfs diff=lfs merge=lfs -text
+*.ckpt filter=lfs diff=lfs merge=lfs -text
+*.onnx filter=lfs diff=lfs merge=lfs -text
+*.pkl filter=lfs diff=lfs merge=lfs -text

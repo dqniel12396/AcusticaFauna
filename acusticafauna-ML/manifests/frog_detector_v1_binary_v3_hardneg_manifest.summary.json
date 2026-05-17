@@ -1,0 +1,20 @@
+{
+  "total_base": 3000,
+  "total_base_after_excluding_previous_test_hard_negatives": 2891,
+  "total_hard_negatives_unique_added": 109,
+  "hard_negative_weight": 2,
+  "total_output": 3109,
+  "total_train_val_test": {
+    "train": 2318,
+    "val": 450,
+    "test": 341
+  },
+  "count_by_label": {
+    "otros_ruidos": 1609,
+    "rana_sapo": 1500
+  },
+  "duplicate_paths_avoided": 0,
+  "base_rows_replaced_as_hard_negatives": 109,
+  "exclude_from_test": true,
+  "note": "sample_weight se conserva como metadato; este pipeline OpenSoundscape usa oversampling por duplicacion en train."
+}
