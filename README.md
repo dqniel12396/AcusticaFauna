@@ -39,6 +39,17 @@ repo/
 
 ## Instalacion rapida
 
+Windows recomendado (Git Bash, ruta corta fuera de OneDrive):
+
+```bash
+cd /c
+git clone https://github.com/dqniel12396/AcusticaFauna.git AcusticaFauna
+cd /c/AcusticaFauna
+python scripts/doctor_install.py
+python scripts/create_local_dirs.py
+bash scripts/setup_gitbash.sh
+```
+
 PowerShell:
 
 ```powershell
@@ -103,13 +114,14 @@ Si un modelo falta, la ML API lo reporta como `modelo no descargado` y no rompe 
 ## Diagnostico
 
 ```bash
+python scripts/doctor_install.py
 python scripts/check_environment.py
 python scripts/preflight_github.py
 ```
 
 ## Documentacion
 
-- [Instalacion local](acusticafauna-General/docs/INSTALACION_LOCAL.md)
+- [Instalacion local](docs/INSTALACION_LOCAL.md)
 - [Modelos y datos](acusticafauna-General/docs/MODELOS_Y_DATOS.md)
 - [Estructura del proyecto](acusticafauna-General/docs/ESTRUCTURA_PROYECTO.md)
 - [Recursos hardware](acusticafauna-General/docs/RECURSOS_HARDWARE.md)

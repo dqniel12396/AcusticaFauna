@@ -12,12 +12,13 @@ python scripts/create_local_dirs.py
 $Backend = Join-Path $Root "acusticafauna-General/acusticafauna-Back/backend"
 $Ml = Join-Path $Root "acusticafauna-ML"
 $Frontend = Join-Path $Root "acusticafauna-General/acusticafauna-frontend"
+$BackendVenv = Join-Path $Backend ".venv-backend"
 
-if (!(Test-Path "$Backend/.venv")) {
-  python -m venv "$Backend/.venv"
+if (!(Test-Path $BackendVenv)) {
+  python -m venv $BackendVenv
 }
-& "$Backend/.venv/Scripts/python.exe" -m pip install -U pip
-& "$Backend/.venv/Scripts/python.exe" -m pip install -r "$Backend/requirements.txt"
+& "$BackendVenv/Scripts/python.exe" -m pip install -U pip
+& "$BackendVenv/Scripts/python.exe" -m pip install -r "$Backend/requirements.txt"
 
 if (!(Test-Path "$Ml/.venv-ml")) {
   python -m venv "$Ml/.venv-ml"

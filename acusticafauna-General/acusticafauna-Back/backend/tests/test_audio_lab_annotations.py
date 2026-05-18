@@ -336,7 +336,7 @@ def test_audio_lab_batch_processing_clean_existing_and_full_auto(client, tmp_pat
     old_ml_url = settings.ML_API_BASE_URL
     settings.ML_API_BASE_URL = "http://127.0.0.1:9"
     quality_dir = settings.STORAGE_DIR / "audio_lab" / "quality_reports"
-    assert not quality_dir.exists()
+    assert not list(quality_dir.glob("*.quality.json"))
     try:
         quality = client.post(
             "/api/audio-lab/audio-processing/quality-report",

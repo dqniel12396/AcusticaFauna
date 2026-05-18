@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import platform
 import shutil
 import socket
 import subprocess
@@ -10,9 +11,21 @@ from hardware_profile import detect_hardware_profile
 from paths import BACKEND_DIR, FRONTEND_DIR, LOCAL_DIRS, ML_ROOT, REPO_ROOT
 
 
-def status(label: str, ok: bool, detail: str = "") -> None:
-    prefix = "OK" if ok else "WARNING"
-    print(f"{prefix}: {label}{' - ' + detail if detail else ''}")
+BACKEND_VENV = BACKEND_DIR / ".venv-backend"
+ML_VENV = ML_ROOT / ".venv-ml"
+RECOMMENDED_PATHS = "C:\\AcusticaFauna o F:\\AcusticaFauna"
+
+
+def status(level: str, label: str, detail: str = "") -> None:
+    print(f"{level}: {label}{' - ' + detail if detail else ''}")
+
+
+def ok(label: str, detail: str = "") -> None:
+    status("OK", label, detail)
+
+
+def warning(label: str, detail: str = "") -> None:
+    status("WARNING", label, detail)
 
 
 def command_version(command: str, args: list[str]) -> str | None:
@@ -32,23 +45,100 @@ def port_open(port: int, host: str = "127.0.0.1") -> bool:
         return sock.connect_ex((host, port)) == 0
 
 
+def is_windows() -> bool:
+    return platform.system().lower() == "windows"
+
+
+def venv_python_candidates(venv_dir: Path) -> list[Path]:
+    if is_windows():
+        return [venv_dir / "Scripts" / "python.exe"]
+    return [venv_dir / "bin" / "python"]
+
+
+def venv_pip_candidates(venv_dir: Path) -> list[Path]:
+    if is_windows():
+        return [venv_dir / "Scripts" / "pip.exe"]
+    return [venv_dir / "bin" / "pip"]
+
+
+def executable_exists(candidates: list[Path]) -> bool:
+    return any(path.exists() for path in candidates)
+
+
+def check_venv(label: str, venv_dir: Path) -> None:
+    if not venv_dir.exists():
+        warning(f"venv {label}", f"no existe: {venv_dir}")
+        return
+    if not executable_exists(venv_python_candidates(venv_dir)):
+        warning(f"venv {label}", f"incompleto: falta Python en {venv_dir}")
+        return
+    if not executable_exists(venv_pip_candidates(venv_dir)):
+        warning(f"venv {label}", f"incompleto: falta pip en {venv_dir}")
+        return
+    ok(f"venv {label}", str(venv_dir))
+
+
+def model_items(models_dir: Path) -> list[Path]:
+    if not models_dir.exists():
+        return []
+    ignored = {".gitkeep", "README.md"}
+    return [path for path in models_dir.iterdir() if path.name not in ignored]
+
+
+def check_path() -> None:
+    root = str(REPO_ROOT)
+    ok("ruta actual", root)
+    if "onedrive" in root.lower():
+        warning("OneDrive detectado", f"para ML usa una ruta corta como {RECOMMENDED_PATHS}")
+    if len(root) > 80:
+        warning("ruta larga", f"{len(root)} caracteres; recomendado: {RECOMMENDED_PATHS}")
+
+
+def check_python() -> None:
+    version = sys.version_info
+    ok("Python", sys.version.split()[0])
+    if version >= (3, 13):
+        warning("Python 3.13 o superior", "para ML se recomienda Python 3.11")
+
+
 def main() -> int:
     print("AcusticaFauna - diagnostico local")
-    status("Python", True, sys.version.split()[0])
-    status("Node", shutil.which("node") is not None, command_version("node", ["--version"]) or "no encontrado")
-    status("npm", shutil.which("npm") is not None, command_version("npm", ["--version"]) or "no encontrado")
-    status("Backend dir", BACKEND_DIR.exists(), str(BACKEND_DIR))
-    status("Frontend dir", FRONTEND_DIR.exists(), str(FRONTEND_DIR))
-    status("ML root", ML_ROOT.exists(), str(ML_ROOT))
-    status(".env", (REPO_ROOT / ".env").exists(), "usa .env.example si falta")
+    check_path()
+    check_python()
+
+    node_version = command_version("node", ["--version"])
+    npm_version = command_version("npm", ["--version"])
+    ok("Node", node_version) if node_version else warning("Node", "no encontrado")
+    ok("npm", npm_version) if npm_version else warning("npm", "no encontrado")
+
+    ok("Backend dir", str(BACKEND_DIR)) if BACKEND_DIR.exists() else warning("Backend dir", str(BACKEND_DIR))
+    ok("Frontend dir", str(FRONTEND_DIR)) if FRONTEND_DIR.exists() else warning("Frontend dir", str(FRONTEND_DIR))
+    ok("ML root", str(ML_ROOT)) if ML_ROOT.exists() else warning("ML root", str(ML_ROOT))
+
+    env_path = REPO_ROOT / ".env"
+    if env_path.exists():
+        ok(".env", str(env_path))
+    else:
+        warning(".env", "falta; copia .env.example a .env")
+
+    check_venv("Backend", BACKEND_VENV)
+    check_venv("ML", ML_VENV)
+
     for path in LOCAL_DIRS:
-        status(f"carpeta {path.relative_to(REPO_ROOT)}", path.exists(), str(path))
+        label = f"carpeta {path.relative_to(REPO_ROOT)}"
+        ok(label, str(path)) if path.exists() else warning(label, "falta; ejecuta python scripts/create_local_dirs.py")
+
     for port in (8000, 8010, 5173):
-        status(f"puerto {port}", not port_open(port), "libre" if not port_open(port) else "en uso")
+        in_use = port_open(port)
+        ok(f"puerto {port}", "libre") if not in_use else warning(f"puerto {port}", "en uso")
 
     models_dir = ML_ROOT / "models"
-    model_dirs = [p for p in models_dir.iterdir() if p.is_dir()] if models_dir.exists() else []
-    status("modelos descargados", bool(model_dirs), f"{len(model_dirs)} carpeta(s)")
+    models = model_items(models_dir)
+    if models:
+        ok("modelos descargados", f"{len(models)} item(s) en {models_dir}")
+    else:
+        warning("modelos descargados", f"faltan modelos en {models_dir}; ejecuta python scripts/download_models.py --list")
+
     print("Perfil hardware:", detect_hardware_profile())
     return 0
 
