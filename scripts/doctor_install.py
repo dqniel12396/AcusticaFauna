@@ -13,7 +13,7 @@ from paths import BACKEND_DIR, FRONTEND_DIR, LOCAL_DIRS, ML_ROOT, REPO_ROOT
 BACKEND_VENV = BACKEND_DIR / ".venv-backend"
 ML_VENV = ML_ROOT / ".venv-ml"
 RECOMMENDED_PATHS = "C:\\AcusticaFauna o F:\\AcusticaFauna"
-PYTHON311_URL = "https://www.python.org/downloads/release/python-3110/"
+PYTHON311_URL = "https://www.python.org/downloads/windows/"
 LONG_PATHS_COMMAND = (
     'New-ItemProperty -Path "HKLM:\\SYSTEM\\CurrentControlSet\\Control\\FileSystem" '
     '-Name "LongPathsEnabled" -Value 1 -PropertyType DWORD -Force'
@@ -54,6 +54,12 @@ def command_version(command: str, args: list[str]) -> str | None:
         return output[0] if output else "detectado"
     except Exception as exc:
         return f"detectado, pero no se pudo ejecutar: {exc}"
+
+
+def python311_launcher_version() -> str | None:
+    if not is_windows():
+        return None
+    return command_version("py", ["-3.11", "--version"])
 
 
 def port_open(port: int, host: str = "127.0.0.1") -> bool:
@@ -119,11 +125,21 @@ def check_path(reporter: Reporter) -> None:
 
 def check_python(reporter: Reporter) -> None:
     reporter.ok("Python", sys.version.split()[0])
+    if is_windows():
+        py311 = python311_launcher_version()
+        if py311:
+            reporter.ok("Python 3.11.x via py -3.11", py311)
+        else:
+            reporter.error(
+                "No se detecto Python 3.11.x. Para AcusticaFauna ML se recomienda Python 3.11.x.",
+                "py -3.11 --version no funciona",
+                f"instala Python 3.11.x desde {PYTHON311_URL}. Busca una version 3.11.x y descarga Windows installer (64-bit). No instales Python 3.13 para este proyecto salvo que sepas lo que haces.",
+            )
     if sys.version_info >= (3, 13):
         reporter.warning(
-            "Python 3.13 detectado. Para AcusticaFauna ML se recomienda Python 3.11.",
-            "dependencias como torch, opensoundscape, librosa, numba, llvmlite y soundfile son mas estables con Python 3.11",
-            f"instala Python 3.11 desde {PYTHON311_URL}",
+            "Python 3.13 detectado. Para AcusticaFauna ML se recomienda Python 3.11.x.",
+            "dependencias como torch, opensoundscape, librosa, numba, llvmlite y soundfile son mas estables con Python 3.11.x",
+            f"instala Python 3.11.x desde {PYTHON311_URL}",
         )
 
 
@@ -243,7 +259,7 @@ def main() -> int:
     reporter = Reporter()
     print("AcusticaFauna - doctor de instalacion")
     if is_windows():
-        print("Camino recomendado: PowerShell + HTTPS + Python 3.11")
+        print("Camino recomendado: PowerShell + HTTPS + Python 3.11.x")
         print("Git Bash/SSH son opcionales.")
     check_path(reporter)
     check_python(reporter)

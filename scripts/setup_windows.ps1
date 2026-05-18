@@ -1,7 +1,7 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $PSScriptRoot
-$Python311Url = "https://www.python.org/downloads/release/python-3110/"
+$Python311Url = "https://www.python.org/downloads/windows/"
 
 Write-Host "Instalacion Windows detectada."
 Write-Host "Este script esta pensado para PowerShell."
@@ -14,33 +14,44 @@ function Get-AcusticaFaunaPython {
   if ($pyLauncher) {
     $py311 = & py -3.11 --version 2>$null
     if ($LASTEXITCODE -eq 0) {
-      Write-Host "Usando Python 3.11 via py -3.11: $py311"
+      Write-Host "Usando Python 3.11.x via py -3.11: $py311"
       return @{ Command = "py"; Args = @("-3.11") }
     }
   }
 
+  Write-Warning "No se encontro Python 3.11.x."
+  Write-Host "Instala Python 3.11.x desde:"
+  Write-Host $Python311Url
+  Write-Host "Busca una version 3.11.x y descarga Windows installer (64-bit)."
+
   $python = Get-Command python -ErrorAction SilentlyContinue
   if (!$python) {
-    throw "Python no esta instalado o no esta en PATH. Instala Python 3.11 desde $Python311Url y abre una nueva terminal."
+    throw "No se encontro Python 3.11.x. Instala Python 3.11.x desde: $Python311Url Busca una version 3.11.x y descarga Windows installer (64-bit)."
   }
 
   $versionText = & python -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}')" 2>$null
   if ($LASTEXITCODE -ne 0) {
-    throw "No se pudo ejecutar Python. Instala Python 3.11 desde $Python311Url y abre una nueva terminal."
+    throw "No se pudo ejecutar Python. Instala Python 3.11.x desde: $Python311Url Busca una version 3.11.x y descarga Windows installer (64-bit)."
   }
 
   $parts = $versionText.Split(".")
   $major = [int]$parts[0]
   $minor = [int]$parts[1]
   if ($major -gt 3 -or ($major -eq 3 -and $minor -ge 13)) {
-    Write-Warning "Python 3.13 no es recomendado para ML. Instala Python 3.11."
+    Write-Warning "Python 3.13 no es recomendado para ML. Instala Python 3.11.x."
     Write-Host "Descarga recomendada: $Python311Url"
     if ($env:ACUSTICAFAUNA_ALLOW_PYTHON_313 -ne "1") {
       $answer = Read-Host "Deseas continuar de todas formas? [y/N]"
       if ($answer -notin @("y", "Y", "yes", "YES")) {
-        throw "Instalacion cancelada. Instala Python 3.11 o define ACUSTICAFAUNA_ALLOW_PYTHON_313=1."
+        throw "Instalacion cancelada. Instala Python 3.11.x o define ACUSTICAFAUNA_ALLOW_PYTHON_313=1."
       }
     }
+  } elseif (!($major -eq 3 -and $minor -eq 11)) {
+    Write-Warning "No se encontro Python 3.11.x via py -3.11."
+    Write-Host "Python actual en PATH: $versionText"
+    Write-Host "Instala Python 3.11.x desde:"
+    Write-Host $Python311Url
+    Write-Host "Busca una version 3.11.x y descarga Windows installer (64-bit)."
   }
 
   Write-Host "Usando Python: $versionText"

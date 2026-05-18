@@ -32,6 +32,8 @@ tmp/
 
 # Local data and audio
 data/
+!acusticafauna-General/acusticafauna-frontend/src/data/
+!acusticafauna-General/acusticafauna-frontend/src/data/*.js
 dataset_curado/
 **/dataset_curado/
 Articulos/

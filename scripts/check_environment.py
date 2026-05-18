@@ -14,7 +14,7 @@ from paths import BACKEND_DIR, FRONTEND_DIR, LOCAL_DIRS, ML_ROOT, REPO_ROOT
 BACKEND_VENV = BACKEND_DIR / ".venv-backend"
 ML_VENV = ML_ROOT / ".venv-ml"
 RECOMMENDED_PATHS = "C:\\AcusticaFauna o F:\\AcusticaFauna"
-PYTHON311_URL = "https://www.python.org/downloads/release/python-3110/"
+PYTHON311_URL = "https://www.python.org/downloads/windows/"
 
 
 def status(level: str, label: str, detail: str = "") -> None:
@@ -100,7 +100,7 @@ def check_python() -> None:
     ok("Python", sys.version.split()[0])
     if version >= (3, 13):
         warning(
-            "Python 3.13 detectado. Para AcusticaFauna ML se recomienda Python 3.11.",
+            "Python 3.13 detectado. Para AcusticaFauna ML se recomienda Python 3.11.x.",
             PYTHON311_URL,
         )
 
@@ -108,7 +108,9 @@ def check_python() -> None:
 def main() -> int:
     print("AcusticaFauna - diagnostico local")
     if is_windows():
-        print("Windows: Python recomendado 3.11")
+        print("Windows: Python recomendado 3.11.x")
+        print("Verificar con: py -3.11 --version")
+        print(f"Descarga: {PYTHON311_URL}")
         print(r"Comandos recomendados: py -3.11 scripts\doctor_install.py")
         print(r"Comandos recomendados: .\scripts\setup_windows.ps1")
         if shutil.which("git") is None:

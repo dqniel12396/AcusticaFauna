@@ -39,18 +39,24 @@ repo/
 
 ## Instalacion rapida en Windows
 
-Opcion recomendada para usuarios normales: PowerShell + HTTPS + Python 3.11.
+Opcion recomendada para usuarios normales: PowerShell + HTTPS + Python 3.11.x.
 
 | Tipo de usuario | Terminal | Clonado | Instalacion |
 | --- | --- | --- | --- |
 | Usuario normal Windows | PowerShell | HTTPS | `.\scripts\setup_windows.ps1` |
 | Desarrollador avanzado | Git Bash opcional | SSH opcional | `bash scripts/setup_gitbash.sh` |
 
-1. Instala Python 3.11:
+1. Instala Python 3.11.x:
 
-   https://www.python.org/downloads/release/python-3110/
+   https://www.python.org/downloads/windows/
+
+   En la pagina de descargas de Windows, busca una version Python 3.11.x. Sirve cualquier version de la rama 3.11: 3.11.0, 3.11.1, 3.11.8, 3.11.9, etc. Preferiblemente usa la mas reciente disponible dentro de Python 3.11.x.
+
+   No uses el boton principal de descarga si te ofrece Python 3.13 o superior. Para AcusticaFauna ML se recomienda Python 3.11.x.
 
    Durante la instalacion marca `Add python.exe to PATH`.
+
+   Cierra y abre PowerShell.
 
    Verifica:
 
@@ -107,7 +113,13 @@ Opcion recomendada para usuarios normales: PowerShell + HTTPS + Python 3.11.
 
    http://localhost:5173
 
-Python 3.13 no es recomendado para AcusticaFauna ML. Dependencias como `torch`, `opensoundscape`, `librosa`, `numba`, `llvmlite` y `soundfile` suelen ser mas estables con Python 3.11.
+El comando `py -3.11` sirve para cualquier Python 3.11.x instalado. No exige que sea exactamente 3.11.0.
+
+Python 3.13 no es recomendado para AcusticaFauna ML. Dependencias como `torch`, `opensoundscape`, `librosa`, `numba`, `llvmlite` y `soundfile` suelen ser mas estables con Python 3.11.x.
+
+## Sirve cualquier Python 3.11?
+
+Si. Sirve cualquier version 3.11.x. Lo importante es que el comando `py -3.11 --version` funcione. Recomendamos la ultima version disponible de la rama 3.11.x.
 
 ## Si no tienes Git instalado
 
@@ -163,6 +175,22 @@ Los scripts de AcusticaFauna ya usan `npm.cmd` automaticamente. Si ejecutas coma
 npm.cmd install
 npm.cmd run dev
 npm.cmd run build
+```
+
+## Error: No suitable Python runtime found
+
+Este error no significa que falte cualquier Python. Significa que no esta instalado Python 3.11.x o que no esta registrado en el Python Launcher.
+
+Solucion:
+
+1. Instala Python 3.11.x desde https://www.python.org/downloads/windows/
+2. En la pagina de Windows busca una version 3.11.x y descarga `Windows installer (64-bit)`.
+3. Durante la instalacion marca `Add python.exe to PATH`.
+4. Cierra y abre PowerShell.
+5. Verifica:
+
+```powershell
+py -3.11 --version
 ```
 
 ## Arranque rapido

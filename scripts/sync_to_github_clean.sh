@@ -48,7 +48,6 @@ EXCLUDES=(
   "--exclude=venv"
   "--exclude=env"
   "--exclude=./data"
-  "--exclude=data"
   "--exclude=./dataset_curado"
   "--exclude=dataset_curado"
   "--exclude=./dataset_ranas-*"
@@ -144,7 +143,7 @@ elif command -v powershell.exe >/dev/null 2>&1; then
     $target = $env:SYNC_TARGET_ROOT
     $skipDirs = @(
       ".git", "AcusticaFauna-GitHub", "tools", "node_modules", "dist", "dist-ssr",
-      ".venv", ".venv-ml", "venv", "env", "data",
+      ".venv", ".venv-ml", "venv", "env",
       "dataset_curado", "Articulos", "Birdnet", "ESC-50-master",
       "PROYECTOGIT", "pruebas de audio", "videos", "models", "storage",
       "outputs", "ml_runs", "tmp", ".pytest_cache", "__pycache__"
@@ -157,6 +156,7 @@ elif command -v powershell.exe >/dev/null 2>&1; then
     $skipRelatives = @(
       "Codigos para arrancaar las cosas.txt",
       "package-lock.json",
+      "data",
       "acusticafauna-ML\=",
       "acusticafauna-General\acusticafauna-frontend\26.1.1",
       "acusticafauna-ML\manifests\clean"

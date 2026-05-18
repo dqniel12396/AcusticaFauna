@@ -2,6 +2,8 @@ import { mockDevices } from "../data/mockDevices";
 import Badge from "../components/shared/Badge";
 
 export default function DevicesPage() {
+  const hasDevices = mockDevices.length > 0;
+
   return (
     <div className="p-6">
       <section className="rounded-3xl bg-white p-6 shadow-sm ring-1 ring-slate-200">
@@ -10,24 +12,30 @@ export default function DevicesPage() {
           Resumen de estado, batería y última sincronización
         </p>
 
-        <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
-          {mockDevices.map((device) => (
-            <div key={device.name} className="rounded-3xl border border-slate-200 p-5">
-              <div className="flex items-center justify-between gap-2">
-                <h4 className="font-semibold text-slate-800">{device.name}</h4>
-                <Badge tone={device.state === "En línea" ? "success" : "warning"}>
-                  {device.state}
-                </Badge>
-              </div>
+        {hasDevices ? (
+          <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+            {mockDevices.map((device) => (
+              <div key={device.name} className="rounded-3xl border border-slate-200 p-5">
+                <div className="flex items-center justify-between gap-2">
+                  <h4 className="font-semibold text-slate-800">{device.name}</h4>
+                  <Badge tone={device.state === "En línea" ? "success" : "warning"}>
+                    {device.state}
+                  </Badge>
+                </div>
 
-              <div className="mt-4 space-y-2 text-sm text-slate-600">
-                <p>Batería: {device.battery}</p>
-                <p>Última sincronización: {device.sync}</p>
-                <p>Almacenamiento usado: {device.storage}</p>
+                <div className="mt-4 space-y-2 text-sm text-slate-600">
+                  <p>Batería: {device.battery}</p>
+                  <p>Última sincronización: {device.sync}</p>
+                  <p>Almacenamiento usado: {device.storage}</p>
+                </div>
               </div>
-            </div>
-          ))}
-        </div>
+            ))}
+          </div>
+        ) : (
+          <div className="rounded-2xl border border-dashed border-slate-300 bg-slate-50 p-6 text-sm text-slate-500">
+            No hay dispositivos registrados todavía.
+          </div>
+        )}
       </section>
     </div>
   );
