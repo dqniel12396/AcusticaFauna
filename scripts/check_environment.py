@@ -14,6 +14,7 @@ from paths import BACKEND_DIR, FRONTEND_DIR, LOCAL_DIRS, ML_ROOT, REPO_ROOT
 BACKEND_VENV = BACKEND_DIR / ".venv-backend"
 ML_VENV = ML_ROOT / ".venv-ml"
 RECOMMENDED_PATHS = "C:\\AcusticaFauna o F:\\AcusticaFauna"
+PYTHON311_URL = "https://www.python.org/downloads/release/python-3110/"
 
 
 def status(level: str, label: str, detail: str = "") -> None:
@@ -98,18 +99,27 @@ def check_python() -> None:
     version = sys.version_info
     ok("Python", sys.version.split()[0])
     if version >= (3, 13):
-        warning("Python 3.13 o superior", "para ML se recomienda Python 3.11")
+        warning(
+            "Python 3.13 detectado. Para AcusticaFauna ML se recomienda Python 3.11.",
+            PYTHON311_URL,
+        )
 
 
 def main() -> int:
     print("AcusticaFauna - diagnostico local")
+    if is_windows():
+        print("Windows: Python recomendado 3.11")
+        print(r"Comandos recomendados: py -3.11 scripts\doctor_install.py")
+        print(r"Comandos recomendados: .\scripts\setup_windows.ps1")
+        if shutil.which("git") is None:
+            print("WARNING: Git no encontrado - puedes descargar el ZIP desde GitHub y descomprimirlo en C:\\AcusticaFauna")
     check_path()
     check_python()
 
     node_version = command_version("node", ["--version"])
-    npm_version = command_version("npm", ["--version"])
+    npm_version = command_version("npm.cmd" if is_windows() else "npm", ["--version"])
     ok("Node", node_version) if node_version else warning("Node", "no encontrado")
-    ok("npm", npm_version) if npm_version else warning("npm", "no encontrado")
+    ok("npm.cmd" if is_windows() else "npm", npm_version) if npm_version else warning("npm.cmd" if is_windows() else "npm", "no encontrado")
 
     ok("Backend dir", str(BACKEND_DIR)) if BACKEND_DIR.exists() else warning("Backend dir", str(BACKEND_DIR))
     ok("Frontend dir", str(FRONTEND_DIR)) if FRONTEND_DIR.exists() else warning("Frontend dir", str(FRONTEND_DIR))

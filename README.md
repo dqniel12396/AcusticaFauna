@@ -37,30 +37,132 @@ repo/
   sample_data/
 ```
 
-## Instalacion rapida
+## Instalacion rapida en Windows
 
-Windows recomendado (Git Bash, ruta corta fuera de OneDrive):
+Opcion recomendada para usuarios normales: PowerShell + HTTPS + Python 3.11.
 
-```bash
-cd /c
-git clone https://github.com/dqniel12396/AcusticaFauna.git AcusticaFauna
-cd /c/AcusticaFauna
-python scripts/doctor_install.py
-python scripts/create_local_dirs.py
-bash scripts/setup_gitbash.sh
+| Tipo de usuario | Terminal | Clonado | Instalacion |
+| --- | --- | --- | --- |
+| Usuario normal Windows | PowerShell | HTTPS | `.\scripts\setup_windows.ps1` |
+| Desarrollador avanzado | Git Bash opcional | SSH opcional | `bash scripts/setup_gitbash.sh` |
+
+1. Instala Python 3.11:
+
+   https://www.python.org/downloads/release/python-3110/
+
+   Durante la instalacion marca `Add python.exe to PATH`.
+
+   Verifica:
+
+   ```powershell
+   py -3.11 --version
+   ```
+
+2. Instala Node.js LTS:
+
+   https://nodejs.org/
+
+   Verifica:
+
+   ```powershell
+   node --version
+   npm.cmd --version
+   ```
+
+3. Clona con HTTPS, no SSH:
+
+   ```powershell
+   cd C:\
+   git clone https://github.com/dqniel12396/AcusticaFauna.git AcusticaFauna
+   cd C:\AcusticaFauna
+   ```
+
+   Usamos HTTPS porque no requiere configurar llaves SSH.
+
+4. Ejecuta el diagnostico:
+
+   ```powershell
+   py -3.11 scripts\doctor_install.py
+   ```
+
+5. Crea carpetas locales:
+
+   ```powershell
+   py -3.11 scripts\create_local_dirs.py
+   ```
+
+6. Instala dependencias:
+
+   ```powershell
+   .\scripts\setup_windows.ps1
+   ```
+
+7. Arranca la aplicacion:
+
+   ```powershell
+   .\scripts\start_all.ps1
+   ```
+
+8. Abre:
+
+   http://localhost:5173
+
+Python 3.13 no es recomendado para AcusticaFauna ML. Dependencias como `torch`, `opensoundscape`, `librosa`, `numba`, `llvmlite` y `soundfile` suelen ser mas estables con Python 3.11.
+
+## Si no tienes Git instalado
+
+Puedes descargar el ZIP desde GitHub:
+
+1. Abre el repositorio en GitHub.
+2. Pulsa `Code`.
+3. Pulsa `Download ZIP`.
+4. Descomprime en:
+
+```text
+C:\AcusticaFauna
 ```
 
-PowerShell:
+Entra con PowerShell:
 
 ```powershell
-Set-ExecutionPolicy -Scope Process Bypass
+cd C:\AcusticaFauna
+py -3.11 scripts\doctor_install.py
+py -3.11 scripts\create_local_dirs.py
 .\scripts\setup_windows.ps1
 ```
 
-Git Bash:
+## Git Bash y SSH son opcionales
+
+Git Bash no es obligatorio. SSH no es obligatorio.
+
+Para la mayoria de usuarios se recomienda HTTPS:
+
+```powershell
+git clone https://github.com/dqniel12396/AcusticaFauna.git
+```
+
+SSH solo es para desarrolladores que ya tienen llaves configuradas:
 
 ```bash
-bash scripts/setup_gitbash.sh
+git clone git@github.com:dqniel12396/AcusticaFauna.git
+```
+
+## Error comun: npm.ps1 Statement
+
+Si en PowerShell aparece un error parecido a:
+
+```text
+No se encuentra la propiedad 'Statement' en C:\Program Files\nodejs\npm.ps1
+```
+
+No es un error de AcusticaFauna. Es PowerShell ejecutando `npm.ps1` en vez de `npm.cmd`.
+
+Los scripts de AcusticaFauna ya usan `npm.cmd` automaticamente. Si ejecutas comandos manualmente, usa:
+
+```powershell
+npm.cmd install
+npm.cmd run dev
+npm.cmd run build
 ```
 
 ## Arranque rapido

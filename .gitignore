@@ -22,6 +22,14 @@ logs/
 tmp/
 *.tmp
 
+# Release hygiene
+*.pdf
+/Codigos para arrancaar las cosas.txt
+/package-lock.json
+/tools/
+/acusticafauna-ML/=
+/acusticafauna-General/acusticafauna-frontend/26.1.1
+
 # Local data and audio
 data/
 dataset_curado/
@@ -71,8 +79,6 @@ acusticafauna-ML/manifests/clean/
 !acusticafauna-ML/manifests/
 !acusticafauna-ML/manifests/README.md
 !acusticafauna-ML/manifests/.gitkeep
-!acusticafauna-ML/manifests/clean/
-!acusticafauna-ML/manifests/clean/.gitkeep
 !acusticafauna-ML/models/
 !acusticafauna-ML/models/.gitkeep
 !acusticafauna-ML/outputs/

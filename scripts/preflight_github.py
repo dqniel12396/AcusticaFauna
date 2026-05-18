@@ -9,9 +9,13 @@ from paths import REPO_ROOT
 
 IGNORE_PARTS = {
     ".git",
+    "AcusticaFauna-GitHub",
     "node_modules",
     ".venv",
+    ".venv-backend",
     ".venv-ml",
+    "venv",
+    "env",
     "__pycache__",
     "dist",
     ".pytest_cache",
@@ -28,9 +32,19 @@ IGNORE_PARTS = {
     "PROYECTOGIT",
     "pruebas de audio",
     "videos",
+    "tools",
 }
 AUDIO_EXTS = {".wav", ".flac", ".mp3", ".ogg", ".m4a"}
 MODEL_EXTS = {".model", ".pt", ".pth", ".ckpt", ".onnx", ".pkl"}
+FORBIDDEN_EXTS = {".pdf"}
+FORBIDDEN_PATHS = {
+    Path("Codigos para arrancaar las cosas.txt"),
+    Path("package-lock.json"),
+    Path("tools"),
+    Path("acusticafauna-ML") / "=",
+    Path("acusticafauna-General") / "acusticafauna-frontend" / "26.1.1",
+    Path("acusticafauna-ML") / "manifests" / "clean",
+}
 ABSOLUTE_PATTERNS = [
     re.compile(r"[A-Z]:\\"),
     re.compile(r"/f/PROYECTO", re.IGNORECASE),
@@ -39,8 +53,34 @@ ABSOLUTE_PATTERNS = [
 ]
 
 
+def is_relative_to(path: Path, parent: Path) -> bool:
+    return path == parent or parent in path.parents
+
+
+def relative_path(path: Path) -> Path:
+    try:
+        return path.relative_to(REPO_ROOT)
+    except ValueError:
+        return path
+
+
+def is_forbidden(path: Path) -> bool:
+    relative = relative_path(path)
+    return any(is_relative_to(relative, forbidden) for forbidden in FORBIDDEN_PATHS)
+
+
 def should_skip(path: Path) -> bool:
-    return any(part in IGNORE_PARTS or part.startswith("wetransfer_") or part.startswith("dataset_ranas-") or part.startswith("segmentos entrenamiento-") for part in path.parts)
+    relative = relative_path(path)
+    if is_forbidden(path):
+        return True
+    return any(
+        part in IGNORE_PARTS
+        or part.startswith(".venv")
+        or part.startswith("wetransfer_")
+        or part.startswith("dataset_ranas-")
+        or part.startswith("segmentos entrenamiento-")
+        for part in relative.parts
+    )
 
 
 def emit(level: str, message: str) -> None:
@@ -50,6 +90,11 @@ def emit(level: str, message: str) -> None:
 def scan() -> int:
     errors = 0
     warnings = 0
+    for forbidden in sorted(FORBIDDEN_PATHS, key=str):
+        forbidden_path = REPO_ROOT / forbidden
+        if forbidden_path.exists():
+            emit("ERROR", f"archivo/carpeta fuera del release limpio: {forbidden}")
+            errors += 1
     for path in REPO_ROOT.rglob("*"):
         if should_skip(path):
             continue
@@ -68,6 +113,9 @@ def scan() -> int:
             errors += 1
         if path.suffix.lower() in MODEL_EXTS:
             emit("ERROR", f"modelo/binario dentro del repo normal: {relative}")
+            errors += 1
+        if path.suffix.lower() in FORBIDDEN_EXTS:
+            emit("ERROR", f"archivo no apto para GitHub limpio: {relative}")
             errors += 1
         if path.name == ".env":
             emit("ERROR", f".env real detectado: {relative}")

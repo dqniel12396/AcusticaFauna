@@ -13,6 +13,7 @@ from paths import BACKEND_DIR, FRONTEND_DIR, LOCAL_DIRS, ML_ROOT, REPO_ROOT
 BACKEND_VENV = BACKEND_DIR / ".venv-backend"
 ML_VENV = ML_ROOT / ".venv-ml"
 RECOMMENDED_PATHS = "C:\\AcusticaFauna o F:\\AcusticaFauna"
+PYTHON311_URL = "https://www.python.org/downloads/release/python-3110/"
 LONG_PATHS_COMMAND = (
     'New-ItemProperty -Path "HKLM:\\SYSTEM\\CurrentControlSet\\Control\\FileSystem" '
     '-Name "LongPathsEnabled" -Value 1 -PropertyType DWORD -Force'
@@ -120,23 +121,24 @@ def check_python(reporter: Reporter) -> None:
     reporter.ok("Python", sys.version.split()[0])
     if sys.version_info >= (3, 13):
         reporter.warning(
-            "Python 3.13 o superior detectado",
-            "algunas dependencias ML pueden fallar",
-            "usa Python 3.11 para crear los venvs ML",
+            "Python 3.13 detectado. Para AcusticaFauna ML se recomienda Python 3.11.",
+            "dependencias como torch, opensoundscape, librosa, numba, llvmlite y soundfile son mas estables con Python 3.11",
+            f"instala Python 3.11 desde {PYTHON311_URL}",
         )
 
 
 def check_node(reporter: Reporter) -> None:
     node_version = command_version("node", ["--version"])
-    npm_version = command_version("npm", ["--version"])
+    npm_command = "npm.cmd" if is_windows() else "npm"
+    npm_version = command_version(npm_command, ["--version"])
     if node_version:
         reporter.ok("Node", node_version)
     else:
         reporter.error("Node", "no encontrado", "instala Node.js LTS y vuelve a ejecutar el setup")
     if npm_version:
-        reporter.ok("npm", npm_version)
+        reporter.ok(npm_command, npm_version)
     else:
-        reporter.error("npm", "no encontrado", "instala Node.js LTS; npm viene incluido")
+        reporter.error(npm_command, "no encontrado", "instala Node.js LTS; npm viene incluido")
 
 
 def check_long_paths(reporter: Reporter) -> None:
@@ -175,10 +177,11 @@ def check_repo_dirs(reporter: Reporter) -> None:
 
 def check_venv(reporter: Reporter, label: str, venv_dir: Path) -> None:
     if not venv_dir.exists():
+        setup_hint = r"se creara al ejecutar .\scripts\setup_windows.ps1" if is_windows() else "se creara al ejecutar bash scripts/setup_gitbash.sh"
         reporter.warning(
             f"venv {label}",
             f"no existe: {venv_dir}",
-            "se creara al ejecutar bash scripts/setup_gitbash.sh",
+            setup_hint,
         )
         return
 
@@ -239,6 +242,9 @@ def check_models(reporter: Reporter) -> None:
 def main() -> int:
     reporter = Reporter()
     print("AcusticaFauna - doctor de instalacion")
+    if is_windows():
+        print("Camino recomendado: PowerShell + HTTPS + Python 3.11")
+        print("Git Bash/SSH son opcionales.")
     check_path(reporter)
     check_python(reporter)
     check_node(reporter)
@@ -251,7 +257,8 @@ def main() -> int:
     if env_path.exists():
         reporter.ok(".env", str(env_path))
     else:
-        reporter.warning(".env", "falta", "copia .env.example a .env o ejecuta setup_gitbash.sh")
+        setup_hint = r"copia .env.example a .env o ejecuta .\scripts\setup_windows.ps1" if is_windows() else "copia .env.example a .env o ejecuta setup_gitbash.sh"
+        reporter.warning(".env", "falta", setup_hint)
 
     check_local_dirs(reporter)
     check_ports(reporter)

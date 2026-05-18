@@ -18,6 +18,14 @@ fi
 EXCLUDES=(
   "--exclude=./.git"
   "--exclude=./AcusticaFauna-GitHub"
+  "--exclude=./*.pdf"
+  "--exclude=*.pdf"
+  "--exclude=./Codigos para arrancaar las cosas.txt"
+  "--exclude=./package-lock.json"
+  "--exclude=./tools"
+  "--exclude=./acusticafauna-ML/="
+  "--exclude=./acusticafauna-General/acusticafauna-frontend/26.1.1"
+  "--exclude=./acusticafauna-ML/manifests/clean"
   "--exclude=./node_modules"
   "--exclude=./*/node_modules"
   "--exclude=node_modules"
@@ -135,7 +143,7 @@ elif command -v powershell.exe >/dev/null 2>&1; then
     $source = $env:SYNC_SOURCE_ROOT
     $target = $env:SYNC_TARGET_ROOT
     $skipDirs = @(
-      ".git", "AcusticaFauna-GitHub", "node_modules", "dist", "dist-ssr",
+      ".git", "AcusticaFauna-GitHub", "tools", "node_modules", "dist", "dist-ssr",
       ".venv", ".venv-ml", "venv", "env", "data",
       "dataset_curado", "Articulos", "Birdnet", "ESC-50-master",
       "PROYECTOGIT", "pruebas de audio", "videos", "models", "storage",
@@ -143,9 +151,16 @@ elif command -v powershell.exe >/dev/null 2>&1; then
     )
     $skipExts = @(
       ".tmp", ".log", ".local", ".wav", ".flac", ".mp3", ".ogg", ".m4a",
-      ".model", ".pt", ".pth", ".ckpt", ".onnx", ".pkl"
+      ".model", ".pt", ".pth", ".ckpt", ".onnx", ".pkl", ".pdf"
     )
     $skipFiles = @(".env", ".DS_Store", "Thumbs.db")
+    $skipRelatives = @(
+      "Codigos para arrancaar las cosas.txt",
+      "package-lock.json",
+      "acusticafauna-ML\=",
+      "acusticafauna-General\acusticafauna-frontend\26.1.1",
+      "acusticafauna-ML\manifests\clean"
+    )
 
     function Test-SkipDir([string] $name) {
       return (
@@ -161,6 +176,10 @@ elif command -v powershell.exe >/dev/null 2>&1; then
         $relative = [System.IO.Path]::GetRelativePath($source, $_.FullName)
         $destination = Join-Path $target $relative
         $name = $_.Name
+        $relativeKey = $relative -replace "/", "\"
+
+        if ($relativeKey -in $skipRelatives) { return }
+        if ($skipRelatives | Where-Object { $relativeKey.StartsWith($_ + "\") }) { return }
 
         if ($_.PSIsContainer) {
           if (Test-SkipDir $name) { return }
