@@ -217,6 +217,42 @@ npm.cmd run dev
 npm.cmd run build
 ```
 
+### Error al cargar audio / 403 Forbidden / audio_path_not_allowed
+
+El backend solo sirve audios dentro de carpetas permitidas. Esto evita que una pagina web pueda leer cualquier archivo del computador.
+
+El repo de GitHub no incluye audios reales. Si clonaste en otro equipo, los registros importados pueden apuntar a rutas de otro PC, por ejemplo `F:\PROYECTO de cosa de sonido\dataset_curado\...`.
+
+Soluciones:
+
+1. Si el audio pertenece al Dataset Curado, configura en `.env`:
+
+```env
+ACUSTICAFAUNA_DATASET_DIR=F:\PROYECTO de cosa de sonido\dataset_curado
+```
+
+2. Si quieres autorizar una carpeta adicional de audios locales:
+
+```env
+ACUSTICAFAUNA_ALLOWED_AUDIO_ROOTS=F:\PC202601\Descargasreal;D:\AudiosCampo
+```
+
+3. Reinicia el backend.
+4. En la app abre Configuracion -> Rutas de audio permitidas -> Probar rutas.
+
+No uses rutas de otro PC si esos audios no existen en este equipo. Para carpetas grandes, usa Laboratorio de audio -> Procesamiento masivo por carpeta local. Para archivos sueltos, puedes usar uploads temporales.
+
+Si una ruta vieja contiene `dataset_curado`, AcusticaFauna intenta reconstruirla bajo `ACUSTICAFAUNA_DATASET_DIR` en tiempo de ejecucion. No modifica la base de datos automaticamente.
+
+Ejemplo para Dataset Curado y audios fuente externos:
+
+```env
+ACUSTICAFAUNA_DATASET_DIR=F:\PROYECTO de cosa de sonido\dataset_curado
+ACUSTICAFAUNA_ALLOWED_AUDIO_ROOTS=F:\PROYECTO de cosa de sonido\dataset_ranas-20260512T141405Z-3-004
+```
+
+Si aparece `content-script.bundle.js` en la consola del navegador, normalmente viene de una extension. Prueba en una ventana sin extensiones antes de tratarlo como bug de AcusticaFauna.
+
 ### Error de rutas largas
 
 Si aparece un error como `Windows Long Path support`, mueve el repo a `C:\AcusticaFauna` y vuelve a instalar. Habilitar rutas largas ayuda, pero no garantiza que todas las herramientas de Python, Node o compilacion funcionen en rutas sincronizadas o demasiado profundas.

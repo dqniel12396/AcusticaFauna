@@ -83,9 +83,29 @@ Variables relevantes:
 - `ACUSTICAFAUNA_MODELS_DIR`
 - `ACUSTICAFAUNA_MANIFESTS_DIR`
 - `ACUSTICAFAUNA_OUTPUTS_DIR`
+- `ACUSTICAFAUNA_ALLOWED_AUDIO_ROOTS`
 - `ACUSTICAFAUNA_RESOURCE_PROFILE`
 
 Los manifests reales que contienen rutas locales deben mantenerse fuera de Git y regenerarse o compartirse como artefactos controlados.
+
+### Allowed audio roots
+
+Los endpoints de audio resuelven rutas mediante `resolve_allowed_audio_path(input_path, allowed_roots)`. La funcion normaliza separadores Windows/Linux, evita traversal, acepta rutas absolutas solo dentro de roots permitidos y devuelve errores JSON claros.
+
+Roots globales:
+
+- `ACUSTICAFAUNA_DATASET_DIR`
+- `ACUSTICAFAUNA_STORAGE_DIR`
+- uploads/clips/processed/cache bajo storage
+- `sample_data`
+- `ACUSTICAFAUNA_ALLOWED_AUDIO_ROOTS`
+
+Roots de job/sesion:
+
+- Batch processing puede recibir `job_allowed_roots` para autorizar la carpeta padre de un archivo elegido por el usuario.
+- Folder-batch usa la carpeta escaneada y validada como root permitido solo para ese job.
+
+Si una ruta antigua contiene `dataset_curado`, el resolver intenta reconstruir la ruta relativa bajo `ACUSTICAFAUNA_DATASET_DIR` en runtime. No migra la base de datos automaticamente.
 
 ## Errores controlados
 

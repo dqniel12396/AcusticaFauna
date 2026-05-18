@@ -1,5 +1,6 @@
 const API_BASE = import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8000/api";
 const ML_API_BASE = import.meta.env.VITE_ML_API_BASE_URL || "http://127.0.0.1:8010";
+const API_ORIGIN = API_BASE.replace(/\/api\/?$/, "");
 
 async function handleResponse(response) {
   let data = null;
@@ -10,7 +11,14 @@ async function handleResponse(response) {
   }
 
   if (!response.ok) {
-    throw new Error(data.detail || "Ocurrió un error en la API.");
+    const detail = data?.detail;
+    if (detail && typeof detail === "object") {
+      const error = new Error(detail.message || detail.error || "Ocurrio un error en la API.");
+      error.detail = detail;
+      error.status = response.status;
+      throw error;
+    }
+    throw new Error(detail || "Ocurrio un error en la API.");
   }
 
   return data;
@@ -38,6 +46,11 @@ export async function fetchImportSessions() {
   return handleResponse(response);
 }
 
+export async function diagnoseImportSessionRoutes(sessionId) {
+  const response = await fetch(`${API_BASE}/sessions/${encodeURIComponent(sessionId)}/diagnose-routes`);
+  return handleResponse(response);
+}
+
 export async function fetchEvents(sessionId = "") {
   const url = sessionId
     ? `${API_BASE}/events?session_id=${encodeURIComponent(sessionId)}`
@@ -54,6 +67,11 @@ export async function fetchEventDetail(eventId) {
 
 export async function fetchHardwareProfile() {
   const response = await fetch(`${API_BASE}/system/hardware-profile`);
+  return handleResponse(response);
+}
+
+export async function fetchSystemPaths() {
+  const response = await fetch(`${API_BASE}/system/paths`);
   return handleResponse(response);
 }
 
@@ -121,11 +139,29 @@ export function getMediaFileUrl(path) {
 export function getApiUrl(path) {
   if (!path) return "";
   if (/^https?:\/\//i.test(path)) return path;
-  return path.startsWith("/api") ? `http://127.0.0.1:8000${path}` : `${API_BASE}${path.startsWith("/") ? path : `/${path}`}`;
+  return path.startsWith("/api") ? `${API_ORIGIN}${path}` : `${API_BASE}${path.startsWith("/") ? path : `/${path}`}`;
+}
+
+export function getPlayableAudioUrl(item) {
+  if (!item) return "";
+  const direct = item.playable_url || item.audio_url || item.output_audio_url || item.backend_audio_url;
+  if (direct) return getApiUrl(direct);
+  const audioPath = item.output_audio_path || item.processed_audio_path || item.segment_audio_path || item.stored_path || item.audio_path || item.output_path;
+  return audioPath ? getMediaFileUrl(audioPath) : "";
 }
 
 export function getAudioLabClipAudioUrl(clip) {
-  return getApiUrl(clip?.playable_url || clip?.audio_url || `/audio-lab/clips/${clip?.id}/audio`);
+  return getPlayableAudioUrl(clip) || getApiUrl(`/audio-lab/clips/${clip?.id}/audio`);
+}
+
+export async function debugResolveAudio(audioPath) {
+  const payload = typeof audioPath === "object" ? audioPath : { audio_path: audioPath };
+  const response = await fetch(`${API_BASE}/audio-lab/debug/resolve-audio`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  return handleResponse(response);
 }
 
 export function getCuratedSegmentSpectrogramUrl(segmentId, mode = "preview", force = false) {
@@ -140,13 +176,10 @@ export async function fetchCuratedSegmentSpectrogramBlob(segmentId, mode = "prev
   const response = await fetch(getCuratedSegmentSpectrogramUrl(segmentId, mode, force));
 
   if (!response.ok) {
-    if (!data) {
-      throw new Error(`Ocurrio un error en la API (${response.status}).`);
-    }
     let message = "No fue posible generar el espectrograma.";
     try {
       const data = await response.json();
-      message = data.detail || message;
+      message = typeof data.detail === "object" ? data.detail.message || data.detail.error || message : data.detail || message;
     } catch {
       // Keep generic message when the backend did not return JSON.
     }
@@ -610,6 +643,68 @@ export async function createAudioLabBatchProcessingJob(payload) {
     body: JSON.stringify(payload),
   });
   return handleResponse(response);
+}
+
+export async function scanAudioLabFolderBatch(payload) {
+  const response = await fetch(`${API_BASE}/audio-lab/folder-batch/scan`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  return handleResponse(response);
+}
+
+export async function createAudioLabFolderBatchJob(payload) {
+  const response = await fetch(`${API_BASE}/audio-lab/folder-batch/jobs`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  return handleResponse(response);
+}
+
+export async function fetchAudioLabFolderBatchJobs() {
+  const response = await fetch(`${API_BASE}/audio-lab/folder-batch/jobs`);
+  return handleResponse(response);
+}
+
+export async function fetchAudioLabFolderBatchJob(jobId) {
+  const response = await fetch(`${API_BASE}/audio-lab/folder-batch/jobs/${encodeURIComponent(jobId)}`);
+  return handleResponse(response);
+}
+
+export async function fetchAudioLabFolderBatchLogs(jobId) {
+  const response = await fetch(`${API_BASE}/audio-lab/folder-batch/jobs/${encodeURIComponent(jobId)}/logs`);
+  return handleResponse(response);
+}
+
+export async function pauseAudioLabFolderBatchJob(jobId) {
+  const response = await fetch(`${API_BASE}/audio-lab/folder-batch/jobs/${encodeURIComponent(jobId)}/pause`, { method: "POST" });
+  return handleResponse(response);
+}
+
+export async function resumeAudioLabFolderBatchJob(jobId) {
+  const response = await fetch(`${API_BASE}/audio-lab/folder-batch/jobs/${encodeURIComponent(jobId)}/resume`, { method: "POST" });
+  return handleResponse(response);
+}
+
+export async function cancelAudioLabFolderBatchJob(jobId) {
+  const response = await fetch(`${API_BASE}/audio-lab/folder-batch/jobs/${encodeURIComponent(jobId)}/cancel`, { method: "POST" });
+  return handleResponse(response);
+}
+
+export async function fetchAudioLabFolderBatchOutputs(jobId) {
+  const response = await fetch(`${API_BASE}/audio-lab/folder-batch/jobs/${encodeURIComponent(jobId)}/outputs`);
+  return handleResponse(response);
+}
+
+export async function fetchAudioLabFolderBatchSummary(jobId) {
+  const response = await fetch(`${API_BASE}/audio-lab/folder-batch/jobs/${encodeURIComponent(jobId)}/summary`);
+  return handleResponse(response);
+}
+
+export function getAudioLabFolderBatchManifestUrl(jobId) {
+  return `${API_BASE}/audio-lab/folder-batch/jobs/${encodeURIComponent(jobId)}/manifest`;
 }
 
 export async function fetchAudioLabBatchProcessingJobs() {

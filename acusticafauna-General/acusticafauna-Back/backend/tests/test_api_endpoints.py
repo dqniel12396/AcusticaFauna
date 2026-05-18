@@ -1,6 +1,22 @@
 from app.db.database import get_connection
 
 
+def write_test_wav(path):
+    import math
+    import struct
+    import wave
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(path), "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(8000)
+        for index in range(800):
+            value = int(10000 * math.sin(2 * math.pi * 440 * index / 8000))
+            wav.writeframes(struct.pack("<h", value))
+    return path
+
+
 def test_curated_dataset_endpoints_use_temporary_database(client, sample_curated_dataset, tmp_db_path):
     response = client.post(
         "/api/curated-dataset/import",
@@ -22,6 +38,66 @@ def test_curated_dataset_endpoints_use_temporary_database(client, sample_curated
     audio_response = client.get(f"/api/curated-dataset/segments/{segment['id']}/audio")
     assert audio_response.status_code == 200
     assert audio_response.headers["content-type"].startswith("audio/")
+
+
+def test_curated_dataset_audio_relocates_old_dataset_curado_path(client, sample_curated_dataset, tmp_path):
+    client.post("/api/curated-dataset/import", json={"dataset_root": str(sample_curated_dataset)})
+    segment = client.get("/api/curated-dataset/segments", params={"label": "Boana_boans"}).json()["items"][0]
+    actual = sample_curated_dataset / "cleaned" / "positivos" / "Boana_boans" / "Boana_boans__sample__seg0001.wav"
+    old_path = tmp_path / "old_pc" / "dataset_curado" / "cleaned" / "positivos" / "Boana_boans" / actual.name
+
+    conn = get_connection()
+    try:
+        conn.execute("UPDATE curated_audio_segments SET output_path = ? WHERE id = ?", (str(old_path), segment["id"]))
+        conn.commit()
+    finally:
+        conn.close()
+
+    audio_response = client.get(f"/api/curated-dataset/segments/{segment['id']}/audio")
+    assert audio_response.status_code == 200
+    assert audio_response.headers["content-type"].startswith("audio/")
+
+    debug = client.post(
+        "/api/audio-lab/debug/resolve-audio",
+        json={"segment_id": segment["id"], "context": "curated_dataset"},
+    )
+    assert debug.status_code == 200
+    payload = debug.json()
+    assert payload["allowed"] is True
+    assert payload["selected_source"] == "audio_limpio"
+
+
+def test_curated_dataset_audio_forbidden_returns_clear_json(client, sample_curated_dataset, tmp_path):
+    client.post("/api/curated-dataset/import", json={"dataset_root": str(sample_curated_dataset)})
+    segment = client.get("/api/curated-dataset/segments", params={"label": "Boana_boans"}).json()["items"][0]
+    outside = write_test_wav(tmp_path / "dataset_ranas-20260512T141405Z-3-004" / "dataset_ranas" / "Allobates" / "outside.wav")
+
+    conn = get_connection()
+    try:
+        conn.execute(
+            "UPDATE curated_audio_segments SET output_path = ?, source_path = NULL WHERE id = ?",
+            (str(outside), segment["id"]),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    audio_response = client.get(f"/api/curated-dataset/segments/{segment['id']}/audio")
+    assert audio_response.status_code == 403
+    detail = audio_response.json()["detail"]
+    assert detail["error"] == "audio_path_not_allowed"
+    assert "suggested_env_line" in detail
+    assert detail["suggested_env_line"].startswith("ACUSTICAFAUNA_ALLOWED_AUDIO_ROOTS=")
+
+    debug = client.post(
+        "/api/audio-lab/debug/resolve-audio",
+        json={"segment_id": segment["id"], "context": "curated_dataset"},
+    )
+    assert debug.status_code == 200
+    payload = debug.json()
+    assert payload["audio_clean"]["exists"] is True
+    assert payload["audio_clean"]["allowed"] is False
+    assert payload["suggested_env_line"].startswith("ACUSTICAFAUNA_ALLOWED_AUDIO_ROOTS=")
 
 
 def test_review_endpoint_is_idempotent(client, sample_curated_dataset):

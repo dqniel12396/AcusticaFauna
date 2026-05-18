@@ -4,9 +4,14 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import FileResponse
 
-from app.core.config import settings
 from app.db.database import get_connection
 from app.schemas.curated_dataset import CuratedImportRequest, CuratedReviewRequest
+from app.services.audio_path_service import (
+    allowed_audio_roots,
+    debug_resolve_audio_path,
+    media_type_for_path,
+    resolve_allowed_audio_path,
+)
 from app.services.curated_dataset_service import (
     get_curated_dataset_stats,
     get_curated_segment_detail,
@@ -25,24 +30,130 @@ from app.services.spectrogram_service import (
 router = APIRouter(prefix="/curated-dataset", tags=["curated-dataset"])
 
 
-def is_path_inside(path: Path, root: Path) -> bool:
-    try:
-        path.resolve().relative_to(root.resolve())
-        return True
-    except ValueError:
-        return False
-
-
 def ensure_allowed_media_path(path: Path) -> Path:
-    resolved = path.expanduser().resolve()
+    return resolve_allowed_audio_path(path)
 
-    if not any(is_path_inside(resolved, root) for root in settings.MEDIA_ALLOWED_ROOTS):
-        raise HTTPException(status_code=403, detail="Ruta de audio fuera de raices permitidas.")
 
-    if not resolved.exists() or not resolved.is_file():
-        raise HTTPException(status_code=404, detail="Archivo de audio no encontrado.")
+def fetch_curated_segment_audio_paths(segment_id: str):
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT id, segment_id, source_path, output_path FROM curated_audio_segments WHERE id = ?",
+            (segment_id,),
+        ).fetchone()
+    finally:
+        conn.close()
 
-    return resolved
+    if not row:
+        raise HTTPException(status_code=404, detail="Segmento curado no encontrado.")
+    return row
+
+
+def combined_suggested_env_line(errors: list[HTTPException]) -> str | None:
+    lines: list[str] = []
+    for exc in errors:
+        detail = exc.detail if isinstance(exc.detail, dict) else {}
+        line = detail.get("suggested_env_line")
+        if line and line not in lines:
+            lines.append(line)
+
+    if not lines:
+        return None
+
+    allowed_roots: list[str] = []
+    dataset_line = None
+    for line in lines:
+        if line.startswith("ACUSTICAFAUNA_DATASET_DIR=") and dataset_line is None:
+            dataset_line = line
+        elif line.startswith("ACUSTICAFAUNA_ALLOWED_AUDIO_ROOTS="):
+            allowed_roots.append(line.split("=", 1)[1])
+
+    if dataset_line and allowed_roots:
+        return f"{dataset_line}\nACUSTICAFAUNA_ALLOWED_AUDIO_ROOTS={';'.join(allowed_roots)}"
+    if len(lines) == 1:
+        return lines[0]
+    return "\n".join(lines)
+
+
+def resolve_curated_segment_audio(row) -> Path:
+    attempts = [
+        ("audio_limpio", row["output_path"]),
+        ("fuente_original", row["source_path"]),
+    ]
+    errors: list[HTTPException] = []
+
+    for kind, raw_path in attempts:
+        if not raw_path:
+            continue
+        try:
+            return resolve_allowed_audio_path(raw_path)
+        except HTTPException as exc:
+            errors.append(exc)
+
+    status_code = 404
+    if any(exc.status_code == 403 for exc in errors):
+        status_code = 403
+
+    detail = {
+        "error": "audio_not_found" if status_code == 404 else "audio_path_not_allowed",
+        "message": (
+            "No se encontro el audio limpio ni la fuente original."
+            if status_code == 404
+            else "El audio existe pero esta fuera de las carpetas permitidas."
+        ),
+        "segment_id": row["id"],
+        "audio_clean_path": row["output_path"],
+        "source_original_path": row["source_path"],
+        "allowed_roots": [str(root) for root in allowed_audio_roots()],
+        "attempts": [exc.detail if isinstance(exc.detail, dict) else {"message": str(exc.detail)} for exc in errors],
+    }
+    suggested = combined_suggested_env_line(errors)
+    if suggested:
+        detail["suggested_env_line"] = suggested
+
+    raise HTTPException(status_code=status_code, detail=detail)
+
+
+def debug_curated_segment_audio(segment_id: str) -> dict[str, Any]:
+    row = fetch_curated_segment_audio_paths(segment_id)
+    clean = debug_resolve_audio_path(row["output_path"]) if row["output_path"] else None
+    source = debug_resolve_audio_path(row["source_path"]) if row["source_path"] else None
+    candidates = [
+        ("audio_limpio", clean, row["output_path"]),
+        ("fuente_original", source, row["source_path"]),
+    ]
+    selected = next((item for item in candidates if item[1] and item[1].get("exists") and item[1].get("allowed")), None)
+
+    suggested_lines = []
+    for _, result, _ in candidates:
+        line = result.get("suggested_env_line") if result else None
+        if line and line not in suggested_lines:
+            suggested_lines.append(line)
+
+    warning = None
+    if clean and clean.get("reason") == "audio_path_not_allowed" and "dataset_curado" in str(row["output_path"]).lower():
+        warning = (
+            "Tu dataset configurado no coincide con las rutas importadas. Configura ACUSTICAFAUNA_DATASET_DIR "
+            "con la carpeta real de dataset_curado o agrega esa carpeta a ACUSTICAFAUNA_ALLOWED_AUDIO_ROOTS."
+        )
+
+    return {
+        "context": "curated_dataset",
+        "segment_id": segment_id,
+        "db_audio_clean_path": row["output_path"],
+        "db_source_original_path": row["source_path"],
+        "audio_clean": clean,
+        "source_original": source,
+        "resolved_final": selected[1]["normalized_path"] if selected else None,
+        "selected_source": selected[0] if selected else None,
+        "exists": bool(selected),
+        "allowed": bool(selected),
+        "matched_root": selected[1]["matched_root"] if selected else None,
+        "playable_url": selected[1]["playable_url"] if selected else None,
+        "suggested_env_line": "\n".join(suggested_lines) if suggested_lines else None,
+        "warning": warning,
+        "allowed_roots": [str(root) for root in allowed_audio_roots()],
+    }
 
 
 @router.post("/import")
@@ -85,30 +196,29 @@ def curated_dataset_segments(
         "limit": limit,
         "offset": offset,
     }
-    return list_curated_segments(filters)
+    result = list_curated_segments(filters)
+    for item in result.get("items", []):
+        if item.get("id"):
+            item["playable_url"] = f"/api/curated-dataset/segments/{item['id']}/audio"
+            item["audio_url"] = item["playable_url"]
+    return result
 
 
 @router.get("/segments/{segment_id}")
 def curated_dataset_segment_detail(segment_id: str):
-    return get_curated_segment_detail(segment_id)
+    detail = get_curated_segment_detail(segment_id)
+    segment = detail.get("segment") or {}
+    if segment.get("id"):
+        segment["playable_url"] = f"/api/curated-dataset/segments/{segment['id']}/audio"
+        segment["audio_url"] = segment["playable_url"]
+    return detail
 
 
 @router.get("/segments/{segment_id}/audio")
 def curated_dataset_segment_audio(segment_id: str):
-    conn = get_connection()
-    try:
-        row = conn.execute(
-            "SELECT output_path FROM curated_audio_segments WHERE id = ?",
-            (segment_id,),
-        ).fetchone()
-    finally:
-        conn.close()
-
-    if not row:
-        raise HTTPException(status_code=404, detail="Segmento curado no encontrado.")
-
-    audio_path = ensure_allowed_media_path(Path(row["output_path"]))
-    return FileResponse(audio_path)
+    row = fetch_curated_segment_audio_paths(segment_id)
+    audio_path = resolve_curated_segment_audio(row)
+    return FileResponse(str(audio_path), media_type=media_type_for_path(audio_path), filename=audio_path.name)
 
 
 def latest_review_status(conn, segment_id: str) -> str | None:
@@ -160,7 +270,7 @@ def curated_dataset_segment_spectrogram(
     conn = get_connection()
     try:
         row = conn.execute(
-            "SELECT id, segment_id, output_path FROM curated_audio_segments WHERE id = ?",
+            "SELECT id, segment_id, source_path, output_path FROM curated_audio_segments WHERE id = ?",
             (segment_id,),
         ).fetchone()
         review_status = latest_review_status(conn, segment_id)
@@ -177,7 +287,7 @@ def curated_dataset_segment_spectrogram(
         )
 
     try:
-        audio_path = ensure_allowed_media_path(Path(row["output_path"]))
+        audio_path = resolve_curated_segment_audio(row)
         spectrogram_path = generate_spectrogram_png(
             audio_path=audio_path,
             segment_id=row["segment_id"],
@@ -229,7 +339,7 @@ def delete_curated_dataset_segment_spectrogram(
     conn = get_connection()
     try:
         row = conn.execute(
-            "SELECT id, segment_id, output_path, spectrogram_path FROM curated_audio_segments WHERE id = ?",
+            "SELECT id, segment_id, source_path, output_path, spectrogram_path FROM curated_audio_segments WHERE id = ?",
             (segment_id,),
         ).fetchone()
     finally:
@@ -238,9 +348,7 @@ def delete_curated_dataset_segment_spectrogram(
     if not row:
         raise HTTPException(status_code=404, detail="Segmento curado no encontrado.")
 
-    audio_path = Path(row["output_path"]).expanduser().resolve()
-    if not any(is_path_inside(audio_path, root) for root in settings.MEDIA_ALLOWED_ROOTS):
-        raise HTTPException(status_code=403, detail="Ruta de audio fuera de raices permitidas.")
+    audio_path = resolve_curated_segment_audio(row)
     deleted: list[str] = []
 
     modes = ["preview", "confirmed"] if mode == "all" else [mode]

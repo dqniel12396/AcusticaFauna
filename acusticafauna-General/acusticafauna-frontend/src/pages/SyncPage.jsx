@@ -1,7 +1,7 @@
-import { useEffect, useMemo, useState } from "react";
+import { Fragment, useEffect, useMemo, useState } from "react";
 import Badge from "../components/shared/Badge";
 import SectionCard from "../components/shared/SectionCard";
-import { fetchImportSessions, importLocalDatasetAdvanced } from "../services/api";
+import { diagnoseImportSessionRoutes, fetchImportSessions, importLocalDatasetAdvanced } from "../services/api";
 
 const DEFAULT_ROOT_PATH = "F:\\PROYECTO de cosa de sonido\\PROYECTOGIT\\Proyecto_Ranas_Aves\\espectogramas";
 
@@ -23,6 +23,7 @@ export default function SyncPage() {
   const [error, setError] = useState("");
   const [successData, setSuccessData] = useState(null);
   const [sessions, setSessions] = useState([]);
+  const [sessionDiagnostics, setSessionDiagnostics] = useState({});
 
   async function loadSessions() {
     try {
@@ -116,12 +117,37 @@ export default function SyncPage() {
     }
   }
 
+  async function diagnoseSession(sessionId) {
+    try {
+      const data = await diagnoseImportSessionRoutes(sessionId);
+      setSessionDiagnostics((prev) => ({ ...prev, [sessionId]: data }));
+    } catch (err) {
+      setSessionDiagnostics((prev) => ({
+        ...prev,
+        [sessionId]: { error: err.message || "No fue posible diagnosticar rutas de la sesion." },
+      }));
+    }
+  }
+
+  function copyText(text) {
+    navigator.clipboard?.writeText(text || "");
+  }
+
   return (
     <div className="space-y-6 p-6">
       <SectionCard
         title="Importación local"
         subtitle="Importe automáticamente desde una ruta raíz o asigne rutas manuales"
       >
+        <div className="mb-5 rounded-2xl border border-blue-200 bg-blue-50 p-4 text-sm text-blue-950">
+          <p className="font-semibold">Esta pagina importa resultados externos ya generados.</p>
+          <p className="mt-1">
+            Sirve para salidas de BirdNET, CSV de resumen, selection.table.txt, espectrogramas y sesiones externas con eventos o predicciones. No limpia ni segmenta audios.
+          </p>
+          <p className="mt-2">Flujo: Carpeta BirdNET/CSV/espectrogramas -&gt; Importar -&gt; Sesion importada -&gt; Revisar eventos/predicciones.</p>
+          <p className="mt-2">Para limpiar carpetas grandes usa Laboratorio de audio -&gt; Procesamiento masivo por carpeta local.</p>
+        </div>
+
         <div className="grid gap-4 md:grid-cols-3">
           <div>
             <label className="mb-1 block text-sm font-medium text-slate-700">
@@ -280,6 +306,22 @@ export default function SyncPage() {
               <p><strong>Segmentos enlazados:</strong> {successData.imported_segments}</p>
               <p><strong>Espectrogramas enlazados:</strong> {successData.imported_spectrograms}</p>
             </div>
+            {successData.route_summary ? (
+              <div className="mt-4 rounded-xl border border-emerald-200 bg-white/70 p-3 text-sm text-slate-700">
+                <p className="font-semibold text-slate-800">Resumen de rutas importadas</p>
+                <div className="mt-2 grid gap-2 md:grid-cols-4">
+                  <span>Audios encontrados: {successData.route_summary.audios_found}</span>
+                  <span>Audios faltantes: {successData.route_summary.audios_missing}</span>
+                  <span>Espectrogramas: {successData.route_summary.spectrograms_found}</span>
+                  <span>Carpeta raiz: {successData.route_summary.root_path_exists ? "existe" : "no existe"}</span>
+                </div>
+                {successData.route_summary.audios_missing > 0 ? (
+                  <p className="mt-2 text-amber-800">
+                    Se importaron predicciones/espectrogramas, pero algunos audios no estan disponibles o no estan autorizados.
+                  </p>
+                ) : null}
+              </div>
+            ) : null}
           </div>
         ) : null}
       </SectionCard>
@@ -315,28 +357,78 @@ export default function SyncPage() {
                 <th className="px-3 py-3 font-medium">Eventos</th>
                 <th className="px-3 py-3 font-medium">Predicciones</th>
                 <th className="px-3 py-3 font-medium">Estado</th>
+                <th className="px-3 py-3 font-medium">Acciones</th>
               </tr>
             </thead>
             <tbody>
               {sessions.length === 0 ? (
                 <tr>
-                  <td colSpan="7" className="px-3 py-8 text-center text-slate-500">
+                  <td colSpan="8" className="px-3 py-8 text-center text-slate-500">
                     Aún no hay sesiones importadas.
                   </td>
                 </tr>
               ) : (
                 sessions.map((session) => (
-                  <tr key={session.id} className="border-b border-slate-100 last:border-0">
-                    <td className="px-3 py-4 font-semibold text-slate-800">{session.name}</td>
-                    <td className="px-3 py-4">{session.source_type}</td>
-                    <td className="px-3 py-4">{session.import_mode}</td>
-                    <td className="px-3 py-4">{session.root_path}</td>
-                    <td className="px-3 py-4">{session.total_events}</td>
-                    <td className="px-3 py-4">{session.total_predictions}</td>
-                    <td className="px-3 py-4">
-                      <Badge tone="success">{session.status}</Badge>
-                    </td>
-                  </tr>
+                  <Fragment key={session.id}>
+                    <tr className="border-b border-slate-100 last:border-0">
+                      <td className="px-3 py-4 font-semibold text-slate-800">{session.name}</td>
+                      <td className="px-3 py-4">{session.source_type}</td>
+                      <td className="px-3 py-4">{session.import_mode}</td>
+                      <td className="px-3 py-4">{session.root_path}</td>
+                      <td className="px-3 py-4">{session.total_events}</td>
+                      <td className="px-3 py-4">{session.total_predictions}</td>
+                      <td className="px-3 py-4">
+                        <Badge tone="success">{session.status}</Badge>
+                      </td>
+                      <td className="px-3 py-4">
+                        <button
+                          onClick={() => diagnoseSession(session.id)}
+                          className="rounded-xl border border-slate-300 bg-white px-3 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-50"
+                        >
+                          Diagnosticar rutas
+                        </button>
+                      </td>
+                    </tr>
+                    {sessionDiagnostics[session.id] ? (
+                      <tr className="border-b border-slate-100 bg-slate-50">
+                        <td colSpan="8" className="px-3 py-4 text-sm text-slate-700">
+                          {sessionDiagnostics[session.id].error ? (
+                            <span className="text-red-700">{sessionDiagnostics[session.id].error}</span>
+                          ) : (
+                            <div className="space-y-2">
+                              <div className="flex flex-wrap gap-2">
+                                <Badge>eventos: {sessionDiagnostics[session.id].total_events}</Badge>
+                                <Badge>predicciones: {sessionDiagnostics[session.id].predictions}</Badge>
+                                <Badge>audios encontrados: {sessionDiagnostics[session.id].audios_found}</Badge>
+                                <Badge>audios faltantes: {sessionDiagnostics[session.id].audios_missing}</Badge>
+                                <Badge>fuera de rutas: {sessionDiagnostics[session.id].audios_outside_allowed_roots}</Badge>
+                                <Badge>espectrogramas: {sessionDiagnostics[session.id].spectrograms_found}</Badge>
+                              </div>
+                              {sessionDiagnostics[session.id].examples?.length ? (
+                                <div className="rounded-xl border border-amber-200 bg-amber-50 p-3 text-amber-900">
+                                  <p className="font-semibold">Audios no reproducibles detectados</p>
+                                  {sessionDiagnostics[session.id].examples.map((example) => (
+                                    <div key={example.event_id} className="mt-2 border-t border-amber-200 pt-2">
+                                      <p className="font-mono text-xs">{example.audio_path}</p>
+                                      <p>Motivo: {example.reason}</p>
+                                      {example.suggested_env_line ? (
+                                        <button
+                                          onClick={() => copyText(example.suggested_env_line)}
+                                          className="mt-2 rounded-lg border border-amber-300 bg-white px-3 py-1 text-xs font-semibold"
+                                        >
+                                          Copiar linea .env sugerida
+                                        </button>
+                                      ) : null}
+                                    </div>
+                                  ))}
+                                </div>
+                              ) : null}
+                            </div>
+                          )}
+                        </td>
+                      </tr>
+                    ) : null}
+                  </Fragment>
                 ))
               )}
             </tbody>

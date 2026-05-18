@@ -242,3 +242,43 @@ Endpoints utiles:
 - Hardware backend: `http://127.0.0.1:8000/api/system/hardware-profile`
 - ML API: `http://127.0.0.1:8010/health`
 - Hardware ML: `http://127.0.0.1:8010/system/hardware-profile`
+## Error al cargar audio / 403 Forbidden / audio_path_not_allowed
+
+El backend solo sirve audios que estan dentro de carpetas permitidas. Esto evita que el navegador pueda pedir archivos arbitrarios del computador.
+
+Carpetas permitidas principales:
+
+- `ACUSTICAFAUNA_DATASET_DIR`
+- `ACUSTICAFAUNA_STORAGE_DIR`
+- `ACUSTICAFAUNA_ALLOWED_AUDIO_ROOTS`
+- uploads, clips y procesados dentro de `storage`
+- `sample_data`
+
+Si clonaste el repo en otro PC, los audios reales no vienen incluidos. Los registros importados pueden apuntar a rutas viejas como `F:\...`, `C:\...` o OneDrive. En ese caso la app debe mostrar `archivo no encontrado` o `ruta fuera de carpetas permitidas`, no un 403 opaco.
+
+Soluciones:
+
+1. Configura `ACUSTICAFAUNA_DATASET_DIR` en `.env` apuntando al dataset local.
+2. Si necesitas autorizar otra carpeta local, agrega solo esa carpeta:
+
+```env
+ACUSTICAFAUNA_ALLOWED_AUDIO_ROOTS=F:\PC202601\Descargasreal;D:\AudiosCampo
+```
+
+3. No uses rutas de otro PC si esos audios no existen en este equipo.
+4. Usa uploads temporales en Laboratorio de audio si no tienes dataset local.
+5. Abre `http://127.0.0.1:8000/api/system/paths` para revisar carpetas permitidas.
+6. En Laboratorio de audio usa `Diagnosticar ruta` para ver si el archivo existe y esta permitido.
+
+Si una ruta vieja contiene `dataset_curado`, AcusticaFauna intenta reconstruirla bajo `ACUSTICAFAUNA_DATASET_DIR` en tiempo de ejecucion. No modifica la base de datos automaticamente.
+
+El frontend nunca debe usar una ruta local como `C:\...` o `F:\...` directamente en el reproductor. Todo audio reproducible debe servirse por endpoints del backend.
+
+Ejemplo para Dataset Curado y audios fuente externos:
+
+```env
+ACUSTICAFAUNA_DATASET_DIR=F:\PROYECTO de cosa de sonido\dataset_curado
+ACUSTICAFAUNA_ALLOWED_AUDIO_ROOTS=F:\PROYECTO de cosa de sonido\dataset_ranas-20260512T141405Z-3-004
+```
+
+Si aparece `content-script.bundle.js` en la consola del navegador, normalmente viene de una extension. Prueba en una ventana sin extensiones antes de tratarlo como bug de AcusticaFauna.

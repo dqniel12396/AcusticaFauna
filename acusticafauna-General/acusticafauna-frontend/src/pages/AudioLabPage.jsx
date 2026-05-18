@@ -3,15 +3,23 @@ import Badge from "../components/shared/Badge";
 import SectionCard from "../components/shared/SectionCard";
 import {
   cancelAudioLabBatchProcessingJob,
+  cancelAudioLabFolderBatchJob,
   createAudioLabAnnotation,
   createAudioLabActivityClips,
   createAudioLabBatchProcessingJob,
   createAudioLabClip,
+  createAudioLabFolderBatchJob,
   createAudioLabQualityReport,
+  debugResolveAudio,
   detectAudioLabActivity,
   fetchAudioLabBatchProcessingJob,
   fetchAudioLabBatchProcessingJobs,
   fetchAudioLabBatchProcessingLogs,
+  fetchAudioLabFolderBatchJob,
+  fetchAudioLabFolderBatchJobs,
+  fetchAudioLabFolderBatchLogs,
+  fetchAudioLabFolderBatchOutputs,
+  fetchAudioLabFolderBatchSummary,
   fetchAudioLabClips,
   fetchAudioLabWaveform,
   fetchAudioLabAnnotations,
@@ -21,11 +29,16 @@ import {
   fetchMlModels,
   fetchMlSpectrogramBlob,
   getAudioLabClipAudioUrl,
+  getAudioLabFolderBatchManifestUrl,
   getCuratedSegmentAudioUrl,
   getMediaFileUrl,
+  getPlayableAudioUrl,
+  pauseAudioLabFolderBatchJob,
   predictAudioPath,
   predictUploadedAudio,
+  resumeAudioLabFolderBatchJob,
   retractAudioLabAnnotation,
+  scanAudioLabFolderBatch,
   updateAudioLabAnnotation,
   uploadAudioLabBatch,
 } from "../services/api";
@@ -76,6 +89,37 @@ const BATCH_PROCESSING_PRESETS = {
   conservador: { threshold_db: -38, prop_decrease: 0.55, detector_threshold: 0.35 },
   normal: { threshold_db: -45, prop_decrease: 0.8, detector_threshold: 0.3 },
   agresivo: { threshold_db: -52, prop_decrease: 0.95, detector_threshold: 0.25 },
+  personalizado: {},
+};
+const FOLDER_BATCH_DEFAULT_FORM = {
+  folder_path: "",
+  recursive: true,
+  target_label: "Boana_boans",
+  job_name: "",
+  preset: "normal",
+  frequency_min_hz: 1800,
+  frequency_max_hz: 3000,
+  threshold_dbfs: -45,
+  min_activity_seconds: 0.4,
+  min_silence_seconds: 1.0,
+  padding_seconds: 0.3,
+  clip_duration_seconds: 5,
+  max_segment_seconds: 10,
+  min_band_ratio: 0.45,
+  bandpass: true,
+  noise_reduce: true,
+  normalize: true,
+  discard_empty: true,
+  detect_frog: true,
+  detect_contaminants_heuristic: true,
+  create_clips: true,
+  create_manifest: true,
+  resource_profile: "auto",
+};
+const FOLDER_BATCH_PRESETS = {
+  conservador: { threshold_dbfs: -38, min_band_ratio: 0.6, min_activity_seconds: 0.6, noise_reduce: false },
+  normal: { threshold_dbfs: -45, min_band_ratio: 0.45, min_activity_seconds: 0.4, noise_reduce: true },
+  agresivo: { threshold_dbfs: -52, min_band_ratio: 0.3, min_activity_seconds: 0.25, noise_reduce: true },
   personalizado: {},
 };
 
@@ -305,6 +349,39 @@ function normalizeAudioPathKey(value) {
   return String(value || "").replaceAll("\\", "/").toLowerCase();
 }
 
+function hasAudioFileExtension(value) {
+  return /\.(wav|flac|mp3|ogg|m4a)$/i.test(String(value || "").trim());
+}
+
+function parentFolderFromPath(value) {
+  const raw = String(value || "").trim();
+  const index = Math.max(raw.lastIndexOf("\\"), raw.lastIndexOf("/"));
+  return index > 0 ? raw.slice(0, index) : "";
+}
+
+function isInternalUploadPath(value) {
+  return normalizeAudioPathKey(value).includes("/storage/audio_lab/uploads/");
+}
+
+function audioOriginLabel(kind) {
+  const labels = {
+    curated: "dataset",
+    manual: "ruta local",
+    upload: "upload temporal",
+    upload_batch: "upload temporal",
+    clip: "clip derivado",
+    batch_output: "output procesado",
+    folder_batch_output: "output procesado",
+  };
+  return labels[kind] || kind || "desconocido";
+}
+
+function batchAuthorizationStatus(item) {
+  if (isInternalUploadPath(item.output_path)) return "copia interna autorizada";
+  if (["dataset", "clip derivado", "output procesado", "upload temporal"].includes(item.source_kind)) return "autorizado por backend";
+  return "requiere ruta permitida o autorizacion por job";
+}
+
 function normalizeAnalysisResult(result, context) {
   const analysisId = makeAnalysisId();
   const audioPath = result.audio_path || result.uploaded_temp_file || context.audioPath || "";
@@ -377,6 +454,14 @@ function formatTime(value) {
 function formatNumber(value, digits = 3) {
   if (value === undefined || value === null || Number.isNaN(Number(value))) return "-";
   return Number(value).toFixed(digits);
+}
+
+function formatBytes(value) {
+  const bytes = Number(value || 0);
+  if (!bytes) return "0 B";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  const index = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
+  return `${(bytes / (1024 ** index)).toFixed(index === 0 ? 0 : 1)} ${units[index]}`;
 }
 
 function qualityLabelText(label) {
@@ -747,11 +832,26 @@ export default function AudioLabPage() {
   const [batchProcessingSubmitting, setBatchProcessingSubmitting] = useState(false);
   const [batchProcessingQueue, setBatchProcessingQueue] = useState([]);
   const [batchProcessingHelp, setBatchProcessingHelp] = useState("");
+  const [batchProcessingJobAllowedRoots, setBatchProcessingJobAllowedRoots] = useState([]);
   const [batchJobSearch, setBatchJobSearch] = useState("");
   const [batchJobStatusFilter, setBatchJobStatusFilter] = useState("");
   const [batchJobModeFilter, setBatchJobModeFilter] = useState("");
   const [batchJobDateFilter, setBatchJobDateFilter] = useState("");
   const [batchJobFlagFilter, setBatchJobFlagFilter] = useState("");
+  const [folderBatchForm, setFolderBatchForm] = useState(FOLDER_BATCH_DEFAULT_FORM);
+  const [folderBatchScan, setFolderBatchScan] = useState(null);
+  const [folderBatchJobs, setFolderBatchJobs] = useState([]);
+  const [activeFolderBatchJob, setActiveFolderBatchJob] = useState(null);
+  const [folderBatchLogs, setFolderBatchLogs] = useState("");
+  const [folderBatchOutputs, setFolderBatchOutputs] = useState([]);
+  const [folderBatchSummary, setFolderBatchSummary] = useState(null);
+  const [folderBatchScanning, setFolderBatchScanning] = useState(false);
+  const [folderBatchSubmitting, setFolderBatchSubmitting] = useState(false);
+  const [folderBatchSearch, setFolderBatchSearch] = useState("");
+  const [folderBatchStatusFilter, setFolderBatchStatusFilter] = useState("");
+  const [folderBatchOutputFilter, setFolderBatchOutputFilter] = useState("candidates");
+  const [folderBatchMinScore, setFolderBatchMinScore] = useState("");
+  const [folderBatchMinRatio, setFolderBatchMinRatio] = useState("");
   const [qualityReport, setQualityReport] = useState(null);
   const [qualityReportLoading, setQualityReportLoading] = useState("");
   const [batchOutputDetails, setBatchOutputDetails] = useState(null);
@@ -852,6 +952,7 @@ export default function AudioLabPage() {
     checkMlService();
     loadClipHistory();
     loadBatchProcessingJobs();
+    loadFolderBatchJobs();
     return () => {
       if (selectedAudio?.objectUrl) URL.revokeObjectURL(selectedAudio.objectUrl);
       if (spectrogramUrl) URL.revokeObjectURL(spectrogramUrl);
@@ -893,6 +994,14 @@ export default function AudioLabPage() {
     return () => window.clearInterval(timer);
   }, [activeBatchProcessingJob?.id, activeBatchProcessingJob?.status]);
 
+  useEffect(() => {
+    if (!activeFolderBatchJob?.id || !["pending", "running", "paused"].includes(activeFolderBatchJob.status)) return undefined;
+    const timer = window.setInterval(() => {
+      refreshFolderBatchJob(activeFolderBatchJob.id, { quiet: true });
+    }, 2000);
+    return () => window.clearInterval(timer);
+  }, [activeFolderBatchJob?.id, activeFolderBatchJob?.status]);
+
   async function loadAudioChoices() {
     try {
       const filters = { label: labelFilter, limit: 80 };
@@ -931,6 +1040,15 @@ export default function AudioLabPage() {
       setBatchProcessingJobs(data.items || []);
     } catch {
       setBatchProcessingJobs([]);
+    }
+  }
+
+  async function loadFolderBatchJobs() {
+    try {
+      const data = await fetchAudioLabFolderBatchJobs();
+      setFolderBatchJobs(data.items || []);
+    } catch {
+      setFolderBatchJobs([]);
     }
   }
 
@@ -1001,6 +1119,10 @@ export default function AudioLabPage() {
       title: segment.label || segment.segment_id,
       audioPath: segment.output_path,
       audioUrl: getCuratedSegmentAudioUrl(segment.id),
+      originalAudioPath: segment.source_path || segment.output_path,
+      processingPath: segment.output_path,
+      originLabel: "dataset",
+      isValid: true,
       segment,
     });
   }
@@ -1016,24 +1138,39 @@ export default function AudioLabPage() {
   function openManualPath() {
     const path = manualPath.trim();
     if (!path) return;
+    if (!hasAudioFileExtension(path)) {
+      setFolderBatchForm((current) => ({ ...current, folder_path: path }));
+      setMessage("Esta ruta parece una carpeta. Para procesar carpetas grandes usa Procesamiento masivo por carpeta local.");
+      return;
+    }
     resetAnalysisState();
     setUploadedFile(null);
     setSelectedAudio({
       kind: "manual",
       title: path.split(/[\\/]/).pop() || "Audio local",
       audioPath: path,
-      audioUrl: getMediaFileUrl(path),
+      audioUrl: getPlayableAudioUrl({ audio_path: path }),
+      originalAudioPath: path,
+      processingPath: path,
+      originLabel: "ruta local",
+      isValid: true,
     });
   }
 
   function openAudioPath(audioPath, title = null) {
     resetAnalysisState();
     setUploadedFile(null);
+    const internalUpload = isInternalUploadPath(audioPath);
     setSelectedAudio({
-      kind: "manual",
+      kind: internalUpload ? "upload_batch" : "manual",
       title: title || getAudioName(audioPath),
       audioPath,
-      audioUrl: getMediaFileUrl(audioPath),
+      audioUrl: getPlayableAudioUrl({ audio_path: audioPath }),
+      originalAudioPath: internalUpload ? title || getAudioName(audioPath) : audioPath,
+      processingPath: audioPath,
+      internalCopyPath: internalUpload ? audioPath : "",
+      originLabel: internalUpload ? "upload temporal" : "ruta local",
+      isValid: true,
     });
   }
 
@@ -1058,6 +1195,10 @@ export default function AudioLabPage() {
       title: clip.clip_name || clip.audio_name || getAudioName(clip.output_audio_path),
       audioPath: clip.output_audio_path,
       audioUrl: getAudioLabClipAudioUrl(clip),
+      originalAudioPath: clip.source_audio_path || clip.output_audio_path,
+      processingPath: clip.output_audio_path,
+      originLabel: "clip derivado",
+      isValid: true,
       clip,
     });
     return true;
@@ -1076,11 +1217,16 @@ export default function AudioLabPage() {
       audioPath: "",
       audioUrl: objectUrl,
       objectUrl,
+      originalAudioPath: file.webkitRelativePath || file.name,
+      processingPath: "",
+      originLabel: "upload temporal",
+      isValid: true,
     });
   }
 
   function handleAudioLoaded(event) {
     setDuration(event.currentTarget.duration || 0);
+    setSelectedAudio((current) => current ? { ...current, isValid: true, loadError: "" } : current);
   }
 
   function handleTimeUpdate(event) {
@@ -1220,7 +1366,11 @@ export default function AudioLabPage() {
         kind: "manual",
         title: title || getAudioName(audioPath),
         audioPath,
-        audioUrl: audioUrl || getMediaFileUrl(audioPath),
+        audioUrl: audioUrl || getPlayableAudioUrl({ audio_path: audioPath }),
+        originalAudioPath: trace?.source_audio_path || audioPath,
+        processingPath: trace?.processed_audio_path || audioPath,
+        originLabel: trace?.processed_audio_path ? "output procesado" : "ruta local",
+        isValid: true,
       });
       const result = await predictAudioPath({ ...payload, audio_path: audioPath });
       const normalized = normalizeAnalysisResult(result, {
@@ -1655,6 +1805,10 @@ export default function AudioLabPage() {
       title: item.audio_name || getAudioName(item.audio_path),
       audioPath: item.audio_path,
       audioUrl: getMediaFileUrl(item.audio_path),
+      originalAudioPath: item.original_audio_path || item.source_audio_path || item.audio_path,
+      processingPath: item.audio_path,
+      originLabel: audioOriginLabel(item.source_kind || "manual"),
+      isValid: true,
     });
     setActivityRun(item.activity);
     setSelectedActivityIds((item.activity.segments || []).map((segment) => segment.id));
@@ -1689,7 +1843,10 @@ export default function AudioLabPage() {
         id: `table:${item.id}`,
         output_path: item.output_path,
         label: item.label || item.segment_id || getAudioName(item.output_path),
-        source_kind: "tabla",
+        source_kind: "dataset",
+        original_audio_path: item.source_path || item.output_path,
+        processing_path: item.output_path,
+        origin_label: "dataset",
         duration_seconds: item.duration_seconds,
         table_id: item.id,
       }));
@@ -1728,13 +1885,18 @@ export default function AudioLabPage() {
   }
 
   async function addCurrentAudioToBatchProcessing() {
-    if (selectedAudio?.audioPath) {
+    if (selectedAudio?.audioPath && selectedAudio?.isValid !== false) {
+      const processingPath = selectedAudio.processingPath || selectedAudio.audioPath;
       addBatchProcessingItems([
         {
-          id: `active:${selectedAudio.audioPath}`,
-          output_path: selectedAudio.audioPath,
-          label: selectedAudio.title || getAudioName(selectedAudio.audioPath),
-          source_kind: "audio activo",
+          id: `active:${processingPath}`,
+          output_path: processingPath,
+          label: selectedAudio.title || getAudioName(processingPath),
+          source_kind: selectedAudio.originLabel || audioOriginLabel(selectedAudio.kind),
+          original_audio_path: selectedAudio.originalAudioPath || selectedAudio.audioPath,
+          processing_path: processingPath,
+          internal_copy_path: selectedAudio.internalCopyPath || (isInternalUploadPath(processingPath) ? processingPath : ""),
+          playable_url: selectedAudio.audioUrl,
           duration_seconds: duration || selectedAudio.clip?.duration_seconds || selectedAudio.segment?.duration_seconds,
         },
       ], "Audio actual agregado al lote.");
@@ -1753,6 +1915,11 @@ export default function AudioLabPage() {
             audioPath: items[0].stored_path,
             audioUrl: getMediaFileUrl(items[0].stored_path),
             title: items[0].original_filename || current?.title || getAudioName(items[0].stored_path),
+            originalAudioPath: current?.originalAudioPath || items[0].original_filename || current?.title,
+            processingPath: items[0].stored_path,
+            internalCopyPath: items[0].stored_path,
+            originLabel: "upload temporal",
+            isValid: true,
           }));
         }
         addBatchProcessingItems(
@@ -1760,7 +1927,10 @@ export default function AudioLabPage() {
             id: `active-upload:${item.id}`,
             output_path: item.stored_path,
             label: item.original_filename || getAudioName(item.stored_path),
-            source_kind: "audio activo",
+            source_kind: "upload temporal",
+            original_audio_path: selectedAudio?.originalAudioPath || item.original_filename || getAudioName(item.stored_path),
+            processing_path: item.stored_path,
+            internal_copy_path: item.stored_path,
             duration_seconds: duration || undefined,
           })),
           "Audio actual subido y agregado al lote."
@@ -1783,12 +1953,14 @@ export default function AudioLabPage() {
         output_path: path,
         label: getAudioName(path),
         source_kind: "ruta manual",
+        original_audio_path: path,
+        processing_path: path,
       }));
     addBatchProcessingItems(items, "Rutas manuales agregadas al lote.");
   }
 
   function removeBatchProcessingItem(item) {
-    if (item.source_kind === "tabla" && item.table_id) {
+    if (item.source_kind === "dataset" && item.table_id) {
       setSelectedBatchIds((current) => current.filter((id) => id !== item.table_id));
       return;
     }
@@ -1842,7 +2014,30 @@ export default function AudioLabPage() {
         keep_intermediate: true,
         recommended_training_use: "requires_review",
       },
+      job_allowed_roots: batchProcessingJobAllowedRoots,
     };
+  }
+
+  function authorizeBatchRootForPath(itemOrPath) {
+    const item = typeof itemOrPath === "string" ? { output_path: itemOrPath } : itemOrPath;
+    const path = item.original_audio_path && !isInternalUploadPath(item.original_audio_path) ? item.original_audio_path : item.output_path;
+    if (isInternalUploadPath(item.output_path)) {
+      setMessage("Este audio ya esta en una copia temporal segura dentro de storage; no requiere autorizacion externa.");
+      return;
+    }
+    const root = parentFolderFromPath(path);
+    if (!root) {
+      setError("No se pudo detectar la carpeta padre de este audio.");
+      return;
+    }
+    if (/^[A-Za-z]:[\\/]?$/.test(root.trim())) {
+      const confirmed = window.confirm("Estas intentando autorizar una raiz de unidad completa. Es mas seguro elegir una carpeta especifica. Deseas continuar de todas formas?");
+      if (!confirmed) return;
+    }
+    const confirmed = window.confirm(`Autorizar esta carpeta solo para este job?\n\n${root}\n\nNo se modificara .env ni se autorizara todo el disco.`);
+    if (!confirmed) return;
+    setBatchProcessingJobAllowedRoots((current) => current.includes(root) ? current : [...current, root]);
+    setMessage(`Carpeta autorizada para este job: ${root}`);
   }
 
   async function startBatchProcessingJob() {
@@ -1900,6 +2095,221 @@ export default function AudioLabPage() {
     }
   }
 
+  function updateFolderBatchField(key, value) {
+    setFolderBatchForm((current) => ({ ...current, [key]: value }));
+  }
+
+  function applyFolderBatchPreset(preset) {
+    const values = FOLDER_BATCH_PRESETS[preset] || {};
+    setFolderBatchForm((current) => ({
+      ...current,
+      preset,
+      ...values,
+    }));
+  }
+
+  function buildFolderBatchScanPayload() {
+    return {
+      folder_path: folderBatchForm.folder_path.trim(),
+      recursive: Boolean(folderBatchForm.recursive),
+      extensions: [".wav", ".flac", ".mp3", ".ogg", ".m4a"],
+      include_patterns: [],
+      exclude_patterns: [],
+    };
+  }
+
+  async function scanFolderBatch() {
+    if (!folderBatchForm.folder_path.trim()) {
+      setError("Escribe la ruta local de la carpeta antes de escanear.");
+      return;
+    }
+    try {
+      setFolderBatchScanning(true);
+      setError("");
+      const scan = await scanAudioLabFolderBatch(buildFolderBatchScanPayload());
+      setFolderBatchScan(scan);
+      setMessage(`Carpeta escaneada: ${scan.files_found || 0} archivo(s), ${formatBytes(scan.total_size_bytes)}.`);
+    } catch (err) {
+      setError(err.message || "No fue posible escanear la carpeta local.");
+    } finally {
+      setFolderBatchScanning(false);
+    }
+  }
+
+  function buildFolderBatchPayload() {
+    return {
+      job_name: folderBatchForm.job_name || `folder_batch_${new Date().toISOString().slice(0, 10)}`,
+      folder_path: folderBatchForm.folder_path.trim(),
+      recursive: Boolean(folderBatchForm.recursive),
+      target_label: folderBatchForm.target_label.trim() || "target_species",
+      mode: "species_folder_cleanup",
+      preset: folderBatchForm.preset,
+      frequency_min_hz: Number(folderBatchForm.frequency_min_hz),
+      frequency_max_hz: Number(folderBatchForm.frequency_max_hz),
+      threshold_dbfs: Number(folderBatchForm.threshold_dbfs),
+      min_activity_seconds: Number(folderBatchForm.min_activity_seconds),
+      min_silence_seconds: Number(folderBatchForm.min_silence_seconds),
+      padding_seconds: Number(folderBatchForm.padding_seconds),
+      clip_duration_seconds: Number(folderBatchForm.clip_duration_seconds),
+      max_segment_seconds: Number(folderBatchForm.max_segment_seconds),
+      min_band_ratio: Number(folderBatchForm.min_band_ratio),
+      bandpass: Boolean(folderBatchForm.bandpass),
+      noise_reduce: Boolean(folderBatchForm.noise_reduce),
+      normalize: Boolean(folderBatchForm.normalize),
+      discard_empty: Boolean(folderBatchForm.discard_empty),
+      detect_frog: Boolean(folderBatchForm.detect_frog),
+      detect_contaminants_heuristic: Boolean(folderBatchForm.detect_contaminants_heuristic),
+      create_clips: Boolean(folderBatchForm.create_clips),
+      create_manifest: Boolean(folderBatchForm.create_manifest),
+      resource_profile: folderBatchForm.resource_profile,
+    };
+  }
+
+  async function startFolderBatchJob() {
+    if (!folderBatchForm.folder_path.trim()) {
+      setError("Escribe la ruta local de la carpeta antes de iniciar.");
+      return;
+    }
+    if (!folderBatchScan) {
+      setError("Escanea la carpeta antes de iniciar el procesamiento.");
+      return;
+    }
+    const confirmed = window.confirm(
+      `Iniciar procesamiento masivo por carpeta?\n\nCarpeta: ${folderBatchForm.folder_path}\nArchivos: ${folderBatchScan.files_found || 0}\nBanda: ${folderBatchForm.frequency_min_hz}-${folderBatchForm.frequency_max_hz} Hz\nDestino: backend/storage/audio_lab/folder_batch_jobs/{job_id}\n\nNo se modificaran ni borraran audios originales.`
+    );
+    if (!confirmed) return;
+    try {
+      setFolderBatchSubmitting(true);
+      setError("");
+      const created = await createAudioLabFolderBatchJob(buildFolderBatchPayload());
+      setMessage("Job de carpeta local creado. El procesamiento queda trazado y los originales no se modifican.");
+      await refreshFolderBatchJob(created.job_id || created.id);
+      await loadFolderBatchJobs();
+    } catch (err) {
+      setError(err.message || "No fue posible crear el job de carpeta local.");
+    } finally {
+      setFolderBatchSubmitting(false);
+    }
+  }
+
+  async function refreshFolderBatchJob(jobId, options = {}) {
+    try {
+      const [detail, logs, outputs, summary] = await Promise.all([
+        fetchAudioLabFolderBatchJob(jobId),
+        fetchAudioLabFolderBatchLogs(jobId),
+        fetchAudioLabFolderBatchOutputs(jobId),
+        fetchAudioLabFolderBatchSummary(jobId),
+      ]);
+      setActiveFolderBatchJob(detail);
+      setFolderBatchLogs(logs.logs || "");
+      setFolderBatchOutputs(outputs.items || []);
+      setFolderBatchSummary(summary);
+      setFolderBatchJobs((current) => {
+        const exists = current.some((item) => item.id === detail.id);
+        return exists ? current.map((item) => (item.id === detail.id ? detail : item)) : [detail, ...current];
+      });
+    } catch (err) {
+      if (!options.quiet) setError(err.message || "No fue posible refrescar el job de carpeta local.");
+    }
+  }
+
+  async function pauseFolderBatchJob() {
+    if (!activeFolderBatchJob?.id) return;
+    try {
+      await pauseAudioLabFolderBatchJob(activeFolderBatchJob.id);
+      await refreshFolderBatchJob(activeFolderBatchJob.id);
+      setMessage("Pausa solicitada. El job terminara el archivo actual antes de detenerse.");
+    } catch (err) {
+      setError(err.message || "No fue posible pausar el job.");
+    }
+  }
+
+  async function resumeFolderBatchJob() {
+    if (!activeFolderBatchJob?.id) return;
+    try {
+      await resumeAudioLabFolderBatchJob(activeFolderBatchJob.id);
+      await refreshFolderBatchJob(activeFolderBatchJob.id);
+      setMessage("Job reanudado.");
+    } catch (err) {
+      setError(err.message || "No fue posible reanudar el job.");
+    }
+  }
+
+  async function cancelFolderBatchJob() {
+    if (!activeFolderBatchJob?.id) return;
+    const confirmed = window.confirm("Cancelar el job de carpeta local? No se borraran originales ni outputs ya generados.");
+    if (!confirmed) return;
+    try {
+      await cancelAudioLabFolderBatchJob(activeFolderBatchJob.id);
+      await refreshFolderBatchJob(activeFolderBatchJob.id);
+      setMessage("Cancelacion solicitada.");
+    } catch (err) {
+      setError(err.message || "No fue posible cancelar el job.");
+    }
+  }
+
+  function openFolderBatchOutputInLab(output) {
+    const path = output.output_audio_path || output.audio_path;
+    if (!path) return;
+    resetAnalysisState();
+    setUploadedFile(null);
+    setSelectedAudio({
+      kind: "folder_batch_output",
+      title: getAudioName(path),
+      audioPath: path,
+      audioUrl: getPlayableAudioUrl(output),
+      originalAudioPath: output.original_audio_path || path,
+      processingPath: path,
+      originLabel: "output procesado",
+      isValid: true,
+    });
+  }
+
+  function feedbackRowFromFolderBatchOutput(output) {
+    const path = output.output_audio_path || output.audio_path || output.original_audio_path;
+    return {
+      analysis_id: activeFolderBatchJob?.id || "folder-batch",
+      result_row_id: output.id,
+      audio_path: path,
+      audio_name: getAudioName(path),
+      original_source_audio_path: output.original_audio_path,
+      processed_audio_path: output.output_audio_path,
+      batch_job_name: activeFolderBatchJob?.job_name,
+      batch_job_id: activeFolderBatchJob?.id || output.job_id,
+      batch_output_id: output.id,
+      processing_metadata_path: output.output_metadata_path,
+      start_seconds: output.start_seconds ?? 0,
+      end_seconds: output.end_seconds ?? output.duration_seconds ?? 0,
+      model_id: DEFAULT_GENERAL_MODEL_ID,
+      predicted_label: activeFolderBatchJob?.target_label || folderBatchForm.target_label,
+      score: output.activity_score,
+      score_used: output.activity_score,
+      threshold: folderBatchForm.threshold_dbfs,
+      raw_argmax_label: "",
+      decision_rule_applied: false,
+    };
+  }
+
+  function openFolderBatchFeedback(output, feedbackType, exclusionReason = "") {
+    const row = feedbackRowFromFolderBatchOutput(output);
+    if (feedbackType === "excluded_from_training") {
+      setFeedbackDraft({
+        mode: "create",
+        row,
+        feedbackType,
+        exclusionReason: exclusionReason || "ruido",
+        notes,
+      });
+      return;
+    }
+    openFeedbackDraft(feedbackType, row);
+  }
+
+  function openFolderBatchManifest() {
+    if (!activeFolderBatchJob?.id) return;
+    window.open(getAudioLabFolderBatchManifestUrl(activeFolderBatchJob.id), "_blank", "noopener,noreferrer");
+  }
+
   async function copyTextToClipboard(text, successMessage = "Copiado.") {
     if (!text) return;
     if (navigator.clipboard?.writeText) {
@@ -1907,6 +2317,23 @@ export default function AudioLabPage() {
       setMessage(successMessage);
     } else {
       setMessage(text);
+    }
+  }
+
+  async function diagnoseAudioPath(audioPath = selectedAudio?.audioPath) {
+    if (!audioPath) {
+      setError("No hay ruta de audio para diagnosticar.");
+      return;
+    }
+    try {
+      const result = await debugResolveAudio(audioPath);
+      const status = result.allowed && result.exists ? "permitida" : result.exists ? "no permitida" : "no encontrada";
+      setMessage(`Diagnostico de audio: ruta ${status}. ${result.reason || ""} ${result.matched_root ? `Root: ${result.matched_root}` : ""}`.trim());
+      if (result.playable_url && selectedAudio?.audioPath === audioPath) {
+        setSelectedAudio((current) => current ? { ...current, audioUrl: getPlayableAudioUrl({ playable_url: result.playable_url }) } : current);
+      }
+    } catch (err) {
+      setError(err.message || "No fue posible diagnosticar la ruta de audio.");
     }
   }
 
@@ -1933,13 +2360,24 @@ export default function AudioLabPage() {
   function openBatchOutputInLab(output) {
     const path = output.processed_audio_path || output.segment_audio_path;
     if (!path) return;
-    openAudioPath(path, output.display_label || output.display_name || getAudioName(path));
+    resetAnalysisState();
+    setUploadedFile(null);
+    setSelectedAudio({
+      kind: "batch_output",
+      title: output.display_label || output.display_name || getAudioName(path),
+      audioPath: path,
+      audioUrl: getPlayableAudioUrl(output),
+      originalAudioPath: output.source_audio_path || path,
+      processingPath: path,
+      originLabel: "output procesado",
+      isValid: true,
+    });
   }
 
   async function analyzeBatchOutput(output) {
     const path = output.processed_audio_path || output.segment_audio_path;
     if (!path) return;
-    await analyzeAudioPathDirect(path, output.display_label || output.display_name || getAudioName(path), getMediaFileUrl(path), traceFromBatchOutput(output));
+    await analyzeAudioPathDirect(path, output.display_label || output.display_name || getAudioName(path), getPlayableAudioUrl(output), traceFromBatchOutput(output));
   }
 
   function exportBatchOutputsCsv() {
@@ -2104,12 +2542,30 @@ export default function AudioLabPage() {
       const data = await uploadAudioLabBatch(files);
       const items = data.items || [];
       setUploadQueue((current) => [...items, ...current]);
+      if (items[0]?.stored_path) {
+        resetAnalysisState();
+        setUploadedFile(null);
+        setSelectedAudio({
+          kind: "upload_batch",
+          title: items[0].original_filename || getAudioName(items[0].stored_path),
+          audioPath: items[0].stored_path,
+          audioUrl: getMediaFileUrl(items[0].stored_path),
+          originalAudioPath: items[0].original_filename || getAudioName(items[0].stored_path),
+          processingPath: items[0].stored_path,
+          internalCopyPath: items[0].stored_path,
+          originLabel: "upload temporal",
+          isValid: true,
+        });
+      }
       addBatchProcessingItems(
         items.map((item) => ({
           id: `upload-processing:${item.id}`,
           output_path: item.stored_path,
           label: item.original_filename || getAudioName(item.stored_path),
-          source_kind: "upload",
+          source_kind: "upload temporal",
+          original_audio_path: item.original_filename || getAudioName(item.stored_path),
+          processing_path: item.stored_path,
+          internal_copy_path: item.stored_path,
         })),
         `${items.length} audio(s) subidos y agregados al lote.`
       );
@@ -2128,6 +2584,10 @@ export default function AudioLabPage() {
       title: item.audio_name || getAudioName(item.audio_path),
       audioPath: item.audio_path,
       audioUrl: getMediaFileUrl(item.audio_path),
+      originalAudioPath: item.original_audio_path || item.source_audio_path || item.audio_path,
+      processingPath: item.audio_path,
+      originLabel: audioOriginLabel(item.source_kind || "manual"),
+      isValid: true,
     });
     setPrediction(item.analysis);
   }
@@ -2452,12 +2912,12 @@ export default function AudioLabPage() {
   const representativeSegment = activeTableRows[0] || null;
   const batchProcessingItems = buildBatchProcessingItems();
   const batchProcessingSourceCounts = {
-    tabla: batchProcessingItems.filter((item) => item.source_kind === "tabla").length,
-    upload: batchProcessingItems.filter((item) => item.source_kind === "upload").length,
+    dataset: batchProcessingItems.filter((item) => item.source_kind === "dataset").length,
+    upload: batchProcessingItems.filter((item) => item.source_kind === "upload temporal").length,
     manual: batchProcessingItems.filter((item) => item.source_kind === "ruta manual").length,
-    activo: batchProcessingItems.filter((item) => item.source_kind === "audio activo").length,
+    local: batchProcessingItems.filter((item) => item.source_kind === "ruta local").length,
   };
-  const hasActiveAudioForBatch = Boolean(selectedAudio?.audioPath || (selectedAudio?.kind === "upload" && uploadedFile));
+  const hasActiveAudioForBatch = Boolean((selectedAudio?.isValid !== false && selectedAudio?.audioPath) || (selectedAudio?.kind === "upload" && uploadedFile));
   const activeAudioMissingFromBatch = hasActiveAudioForBatch && !activeAudioIsInBatchProcessing();
   const normalizedBatchJobSearch = batchJobSearch.trim().toLowerCase();
   const filteredBatchProcessingJobs = batchProcessingJobs.filter((job) => {
@@ -2486,6 +2946,46 @@ export default function AudioLabPage() {
       (batchJobFlagFilter === "errors" && Number(summary.errors || 0) > 0) ||
       (batchJobFlagFilter === "probable_rana" && Number(summary.probable_rana || 0) > 0);
     return matchesSearch && matchesStatus && matchesMode && matchesDate && matchesFlag;
+  });
+  const normalizedFolderBatchSearch = folderBatchSearch.trim().toLowerCase();
+  const filteredFolderBatchJobs = folderBatchJobs.filter((job) => {
+    const matchesSearch = !normalizedFolderBatchSearch || [
+      job.job_name,
+      job.id,
+      job.folder_path,
+      job.target_label,
+      job.status,
+      job.output_dir,
+    ].some((value) => String(value || "").toLowerCase().includes(normalizedFolderBatchSearch));
+    const matchesStatus = !folderBatchStatusFilter || job.status === folderBatchStatusFilter;
+    return matchesSearch && matchesStatus;
+  });
+  const folderBatchProgress = activeFolderBatchJob?.total_files
+    ? Math.round((Number(activeFolderBatchJob.processed_files || 0) / Number(activeFolderBatchJob.total_files || 1)) * 100)
+    : 0;
+  const filteredFolderBatchOutputs = folderBatchOutputs.filter((output) => {
+    const searchTerm = normalizedFolderBatchSearch;
+    const flags = output.contaminant_flags || output.contaminant_flags_json || "";
+    const recommendation = output.recommendation || "";
+    const ratio = Number(output.band_energy_ratio || 0);
+    const score = Number(output.activity_score || 0);
+    const durationValue = Number(output.duration_seconds || 0);
+    const matchesSearch = !searchTerm || [
+      output.original_audio_path,
+      output.output_audio_path,
+      recommendation,
+      flags,
+    ].some((value) => String(value || "").toLowerCase().includes(searchTerm));
+    const matchesMode =
+      folderBatchOutputFilter === "all" ||
+      (folderBatchOutputFilter === "candidates" && recommendation === "candidate") ||
+      (folderBatchOutputFilter === "excluded" && recommendation !== "candidate") ||
+      (folderBatchOutputFilter === "contaminants" && flags && flags !== "{}" && flags !== "[]") ||
+      (folderBatchOutputFilter === "errors" && recommendation === "error") ||
+      (folderBatchOutputFilter === "review" && recommendation.includes("review"));
+    const matchesScore = folderBatchMinScore === "" || score >= Number(folderBatchMinScore);
+    const matchesRatio = folderBatchMinRatio === "" || ratio >= Number(folderBatchMinRatio);
+    return matchesSearch && matchesMode && matchesScore && matchesRatio && durationValue >= 0;
   });
 
   return (
@@ -2792,6 +3292,22 @@ python -m uvicorn ml_api.main:app --host 127.0.0.1 --port 8010 --reload`}
               </button>
             </div>
             <input ref={uploadInputRef} type="file" accept="audio/*" className="hidden" onChange={openUpload} />
+            <div
+              onClick={() => uploadInputRef.current?.click()}
+              onDragOver={(event) => event.preventDefault()}
+              onDrop={(event) => {
+                event.preventDefault();
+                if (!event.dataTransfer.files?.length) {
+                  setMessage("Para carpetas grandes pega la ruta en Procesamiento masivo por carpeta local.");
+                  return;
+                }
+                handleBatchFiles(event.dataTransfer.files);
+              }}
+              className="cursor-pointer rounded-lg border border-dashed border-emerald-300 bg-emerald-50 p-4 text-center text-sm font-semibold text-emerald-900 hover:bg-emerald-100"
+            >
+              Arrastra audios aqui o haz clic para seleccionar
+              <p className="mt-1 text-xs font-normal text-emerald-800">Soporta .wav, .flac, .mp3, .ogg, .m4a. Si es una carpeta grande, pega la ruta abajo en procesamiento masivo.</p>
+            </div>
             <button
               type="button"
               onClick={() => uploadInputRef.current?.click()}
@@ -3080,6 +3596,310 @@ python -m uvicorn ml_api.main:app --host 127.0.0.1 --port 8010 --reload`}
         </div>
       </SectionCard>
 
+      <SectionCard title="Procesamiento masivo por carpeta local" subtitle="Limpia, segmenta y filtra carpetas grandes sin subir archivos uno por uno">
+        <div className="space-y-5">
+          <div className="rounded-lg border border-emerald-200 bg-emerald-50 p-3 text-sm text-emerald-950">
+            <p className="font-semibold">Para carpetas grandes, no subas archivos uno por uno. Escribe o pega la ruta local de la carpeta. El backend procesara los audios desde tu computador.</p>
+            <p className="mt-1">Los audios originales no se modifican ni se borran. Los derivados y manifests se guardan en backend/storage/audio_lab/folder_batch_jobs.</p>
+            {mlStatus.state !== "connected" ? (
+              <p className="mt-2 rounded-lg border border-amber-200 bg-amber-50 p-2 text-xs text-amber-900">
+                ML API no disponible; se omitira detector rana/sapo. El procesamiento DSP puede correr igual.
+              </p>
+            ) : null}
+          </div>
+
+          <div className="grid gap-4 xl:grid-cols-[minmax(0,0.85fr)_minmax(0,1.15fr)]">
+            <div className="space-y-4">
+              <label className="block text-sm">
+                <span className="mb-1 block font-semibold text-slate-700">Ruta de carpeta local</span>
+                <input
+                  value={folderBatchForm.folder_path}
+                  onChange={(event) => updateFolderBatchField("folder_path", event.target.value)}
+                  placeholder="C:\\Datos\\Ranas\\lote_01"
+                  className="w-full rounded-lg border border-slate-300 px-3 py-2"
+                />
+                <span className="mt-1 block text-xs text-slate-500">La ruta debe existir en este computador. Ejemplo: C:\Datos\Ranas\lote_01.</span>
+              </label>
+
+              <div className="grid gap-3 md:grid-cols-2">
+                <label className="text-sm">
+                  <span className="mb-1 block font-semibold text-slate-700">Nombre del job</span>
+                  <input value={folderBatchForm.job_name} onChange={(event) => updateFolderBatchField("job_name", event.target.value)} placeholder="boana_lote_mayo_2026" className="w-full rounded-lg border border-slate-300 px-3 py-2" />
+                </label>
+                <label className="text-sm">
+                  <span className="mb-1 block font-semibold text-slate-700">Label objetivo / especie</span>
+                  <input value={folderBatchForm.target_label} onChange={(event) => updateFolderBatchField("target_label", event.target.value)} placeholder="Boana_boans" className="w-full rounded-lg border border-slate-300 px-3 py-2" />
+                </label>
+              </div>
+
+              <label className="inline-flex items-center gap-2 rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm">
+                <input type="checkbox" checked={folderBatchForm.recursive} onChange={(event) => updateFolderBatchField("recursive", event.target.checked)} />
+                Buscar en subcarpetas
+              </label>
+
+              <div>
+                <div className="mb-2 text-sm font-semibold text-slate-700">Preset</div>
+                <div className="flex flex-wrap gap-2">
+                  {["conservador", "normal", "agresivo", "personalizado"].map((preset) => (
+                    <button
+                      key={preset}
+                      type="button"
+                      onClick={() => applyFolderBatchPreset(preset)}
+                      className={`rounded-lg border px-3 py-2 text-sm font-semibold ${folderBatchForm.preset === preset ? "border-emerald-500 bg-emerald-50 text-emerald-900" : "border-slate-300 bg-white text-slate-700"}`}
+                    >
+                      {preset}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <div className="grid gap-3 md:grid-cols-2">
+                {[
+                  ["frequency_min_hz", "Frecuencia minima Hz", "10"],
+                  ["frequency_max_hz", "Frecuencia maxima Hz", "10"],
+                  ["threshold_dbfs", "Threshold dBFS", "1"],
+                  ["min_band_ratio", "Ratio minimo energia banda", "0.05"],
+                  ["min_activity_seconds", "Min actividad s", "0.1"],
+                  ["min_silence_seconds", "Min silencio s", "0.1"],
+                  ["padding_seconds", "Padding s", "0.1"],
+                  ["clip_duration_seconds", "Duracion clip s", "0.5"],
+                  ["max_segment_seconds", "Max segmento s", "0.5"],
+                ].map(([key, label, step]) => (
+                  <label key={key} className="text-sm">
+                    <span className="mb-1 block font-semibold">{label}</span>
+                    <input type="number" step={step} value={folderBatchForm[key]} onChange={(event) => updateFolderBatchField(key, Number(event.target.value))} className="w-full rounded-lg border border-slate-300 px-3 py-2" />
+                  </label>
+                ))}
+              </div>
+
+              <div className="grid gap-2 text-sm md:grid-cols-2">
+                {[
+                  ["bandpass", "Bandpass"],
+                  ["noise_reduce", "Reduccion de ruido"],
+                  ["normalize", "Normalizar"],
+                  ["discard_empty", "Descartar vacios"],
+                  ["detect_frog", "Detector rana/sapo si ML API esta disponible"],
+                  ["detect_contaminants_heuristic", "Marcar contaminantes heuristico"],
+                  ["create_clips", "Crear clips derivados"],
+                  ["create_manifest", "Crear manifest CSV"],
+                ].map(([key, label]) => (
+                  <label key={key} className="flex items-center gap-2 rounded-lg border border-slate-200 bg-white p-2">
+                    <input type="checkbox" checked={Boolean(folderBatchForm[key])} onChange={(event) => updateFolderBatchField(key, event.target.checked)} />
+                    <span>{label}</span>
+                  </label>
+                ))}
+              </div>
+
+              <label className="block text-sm">
+                <span className="mb-1 block font-semibold text-slate-700">Perfil de recursos</span>
+                <select value={folderBatchForm.resource_profile} onChange={(event) => updateFolderBatchField("resource_profile", event.target.value)} className="w-full rounded-lg border border-slate-300 px-3 py-2">
+                  <option value="auto">auto</option>
+                  <option value="eco">eco</option>
+                  <option value="balanceado">balanceado</option>
+                  <option value="rendimiento">rendimiento</option>
+                </select>
+              </label>
+
+              <div className="rounded-lg border border-slate-200 bg-slate-50 p-3 text-xs text-slate-700">
+                <p><strong>Frecuencia:</strong> si la especie canta entre 2 y 3 kHz, escribe 2000 y 3000 Hz.</p>
+                <p className="mt-1"><strong>dBFS:</strong> este valor es nivel digital relativo del archivo; no es dB SPL calibrado.</p>
+              </div>
+
+              <div className="flex flex-wrap gap-2">
+                <button type="button" onClick={scanFolderBatch} disabled={folderBatchScanning} className="rounded-lg bg-emerald-600 px-4 py-2 text-sm font-semibold text-white disabled:opacity-50">
+                  <LoadingText loading={folderBatchScanning} loadingText="Escaneando...">Escanear carpeta</LoadingText>
+                </button>
+                <button type="button" onClick={startFolderBatchJob} disabled={folderBatchSubmitting || !folderBatchScan} className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-semibold text-white disabled:opacity-50">
+                  <LoadingText loading={folderBatchSubmitting} loadingText="Creando job...">Iniciar procesamiento</LoadingText>
+                </button>
+              </div>
+            </div>
+
+            <div className="space-y-4">
+              {folderBatchScan ? (
+                <div className="rounded-lg border border-emerald-200 bg-white p-4">
+                  <div className="flex flex-wrap items-start justify-between gap-3">
+                    <div>
+                      <h3 className="font-bold text-emerald-950">Resumen de escaneo</h3>
+                      <p className="mt-1 max-w-2xl truncate text-xs text-slate-500" title={folderBatchScan.folder_path}>{folderBatchScan.folder_path}</p>
+                    </div>
+                    <Badge tone="success">{folderBatchScan.files_found || 0} archivos</Badge>
+                  </div>
+                  <div className="mt-3 grid gap-2 text-sm sm:grid-cols-4">
+                    <span>Tamano: <strong>{formatBytes(folderBatchScan.total_size_bytes)}</strong></span>
+                    <span>Duracion est.: <strong>{formatTime(folderBatchScan.estimated_duration_seconds)}</strong></span>
+                    <span>Espacio recomendado: <strong>{formatBytes(Number(folderBatchScan.total_size_bytes || 0) * 0.35)}</strong></span>
+                    <span>Extensiones: <strong>{Object.keys(folderBatchScan.extensions_count || {}).length}</strong></span>
+                  </div>
+                  {folderBatchScan.warnings?.length ? (
+                    <ul className="mt-3 list-disc pl-5 text-xs text-amber-800">
+                      {folderBatchScan.warnings.map((warning) => <li key={warning}>{warning}</li>)}
+                    </ul>
+                  ) : null}
+                  <div className="mt-3 max-h-28 overflow-auto rounded-lg border border-slate-100 bg-slate-50 p-2 text-xs text-slate-600">
+                    {(folderBatchScan.sample_files || []).map((path) => <div key={path} className="truncate" title={path}>{path}</div>)}
+                  </div>
+                </div>
+              ) : (
+                <p className="rounded-lg border border-slate-200 p-4 text-sm text-slate-500">Escanea una carpeta para ver archivos encontrados, tamano, duracion estimada y advertencias antes de iniciar.</p>
+              )}
+
+              {activeFolderBatchJob ? (
+                <div className="rounded-lg border border-blue-200 bg-blue-50 p-4">
+                  <div className="flex flex-wrap items-start justify-between gap-3">
+                    <div className="min-w-0">
+                      <h3 className="truncate font-bold text-blue-950">{activeFolderBatchJob.job_name || activeFolderBatchJob.id}</h3>
+                      <p className="text-sm text-blue-900">{activeFolderBatchJob.status} - {activeFolderBatchJob.target_label || "-"}</p>
+                      <p className="mt-1 truncate text-xs text-blue-800" title={activeFolderBatchJob.current_file || activeFolderBatchJob.folder_path}>{activeFolderBatchJob.current_file || activeFolderBatchJob.folder_path}</p>
+                    </div>
+                    <div className="flex flex-wrap gap-2">
+                      <button type="button" onClick={() => refreshFolderBatchJob(activeFolderBatchJob.id)} className="rounded-lg border border-blue-300 bg-white px-3 py-2 text-xs font-semibold">Refrescar</button>
+                      <button type="button" onClick={pauseFolderBatchJob} disabled={activeFolderBatchJob.status !== "running"} className="rounded-lg border border-amber-300 bg-white px-3 py-2 text-xs font-semibold text-amber-800 disabled:opacity-50">Pausar</button>
+                      <button type="button" onClick={resumeFolderBatchJob} disabled={activeFolderBatchJob.status !== "paused"} className="rounded-lg border border-emerald-300 bg-white px-3 py-2 text-xs font-semibold text-emerald-800 disabled:opacity-50">Reanudar</button>
+                      <button type="button" onClick={cancelFolderBatchJob} disabled={!["pending", "running", "paused"].includes(activeFolderBatchJob.status)} className="rounded-lg border border-red-300 bg-white px-3 py-2 text-xs font-semibold text-red-700 disabled:opacity-50">Cancelar</button>
+                    </div>
+                  </div>
+                  <div className="mt-3 h-3 overflow-hidden rounded-full bg-white">
+                    <div className="h-full bg-blue-600" style={{ width: `${Math.max(0, Math.min(100, folderBatchProgress))}%` }} />
+                  </div>
+                  <div className="mt-3 grid gap-2 text-xs text-blue-950 sm:grid-cols-4">
+                    <span>Archivos: <strong>{activeFolderBatchJob.processed_files || 0}/{activeFolderBatchJob.total_files || 0}</strong></span>
+                    <span>Candidatos: <strong>{activeFolderBatchJob.candidates_count || 0}</strong></span>
+                    <span>Descartados: <strong>{activeFolderBatchJob.discarded_count || 0}</strong></span>
+                    <span>Errores: <strong>{activeFolderBatchJob.errors_count || 0}</strong></span>
+                    <span>Contaminantes: <strong>{activeFolderBatchJob.contaminant_suspect_count || 0}</strong></span>
+                    <span>Rana/sapo ML: <strong>{activeFolderBatchJob.frog_positive_count || 0}</strong></span>
+                    <span>Duracion proc.: <strong>{formatTime(activeFolderBatchJob.processed_duration_seconds)}</strong></span>
+                    <span>Progreso: <strong>{folderBatchProgress}%</strong></span>
+                  </div>
+                  <div className="mt-3 flex flex-wrap gap-2">
+                    <button type="button" onClick={() => setFolderBatchLogs((current) => current || "")} className="rounded-lg border border-blue-300 bg-white px-3 py-2 text-xs font-semibold">Ver logs</button>
+                    <button type="button" onClick={openFolderBatchManifest} disabled={!activeFolderBatchJob.manifest_path} className="rounded-lg border border-blue-300 bg-white px-3 py-2 text-xs font-semibold disabled:opacity-50">Exportar manifest</button>
+                    <button type="button" onClick={() => copyTextToClipboard(activeFolderBatchJob.output_dir, "Ruta de outputs copiada.")} disabled={!activeFolderBatchJob.output_dir} className="rounded-lg border border-blue-300 bg-white px-3 py-2 text-xs font-semibold disabled:opacity-50">Abrir carpeta de outputs</button>
+                  </div>
+                  {folderBatchLogs ? <pre className="mt-3 max-h-32 overflow-auto rounded-lg bg-slate-950 p-3 text-xs text-slate-100">{folderBatchLogs}</pre> : null}
+                </div>
+              ) : (
+                <p className="rounded-lg border border-slate-200 p-4 text-sm text-slate-500">Inicia un job o selecciona uno del historial para ver progreso, logs y resultados.</p>
+              )}
+
+              <div className="rounded-lg border border-slate-200 p-3">
+                <div className="grid gap-2 md:grid-cols-2">
+                  <label className="text-xs font-semibold text-slate-600">
+                    Buscar job/audio
+                    <input type="search" value={folderBatchSearch} onChange={(event) => setFolderBatchSearch(event.target.value)} placeholder="Nombre, ruta, id..." className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm font-normal" />
+                  </label>
+                  <label className="text-xs font-semibold text-slate-600">
+                    Estado
+                    <select value={folderBatchStatusFilter} onChange={(event) => setFolderBatchStatusFilter(event.target.value)} className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm font-normal">
+                      <option value="">Todos</option>
+                      {["pending", "running", "paused", "completed", "failed", "cancelled"].map((status) => <option key={status} value={status}>{status}</option>)}
+                    </select>
+                  </label>
+                </div>
+                <div className="mt-3 max-h-44 overflow-auto rounded-lg border border-slate-200">
+                  {filteredFolderBatchJobs.length ? (
+                    filteredFolderBatchJobs.map((job) => (
+                      <button key={job.id} type="button" onClick={() => refreshFolderBatchJob(job.id)} className="block w-full border-b border-slate-100 p-3 text-left text-sm last:border-b-0 hover:bg-slate-50">
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <strong>{job.job_name || job.id}</strong>
+                          <Badge tone={job.status === "completed" ? "success" : job.status === "failed" ? "danger" : job.status === "cancelled" ? "warning" : "info"}>{job.status}</Badge>
+                        </div>
+                        <div className="mt-1 truncate text-xs text-slate-500" title={job.folder_path}>{job.target_label || "-"} - {job.folder_path}</div>
+                      </button>
+                    ))
+                  ) : (
+                    <p className="p-4 text-sm text-slate-500">{folderBatchJobs.length ? "No hay jobs que coincidan con los filtros." : "Sin jobs de carpeta local."}</p>
+                  )}
+                </div>
+              </div>
+            </div>
+          </div>
+
+          {activeFolderBatchJob ? (
+            <div className="space-y-3">
+              <div className="grid gap-2 rounded-lg border border-slate-200 p-3 md:grid-cols-4">
+                <label className="text-xs font-semibold text-slate-600">
+                  Resultados
+                  <select value={folderBatchOutputFilter} onChange={(event) => setFolderBatchOutputFilter(event.target.value)} className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm font-normal">
+                    <option value="candidates">Solo candidatos</option>
+                    <option value="excluded">Solo excluidos</option>
+                    <option value="contaminants">Solo contaminantes</option>
+                    <option value="errors">Solo errores</option>
+                    <option value="review">Enviar/revisar</option>
+                    <option value="all">Todos</option>
+                  </select>
+                </label>
+                <label className="text-xs font-semibold text-slate-600">
+                  Score minimo
+                  <input type="number" step="0.05" value={folderBatchMinScore} onChange={(event) => setFolderBatchMinScore(event.target.value)} className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm font-normal" />
+                </label>
+                <label className="text-xs font-semibold text-slate-600">
+                  Ratio banda minimo
+                  <input type="number" step="0.05" value={folderBatchMinRatio} onChange={(event) => setFolderBatchMinRatio(event.target.value)} className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm font-normal" />
+                </label>
+                <div className="text-xs text-slate-600">
+                  <span className="block font-semibold">Summary</span>
+                  <span>{folderBatchSummary?.summary?.candidates || activeFolderBatchJob.candidates_count || 0} candidatos, {folderBatchSummary?.summary?.contaminants || activeFolderBatchJob.contaminant_suspect_count || 0} sospechosos</span>
+                </div>
+              </div>
+
+              <div className="max-h-96 overflow-auto rounded-lg border border-slate-200">
+                <table className="min-w-full text-left text-sm">
+                  <thead className="sticky top-0 bg-slate-100 text-xs uppercase text-slate-500">
+                    <tr>
+                      <th className="px-3 py-2">Audio original</th>
+                      <th className="px-3 py-2">Segmento</th>
+                      <th className="px-3 py-2">Score</th>
+                      <th className="px-3 py-2">Ratio banda</th>
+                      <th className="px-3 py-2">RMS dBFS</th>
+                      <th className="px-3 py-2">Flags</th>
+                      <th className="px-3 py-2">Recomendacion</th>
+                      <th className="px-3 py-2">Acciones</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {filteredFolderBatchOutputs.length ? (
+                      filteredFolderBatchOutputs.map((output) => (
+                        <tr key={output.id} className="border-t border-slate-100">
+                          <td className="px-3 py-2">
+                            <div className="max-w-56 truncate font-semibold" title={output.original_audio_path}>{getAudioName(output.original_audio_path)}</div>
+                            <div className="max-w-56 truncate text-xs text-slate-500" title={output.original_audio_path}>{output.original_audio_path}</div>
+                          </td>
+                          <td className="px-3 py-2">{formatTime(output.start_seconds)} - {formatTime(output.end_seconds)}<div className="text-xs text-slate-500">{formatNumber(output.duration_seconds, 1)} s</div></td>
+                          <td className="px-3 py-2">{formatNumber(output.activity_score, 3)}</td>
+                          <td className="px-3 py-2">{formatNumber(output.band_energy_ratio, 3)}</td>
+                          <td className="px-3 py-2">{formatNumber(output.rms_dbfs, 1)}</td>
+                          <td className="px-3 py-2"><div className="max-w-48 truncate text-xs" title={output.contaminant_flags_json || ""}>{output.contaminant_flags_json || "[]"}</div></td>
+                          <td className="px-3 py-2"><Badge tone={output.recommendation === "candidate" ? "success" : output.recommendation === "error" ? "danger" : "warning"}>{output.recommendation || "review"}</Badge></td>
+                          <td className="px-3 py-2">
+                            <div className="flex flex-wrap gap-2">
+                              <button type="button" disabled={!output.output_audio_path} onClick={() => { openFolderBatchOutputInLab(output); window.setTimeout(() => audioRef.current?.play(), 150); }} className="rounded-lg border border-slate-300 px-2 py-1 text-xs font-semibold disabled:opacity-50">Reproducir</button>
+                              <button type="button" disabled={!output.output_audio_path} onClick={() => generateSpectrogram({ audio_path: output.output_audio_path, start_seconds: 0, end_seconds: undefined })} className="rounded-lg border border-slate-300 px-2 py-1 text-xs font-semibold disabled:opacity-50">Espectrograma</button>
+                              <button type="button" disabled={!output.quality_report_path} onClick={() => fetch(getMediaFileUrl(output.quality_report_path)).then((response) => response.json()).then(setQualityReport).catch(() => setError("No se pudo abrir reporte de calidad."))} className="rounded-lg border border-blue-300 bg-blue-50 px-2 py-1 text-xs font-semibold text-blue-800 disabled:opacity-50">Reporte calidad</button>
+                              <button type="button" onClick={() => openFolderBatchFeedback(output, "confirmed_positive")} className="rounded-lg border border-emerald-300 px-2 py-1 text-xs font-semibold text-emerald-800">Confirmar</button>
+                              <button type="button" onClick={() => openFolderBatchFeedback(output, "excluded_from_training", "ruido")} className="rounded-lg border border-red-300 px-2 py-1 text-xs font-semibold text-red-700">Excluir</button>
+                              <button type="button" onClick={() => openFolderBatchFeedback(output, "excluded_from_training", "voz_humana")} className="rounded-lg border border-red-300 px-2 py-1 text-xs font-semibold text-red-700">Voz humana</button>
+                              <button type="button" onClick={() => openFolderBatchFeedback(output, "excluded_from_training", "ruido")} className="rounded-lg border border-red-300 px-2 py-1 text-xs font-semibold text-red-700">Carro/motor</button>
+                              <button type="button" onClick={() => openFolderBatchFeedback(output, "excluded_from_training", "otro")} className="rounded-lg border border-red-300 px-2 py-1 text-xs font-semibold text-red-700">Ave</button>
+                              <button type="button" onClick={() => openFolderBatchFeedback(output, "uncertain")} className="rounded-lg border border-slate-300 px-2 py-1 text-xs font-semibold">Enviar a revisar</button>
+                            </div>
+                          </td>
+                        </tr>
+                      ))
+                    ) : (
+                      <tr>
+                        <td colSpan="8" className="px-3 py-8 text-center text-slate-500">Sin resultados con estos filtros todavia.</td>
+                      </tr>
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          ) : null}
+        </div>
+      </SectionCard>
+
       <SectionCard title="Procesamiento por lote" subtitle="Limpia clips existentes o prepara audios crudos sin modificar originales">
         <div className="space-y-5">
           <div className="grid gap-3 md:grid-cols-2">
@@ -3108,10 +3928,10 @@ python -m uvicorn ml_api.main:app --host 127.0.0.1 --port 8010 --reload`}
               <p>No hay audios en el lote. Selecciona audios con el checkbox LOTE, sube archivos, pega rutas o agrega el audio activo.</p>
             )}
             <div className="mt-2 flex flex-wrap gap-2 text-xs">
-              <Badge tone={batchProcessingSourceCounts.tabla ? "info" : "default"}>Tabla: {batchProcessingSourceCounts.tabla}</Badge>
+              <Badge tone={batchProcessingSourceCounts.dataset ? "info" : "default"}>Dataset: {batchProcessingSourceCounts.dataset}</Badge>
               <Badge tone={batchProcessingSourceCounts.upload ? "info" : "default"}>Uploads: {batchProcessingSourceCounts.upload}</Badge>
               <Badge tone={batchProcessingSourceCounts.manual ? "info" : "default"}>Rutas manuales: {batchProcessingSourceCounts.manual}</Badge>
-              <Badge tone={batchProcessingSourceCounts.activo ? "info" : "default"}>Audio activo: {batchProcessingSourceCounts.activo}</Badge>
+              <Badge tone={batchProcessingSourceCounts.local ? "info" : "default"}>Rutas locales: {batchProcessingSourceCounts.local}</Badge>
             </div>
           </div>
 
@@ -3126,6 +3946,20 @@ python -m uvicorn ml_api.main:app --host 127.0.0.1 --port 8010 --reload`}
 
           {batchProcessingHelp ? (
             <p className="rounded-lg border border-blue-200 bg-blue-50 p-3 text-sm text-blue-800">{batchProcessingHelp}</p>
+          ) : null}
+
+          {batchProcessingJobAllowedRoots.length ? (
+            <div className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-xs text-amber-900">
+              <div className="font-semibold">Carpetas autorizadas solo para este job</div>
+              {batchProcessingJobAllowedRoots.map((root) => (
+                <div key={root} className="mt-1 flex items-center justify-between gap-3">
+                  <span className="truncate font-mono" title={root}>{root}</span>
+                  <button type="button" onClick={() => setBatchProcessingJobAllowedRoots((current) => current.filter((item) => item !== root))} className="rounded border border-amber-300 bg-white px-2 py-1 font-semibold">
+                    Quitar
+                  </button>
+                </div>
+              ))}
+            </div>
           ) : null}
 
           <div className="grid gap-3 xl:grid-cols-[minmax(0,0.8fr)_minmax(0,1.2fr)]">
@@ -3151,15 +3985,44 @@ python -m uvicorn ml_api.main:app --host 127.0.0.1 --port 8010 --reload`}
                   {batchProcessingItems.map((item) => (
                     <div key={`${item.source_kind}:${item.output_path}`} className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-100 p-3 text-sm last:border-b-0">
                       <div className="min-w-0 flex-1">
-                        <div className="truncate font-semibold" title={item.output_path}>{item.label || getAudioName(item.output_path)}</div>
-                        <div className="truncate text-xs text-slate-500" title={item.output_path}>{item.output_path}</div>
+                        <div className="truncate font-semibold" title={item.label || getAudioName(item.output_path)}>{item.label || getAudioName(item.output_path)}</div>
+                        <div className="mt-1 grid gap-1 text-xs text-slate-600 md:grid-cols-2">
+                          <div className="min-w-0">
+                            <span className="font-semibold">Origen:</span> {item.source_kind}
+                          </div>
+                          <div className="min-w-0">
+                            <span className="font-semibold">Duracion:</span> {item.duration_seconds ? `${formatNumber(item.duration_seconds, 1)} s` : "-"}
+                          </div>
+                          <div className="min-w-0 md:col-span-2">
+                            <span className="font-semibold">Ruta original:</span>{" "}
+                            <span className="break-all font-mono">{item.original_audio_path || item.output_path}</span>
+                          </div>
+                          <div className="min-w-0 md:col-span-2">
+                            <span className="font-semibold">Ruta usada para procesamiento:</span>{" "}
+                            <span className="break-all font-mono">{item.processing_path || item.output_path}</span>
+                          </div>
+                          {item.internal_copy_path ? (
+                            <div className="min-w-0 md:col-span-2">
+                              <span className="font-semibold">Copia interna:</span>{" "}
+                              <span className="break-all font-mono">{item.internal_copy_path}</span>
+                            </div>
+                          ) : null}
+                          <div className="min-w-0 md:col-span-2">
+                            <span className="font-semibold">Estado autorizacion:</span> {batchAuthorizationStatus(item)}
+                          </div>
+                        </div>
                         <div className="mt-1 flex flex-wrap gap-2 text-xs text-slate-500">
-                          <span>Origen: <strong>{item.source_kind}</strong></span>
-                          <span>Duracion: <strong>{item.duration_seconds ? `${formatNumber(item.duration_seconds, 1)} s` : "-"}</strong></span>
+                          <details>
+                            <summary className="cursor-pointer font-semibold text-slate-700">Detalles</summary>
+                            <pre className="mt-2 max-w-full overflow-auto rounded bg-slate-950 p-2 text-[11px] text-slate-100">{JSON.stringify(item, null, 2)}</pre>
+                          </details>
                         </div>
                       </div>
                       <button type="button" onClick={() => removeBatchProcessingItem(item)} className="rounded-lg border border-red-300 px-3 py-2 text-xs font-semibold text-red-700">
                         Quitar
+                      </button>
+                      <button type="button" onClick={() => authorizeBatchRootForPath(item)} className="rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-xs font-semibold text-amber-900">
+                        Autorizar carpeta para este job
                       </button>
                     </div>
                   ))}
@@ -3421,9 +4284,28 @@ python -m uvicorn ml_api.main:app --host 127.0.0.1 --port 8010 --reload`}
               preload="metadata"
               onLoadedMetadata={handleAudioLoaded}
               onTimeUpdate={handleTimeUpdate}
-              onError={() => setError("No fue posible cargar el audio seleccionado.")}
+              onError={() => {
+                setSelectedAudio((current) => current ? { ...current, isValid: false, loadError: "No se pudo reproducir el audio." } : current);
+                setError("No se pudo reproducir el audio. El archivo puede no existir, estar fuera de las carpetas permitidas del backend o tener un formato no soportado por el navegador. Usa Diagnosticar ruta para revisar la configuracion.");
+              }}
               className="hidden"
             />
+            {selectedAudio.loadError ? (
+              <div className="rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-800">
+                {selectedAudio.loadError} El audio actual no se agregara al lote hasta que vuelva a cargar correctamente.
+              </div>
+            ) : null}
+            <div className="rounded-lg border border-slate-200 bg-slate-50 p-3 text-xs text-slate-700">
+              <div className="flex flex-wrap gap-2">
+                <Badge tone="info">Origen: {selectedAudio.originLabel || audioOriginLabel(selectedAudio.kind)}</Badge>
+                {selectedAudio.internalCopyPath ? <Badge>copia temporal segura</Badge> : null}
+              </div>
+              <div className="mt-2 grid gap-1">
+                <div><strong>Ruta original:</strong> <span className="break-all font-mono">{selectedAudio.originalAudioPath || selectedAudio.audioPath || selectedAudio.title}</span></div>
+                <div><strong>Ruta usada para reproducir/procesar:</strong> <span className="break-all font-mono">{selectedAudio.processingPath || selectedAudio.audioPath || selectedAudio.audioUrl}</span></div>
+                {selectedAudio.internalCopyPath ? <div><strong>Copia interna:</strong> <span className="break-all font-mono">{selectedAudio.internalCopyPath}</span></div> : null}
+              </div>
+            </div>
             <div className="flex flex-wrap items-center gap-2">
               <button type="button" onClick={() => audioRef.current?.play()} className="rounded-lg bg-emerald-600 px-4 py-2 text-sm font-semibold text-white">
                 Play
@@ -3507,6 +4389,12 @@ python -m uvicorn ml_api.main:app --host 127.0.0.1 --port 8010 --reload`}
               </button>
               <button type="button" onClick={() => setSelection(null)} className="rounded-lg border border-slate-300 px-3 py-2 text-sm font-semibold">
                 Limpiar seleccion
+              </button>
+              <button type="button" onClick={() => copyTextToClipboard(selectedAudio.audioPath, "Ruta de audio copiada.")} className="rounded-lg border border-slate-300 px-3 py-2 text-sm font-semibold">
+                Copiar ruta
+              </button>
+              <button type="button" onClick={() => diagnoseAudioPath(selectedAudio.audioPath)} className="rounded-lg border border-blue-300 bg-blue-50 px-3 py-2 text-sm font-semibold text-blue-800">
+                Diagnosticar ruta
               </button>
             </div>
           </div>

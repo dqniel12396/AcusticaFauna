@@ -81,8 +81,8 @@ def initialized_test_db(test_settings):
 
 
 @pytest.fixture
-def sample_audio_file(tmp_path: Path) -> Path:
-    return write_wav(tmp_path / "sample.wav")
+def sample_audio_file(test_settings) -> Path:
+    return write_wav(test_settings.STORAGE_DIR / "sample.wav")
 
 
 @pytest.fixture

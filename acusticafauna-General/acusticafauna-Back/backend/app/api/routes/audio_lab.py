@@ -3,6 +3,7 @@ from __future__ import annotations
 import uuid
 import base64
 import csv
+import fnmatch
 import json
 import math
 import re
@@ -20,6 +21,13 @@ from pydantic import BaseModel
 
 from app.core.config import settings
 from app.db.database import get_connection
+from app.services.audio_path_service import (
+    allowed_audio_roots,
+    debug_resolve_audio_path,
+    media_type_for_path,
+    playable_url_for_path,
+    resolve_allowed_audio_path,
+)
 
 try:
     import soundfile as sf
@@ -51,6 +59,10 @@ BATCH_JOB_CANCEL_EVENTS: dict[str, threading.Event] = {}
 BATCH_JOB_STATUSES = {"queued", "running", "completed", "failed", "canceled"}
 BATCH_JOB_MODES = {"clean_existing", "full_auto"}
 BATCH_JOB_PRESETS = {"conservador", "normal", "agresivo", "personalizado"}
+FOLDER_BATCH_EXTENSIONS = {".wav", ".flac", ".mp3", ".ogg", ".m4a"}
+FOLDER_BATCH_STATUSES = {"pending", "running", "paused", "completed", "failed", "cancelled"}
+FOLDER_BATCH_MODES = {"species_folder_cleanup"}
+FOLDER_BATCH_PRESETS = {"conservador", "normal", "agresivo", "personalizado"}
 
 
 class AudioLabAnnotationPayload(BaseModel):
@@ -207,6 +219,7 @@ class BatchProcessingJobPayload(BaseModel):
     denoise_params: BatchDenoiseParams = BatchDenoiseParams()
     detector_params: BatchDetectorParams = BatchDetectorParams()
     output_policy: BatchOutputPolicy = BatchOutputPolicy()
+    job_allowed_roots: list[str] = []
 
 
 class QualityReportPayload(BaseModel):
@@ -216,6 +229,50 @@ class QualityReportPayload(BaseModel):
     frog_detector_model_id: str = "frog_detector_v1_binary_v3_hardneg"
     frog_detector_threshold: float = 0.30
     batch_output_id: str | None = None
+
+
+class DebugResolveAudioPayload(BaseModel):
+    audio_path: str | None = None
+    segment_id: str | None = None
+    context: str | None = None
+
+
+class FolderBatchScanPayload(BaseModel):
+    folder_path: str
+    recursive: bool = True
+    extensions: list[str] = [".wav", ".flac", ".mp3", ".ogg", ".m4a"]
+    include_patterns: list[str] = []
+    exclude_patterns: list[str] = []
+
+
+class FolderBatchJobPayload(BaseModel):
+    job_name: str
+    folder_path: str
+    recursive: bool = True
+    target_label: str
+    mode: str = "species_folder_cleanup"
+    preset: str = "normal"
+    frequency_min_hz: float = 1800
+    frequency_max_hz: float = 3000
+    threshold_dbfs: float = -45
+    min_activity_seconds: float = 0.4
+    min_silence_seconds: float = 1.0
+    padding_seconds: float = 0.3
+    clip_duration_seconds: float = 5.0
+    max_segment_seconds: float = 10.0
+    min_band_ratio: float = 0.25
+    bandpass: bool = True
+    noise_reduce: bool = True
+    normalize: bool = True
+    discard_empty: bool = True
+    detect_frog: bool = True
+    detect_contaminants_heuristic: bool = True
+    create_clips: bool = True
+    create_manifest: bool = True
+    resource_profile: str = "auto"
+    include_patterns: list[str] = []
+    exclude_patterns: list[str] = []
+    extensions: list[str] = [".wav", ".flac", ".mp3", ".ogg", ".m4a"]
 
 
 class CleanManifestPayload(BaseModel):
@@ -410,6 +467,332 @@ def batch_job_dir(job_id: str, *parts: str) -> Path:
     return path
 
 
+def folder_batch_job_dir(job_id: str, *parts: str) -> Path:
+    path = audio_lab_dir("folder_batch_jobs") / job_id
+    for part in parts:
+        path = path / part
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def normalize_extensions(extensions: list[str] | None) -> set[str]:
+    values = extensions or list(FOLDER_BATCH_EXTENSIONS)
+    normalized = {value.lower() if value.startswith(".") else f".{value.lower()}" for value in values}
+    return normalized & FOLDER_BATCH_EXTENSIONS or set(FOLDER_BATCH_EXTENSIONS)
+
+
+def matches_folder_patterns(path: Path, include_patterns: list[str], exclude_patterns: list[str]) -> bool:
+    text = str(path)
+    name = path.name
+    if include_patterns and not any(fnmatch.fnmatch(name, pattern) or fnmatch.fnmatch(text, pattern) for pattern in include_patterns):
+        return False
+    if exclude_patterns and any(fnmatch.fnmatch(name, pattern) or fnmatch.fnmatch(text, pattern) for pattern in exclude_patterns):
+        return False
+    return True
+
+
+def list_folder_audio_files(payload: FolderBatchScanPayload | FolderBatchJobPayload) -> list[Path]:
+    folder = Path(payload.folder_path).expanduser().resolve(strict=False)
+    if not folder.exists() or not folder.is_dir():
+        raise HTTPException(status_code=404, detail="La ruta de carpeta no existe en este computador.")
+    extensions = normalize_extensions(payload.extensions)
+    iterator = folder.rglob("*") if payload.recursive else folder.glob("*")
+    files = [
+        path
+        for path in iterator
+        if path.is_file()
+        and path.suffix.lower() in extensions
+        and matches_folder_patterns(path, payload.include_patterns, payload.exclude_patterns)
+    ]
+    return sorted(files, key=lambda item: str(item).lower())
+
+
+def audio_file_info(path: Path) -> dict[str, Any]:
+    size = path.stat().st_size
+    sample_rate = None
+    duration = None
+    try:
+        if sf is not None:
+            info = sf.info(str(path))
+            sample_rate = int(info.samplerate)
+            duration = float(info.duration)
+        elif path.suffix.lower() == ".wav":
+            with wave.open(str(path), "rb") as wav:
+                sample_rate = int(wav.getframerate())
+                duration = float(wav.getnframes() / max(1, sample_rate))
+    except Exception:
+        pass
+    return {
+        "size_bytes": int(size),
+        "duration_seconds": duration,
+        "sample_rate": sample_rate,
+    }
+
+
+def scan_folder_payload(payload: FolderBatchScanPayload | FolderBatchJobPayload) -> dict[str, Any]:
+    files = list_folder_audio_files(payload)
+    extensions_count: dict[str, int] = {}
+    total_size = 0
+    estimated_duration = 0.0
+    warnings: list[str] = []
+    sample_files = []
+    for index, path in enumerate(files):
+        extensions_count[path.suffix.lower()] = extensions_count.get(path.suffix.lower(), 0) + 1
+        info = audio_file_info(path)
+        total_size += int(info["size_bytes"])
+        if info["duration_seconds"] is not None:
+            estimated_duration += float(info["duration_seconds"])
+        elif index < 25:
+            warnings.append(f"No se pudo estimar duracion: {path}")
+        if len(sample_files) < 10:
+            sample_files.append(str(path))
+    if total_size > 50 * 1024**3:
+        warnings.append("Lote grande detectado: se recomienda procesar por perfil eco o balanceado y revisar espacio en disco.")
+    folder_resolved = Path(payload.folder_path).expanduser().resolve(strict=False)
+    return {
+        "folder_path": str(Path(payload.folder_path).expanduser()),
+        "folder_path_resolved": str(folder_resolved),
+        "job_allowed_root": str(folder_resolved),
+        "files_found": len(files),
+        "total_size_bytes": total_size,
+        "estimated_duration_seconds": round(estimated_duration, 3),
+        "extensions_count": extensions_count,
+        "sample_files": sample_files,
+        "warnings": warnings,
+    }
+
+
+def iter_audio_blocks(path: Path, block_seconds: float = 20.0):
+    if sf is not None:
+        with sf.SoundFile(str(path)) as audio_file:
+            sample_rate = int(audio_file.samplerate)
+            block_size = max(1, int(sample_rate * block_seconds))
+            start = 0
+            while True:
+                data = audio_file.read(block_size, always_2d=True, dtype="float32")
+                if data.size == 0:
+                    break
+                mono = data.mean(axis=1).astype("float32")
+                yield mono, sample_rate, float(start / sample_rate)
+                start += len(mono)
+        return
+    if path.suffix.lower() != ".wav":
+        raise RuntimeError("soundfile no esta instalado; solo WAV soportado por streaming.")
+    with wave.open(str(path), "rb") as wav:
+        sample_rate = int(wav.getframerate())
+        channels = int(wav.getnchannels())
+        sample_width = int(wav.getsampwidth())
+        block_frames = max(1, int(sample_rate * block_seconds))
+        start = 0
+        while True:
+            raw = wav.readframes(block_frames)
+            if not raw:
+                break
+            if sample_width == 2:
+                data = np.frombuffer(raw, dtype="<i2").astype("float32") / 32768.0
+            elif sample_width == 1:
+                data = (np.frombuffer(raw, dtype=np.uint8).astype("float32") - 128.0) / 128.0
+            else:
+                raise RuntimeError("sample width WAV no soportado en streaming.")
+            if channels > 1:
+                data = data.reshape(-1, channels).mean(axis=1)
+            yield data.astype("float32"), sample_rate, float(start / sample_rate)
+            start += len(data)
+
+
+def frame_band_metrics(
+    frame: np.ndarray,
+    sample_rate: int,
+    frequency_min_hz: float,
+    frequency_max_hz: float,
+) -> dict[str, float]:
+    epsilon = 1e-12
+    rms = float(np.sqrt(np.mean(np.square(frame)) + epsilon))
+    total_energy = float(np.sum(np.square(frame)) + epsilon)
+    window = np.hanning(frame.size).astype("float32")
+    spectrum = np.fft.rfft(frame * window)
+    freqs = np.fft.rfftfreq(frame.size, d=1.0 / sample_rate)
+    power = np.square(np.abs(spectrum))
+    total_power = float(np.sum(power) + epsilon)
+    band_mask = (freqs >= frequency_min_hz) & (freqs <= min(frequency_max_hz, sample_rate / 2))
+    low_mask = freqs < 500
+    voice_mask = (freqs >= 300) & (freqs <= 3400)
+    high_mask = freqs > 4000
+    band_power = float(np.sum(power[band_mask]) + epsilon) if np.any(band_mask) else epsilon
+    band_ratio = float(band_power / total_power)
+    band_rms = rms * math.sqrt(max(0.0, min(1.0, band_ratio)))
+    return {
+        "rms_dbfs": dbfs(rms),
+        "band_rms_dbfs": dbfs(band_rms),
+        "band_energy_ratio": band_ratio,
+        "low_ratio": float(np.sum(power[low_mask]) / total_power) if np.any(low_mask) else 0.0,
+        "voice_ratio": float(np.sum(power[voice_mask]) / total_power) if np.any(voice_mask) else 0.0,
+        "high_ratio": float(np.sum(power[high_mask]) / total_power) if np.any(high_mask) else 0.0,
+        "total_energy": total_energy,
+    }
+
+
+def contaminant_flags_from_metrics(metrics: dict[str, float], payload: FolderBatchJobPayload, duration: float) -> list[str]:
+    flags: list[str] = []
+    band_ratio = metrics.get("band_energy_ratio", 0.0)
+    if metrics.get("voice_ratio", 0.0) > 0.60 and band_ratio < max(payload.min_band_ratio, 0.35) and duration >= 1.0:
+        flags.append("voz_humana_suspect")
+    if metrics.get("low_ratio", 0.0) > 0.55 and duration >= 1.5:
+        flags.append("carro_motor_suspect")
+    if metrics.get("high_ratio", 0.0) > 0.45 and duration <= 3.0:
+        flags.append("ave_suspect")
+    if band_ratio < 0.18 and metrics.get("voice_ratio", 0.0) > 0.20 and metrics.get("high_ratio", 0.0) > 0.20:
+        flags.append("broadband_noise_suspect")
+    return flags
+
+
+def analyze_folder_audio_file(path: Path, payload: FolderBatchJobPayload) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    info = audio_file_info(path)
+    sample_rate = info.get("sample_rate")
+    duration = float(info.get("duration_seconds") or 0.0)
+    frame_seconds = 0.10
+    hop_seconds = 0.05
+    active_intervals: list[tuple[float, float, dict[str, float]]] = []
+    for block, block_rate, block_start in iter_audio_blocks(path, block_seconds=20.0):
+        sample_rate = sample_rate or block_rate
+        if block.size == 0:
+            continue
+        frame_size = max(1, int(block_rate * frame_seconds))
+        hop_size = max(1, int(block_rate * hop_seconds))
+        if block.size < frame_size:
+            block = np.pad(block, (0, frame_size - block.size))
+        for start in range(0, max(block.size - frame_size, 0) + 1, hop_size):
+            frame = block[start : start + frame_size]
+            metrics = frame_band_metrics(frame, block_rate, payload.frequency_min_hz, payload.frequency_max_hz)
+            is_active = (
+                metrics["band_rms_dbfs"] >= payload.threshold_dbfs
+                and metrics["band_energy_ratio"] >= payload.min_band_ratio
+            )
+            if is_active:
+                absolute_start = block_start + float(start / block_rate)
+                active_intervals.append((absolute_start, absolute_start + frame_seconds, metrics))
+    if sample_rate is None:
+        sample_rate = 0
+    if duration <= 0 and sample_rate:
+        duration = max((end for _, end, _ in active_intervals), default=0.0)
+    merged = merge_intervals([(start, end) for start, end, _ in active_intervals], payload.min_silence_seconds)
+    padded = [(max(0.0, start - payload.padding_seconds), min(duration or end, end + payload.padding_seconds)) for start, end in merged]
+    merged = merge_intervals(padded, payload.min_silence_seconds)
+    merged = [(start, end) for start, end in merged if end - start >= payload.min_activity_seconds]
+    merged = split_long_intervals(merged, payload.max_segment_seconds or payload.clip_duration_seconds)
+
+    segments: list[dict[str, Any]] = []
+    for index, (start, end) in enumerate(merged, start=1):
+        related = [metrics for frame_start, frame_end, metrics in active_intervals if frame_start < end and frame_end > start]
+        if not related:
+            continue
+        avg = {
+            key: float(np.mean([item[key] for item in related]))
+            for key in ["rms_dbfs", "band_rms_dbfs", "band_energy_ratio", "low_ratio", "voice_ratio", "high_ratio"]
+        }
+        peak_band = float(max(item["band_rms_dbfs"] for item in related))
+        segment_duration = float(end - start)
+        flags = contaminant_flags_from_metrics(avg, payload, segment_duration) if payload.detect_contaminants_heuristic else []
+        score = max(0.0, min(1.0, (avg["band_energy_ratio"] * 0.65) + (max(0.0, peak_band - payload.threshold_dbfs) / 40.0 * 0.35)))
+        recommendation = "candidate"
+        if flags:
+            recommendation = "requires_review"
+        if avg["band_energy_ratio"] < payload.min_band_ratio or segment_duration < payload.min_activity_seconds:
+            recommendation = "excluded"
+        segments.append(
+            {
+                "segment_key": f"seg_{index:04d}",
+                "start_seconds": round(float(start), 3),
+                "end_seconds": round(float(end), 3),
+                "duration_seconds": round(segment_duration, 3),
+                "frequency_min_hz": payload.frequency_min_hz,
+                "frequency_max_hz": payload.frequency_max_hz,
+                "rms_dbfs": round(avg["rms_dbfs"], 3),
+                "band_rms_dbfs": round(avg["band_rms_dbfs"], 3),
+                "band_energy_ratio": round(avg["band_energy_ratio"], 6),
+                "snr_estimate": round(peak_band - payload.threshold_dbfs, 3),
+                "activity_score": round(score, 4),
+                "contaminant_flags": flags,
+                "recommendation": recommendation,
+            }
+        )
+    return {
+        "duration_seconds": round(duration, 3),
+        "sample_rate": int(sample_rate or 0),
+        "size_bytes": int(info.get("size_bytes") or 0),
+    }, segments
+
+
+def folder_batch_payload_dict(payload: FolderBatchJobPayload) -> dict[str, Any]:
+    return pydantic_to_dict(payload)
+
+
+def validate_job_allowed_roots(raw_roots: list[str] | None, require_confirmation: bool = False) -> list[Path]:
+    roots: list[Path] = []
+    for raw in raw_roots or []:
+        root = Path(str(raw)).expanduser().resolve(strict=False)
+        anchor = Path(root.anchor) if root.anchor else None
+        if anchor and root == anchor and not require_confirmation:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": "job_allowed_root_too_broad",
+                    "message": "No se autoriza una raiz de unidad completa para este job. Selecciona una carpeta mas especifica.",
+                    "audio_path": str(root),
+                },
+            )
+        if not root.exists() or not root.is_dir():
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "error": "job_allowed_root_not_found",
+                    "message": "La carpeta autorizada para el job no existe.",
+                    "audio_path": str(root),
+                },
+            )
+        roots.append(root)
+    return roots
+
+
+def folder_batch_job_to_dict(row) -> dict[str, Any]:
+    item = dict(row)
+    if item.get("total_files"):
+        item["progress"] = round(float(item.get("processed_files") or 0) / float(item["total_files"]), 4)
+    else:
+        item["progress"] = 0.0
+    item["output_dir"] = item.get("output_dir") or str(folder_batch_job_dir(item["id"]))
+    return item
+
+
+def folder_job_status(job_id: str) -> str | None:
+    conn = get_connection()
+    try:
+        ensure_audio_lab_extra_schema(conn)
+        row = conn.execute("SELECT status FROM audio_lab_folder_batch_jobs WHERE id = ?", (job_id,)).fetchone()
+        return row["status"] if row else None
+    finally:
+        conn.close()
+
+
+def log_folder_batch_job(job_id: str, message: str) -> None:
+    logs_dir = folder_batch_job_dir(job_id, "logs")
+    (logs_dir / "job.log").open("a", encoding="utf-8").write(f"{now_iso()} {message}\n")
+
+
+def update_folder_batch_job(job_id: str, **values: Any) -> None:
+    if not values:
+        return
+    values["updated_at"] = now_iso()
+    conn = get_connection()
+    try:
+        ensure_audio_lab_extra_schema(conn)
+        assignments = ", ".join(f"{key} = ?" for key in values)
+        conn.execute(f"UPDATE audio_lab_folder_batch_jobs SET {assignments} WHERE id = ?", [*values.values(), job_id])
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def batch_payload_dict(payload: BatchProcessingJobPayload) -> dict[str, Any]:
     return {
         "job_name": payload.job_name,
@@ -421,6 +804,7 @@ def batch_payload_dict(payload: BatchProcessingJobPayload) -> dict[str, Any]:
         "denoise_params": pydantic_to_dict(payload.denoise_params),
         "detector_params": pydantic_to_dict(payload.detector_params),
         "output_policy": pydantic_to_dict(payload.output_policy),
+        "job_allowed_roots": payload.job_allowed_roots,
     }
 
 
@@ -578,6 +962,10 @@ def enrich_batch_outputs_with_quality_reports(conn, outputs, job: dict[str, Any]
         item["source_audio_stem"] = source_stem
         item["processed_audio_name"] = processed_name
         item["processed_audio_stem"] = processed_stem
+        playable_path = item.get("processed_audio_path") or item.get("segment_audio_path") or item.get("source_audio_path")
+        if playable_path:
+            item["playable_url"] = playable_url_for_path(playable_path)
+            item["audio_url"] = item["playable_url"]
         item["display_name"] = display_base
         item["display_label"] = f"{display_base} · procesado" if processed_path else display_base
         item["short_id"] = item.get("id", "")[:8]
@@ -693,9 +1081,7 @@ def split_long_intervals(intervals: list[tuple[float, float]], max_seconds: floa
 
 def detect_activity_segments(payload: ActivityDetectPayload) -> dict[str, Any]:
     validate_activity_payload(payload)
-    source = Path(payload.audio_path)
-    if not source.exists():
-        raise HTTPException(status_code=404, detail="Audio original no encontrado.")
+    source = resolve_allowed_audio_path(payload.audio_path)
 
     audio, sample_rate = read_audio_mono_for_activity(source)
     if audio.size == 0 or sample_rate <= 0:
@@ -1058,12 +1444,8 @@ def build_quality_recommendation(
 
 
 def build_quality_report(payload: QualityReportPayload) -> dict[str, Any]:
-    source = Path(payload.source_audio_path)
-    processed = Path(payload.processed_audio_path)
-    if not source.exists():
-        raise HTTPException(status_code=404, detail="Audio original no encontrado.")
-    if not processed.exists():
-        raise HTTPException(status_code=404, detail="Audio procesado no encontrado.")
+    source = resolve_allowed_audio_path(payload.source_audio_path)
+    processed = resolve_allowed_audio_path(payload.processed_audio_path)
 
     source_metrics = quality_metrics(source)
     processed_metrics = quality_metrics(processed)
@@ -1540,6 +1922,110 @@ def ensure_audio_lab_extra_schema(conn) -> None:
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS audio_lab_folder_batch_jobs (
+            id TEXT PRIMARY KEY,
+            job_name TEXT NOT NULL,
+            folder_path TEXT NOT NULL,
+            folder_path_resolved TEXT,
+            target_label TEXT,
+            status TEXT NOT NULL,
+            mode TEXT,
+            preset TEXT,
+            frequency_min_hz REAL,
+            frequency_max_hz REAL,
+            threshold_dbfs REAL,
+            total_files INTEGER DEFAULT 0,
+            processed_files INTEGER DEFAULT 0,
+            total_duration_seconds REAL DEFAULT 0,
+            processed_duration_seconds REAL DEFAULT 0,
+            candidates_count INTEGER DEFAULT 0,
+            discarded_count INTEGER DEFAULT 0,
+            contaminant_suspect_count INTEGER DEFAULT 0,
+            frog_positive_count INTEGER DEFAULT 0,
+            errors_count INTEGER DEFAULT 0,
+            output_dir TEXT,
+            manifest_path TEXT,
+            params_json TEXT,
+            summary_json TEXT,
+            current_file TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    existing_folder_job_columns = {row["name"] for row in conn.execute("PRAGMA table_info(audio_lab_folder_batch_jobs)").fetchall()}
+    if "folder_path_resolved" not in existing_folder_job_columns:
+        conn.execute("ALTER TABLE audio_lab_folder_batch_jobs ADD COLUMN folder_path_resolved TEXT")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS audio_lab_folder_batch_files (
+            id TEXT PRIMARY KEY,
+            job_id TEXT NOT NULL,
+            original_audio_path TEXT NOT NULL,
+            audio_name TEXT,
+            extension TEXT,
+            size_bytes INTEGER DEFAULT 0,
+            duration_seconds REAL,
+            sample_rate INTEGER,
+            status TEXT,
+            error TEXT,
+            processed_at TEXT,
+            FOREIGN KEY(job_id) REFERENCES audio_lab_folder_batch_jobs(id)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS audio_lab_folder_batch_segments (
+            id TEXT PRIMARY KEY,
+            job_id TEXT NOT NULL,
+            file_id TEXT NOT NULL,
+            original_audio_path TEXT NOT NULL,
+            start_seconds REAL,
+            end_seconds REAL,
+            duration_seconds REAL,
+            frequency_min_hz REAL,
+            frequency_max_hz REAL,
+            rms_dbfs REAL,
+            band_rms_dbfs REAL,
+            band_energy_ratio REAL,
+            snr_estimate REAL,
+            activity_score REAL,
+            contaminant_flags_json TEXT,
+            recommendation TEXT,
+            output_audio_path TEXT,
+            output_metadata_path TEXT,
+            quality_report_path TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(job_id) REFERENCES audio_lab_folder_batch_jobs(id),
+            FOREIGN KEY(file_id) REFERENCES audio_lab_folder_batch_files(id)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS audio_lab_folder_batch_outputs (
+            id TEXT PRIMARY KEY,
+            job_id TEXT NOT NULL,
+            file_id TEXT NOT NULL,
+            segment_id TEXT,
+            original_audio_path TEXT NOT NULL,
+            output_audio_path TEXT,
+            output_metadata_path TEXT,
+            quality_report_path TEXT,
+            recommendation TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(job_id) REFERENCES audio_lab_folder_batch_jobs(id),
+            FOREIGN KEY(file_id) REFERENCES audio_lab_folder_batch_files(id),
+            FOREIGN KEY(segment_id) REFERENCES audio_lab_folder_batch_segments(id)
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_audio_lab_folder_batch_files_job ON audio_lab_folder_batch_files(job_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_audio_lab_folder_batch_segments_job ON audio_lab_folder_batch_segments(job_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_audio_lab_folder_batch_outputs_job ON audio_lab_folder_batch_outputs(job_id)")
     conn.commit()
 
 
@@ -1821,11 +2307,20 @@ def annotation_facets():
         conn.close()
 
 
+@router.post("/debug/resolve-audio")
+def debug_resolve_audio(payload: DebugResolveAudioPayload):
+    if payload.context == "curated_dataset" and payload.segment_id:
+        from app.api.routes.curated_dataset import debug_curated_segment_audio
+
+        return debug_curated_segment_audio(payload.segment_id)
+    if not payload.audio_path:
+        raise HTTPException(status_code=400, detail="Debes enviar audio_path o segment_id con context=curated_dataset.")
+    return debug_resolve_audio_path(payload.audio_path)
+
+
 @router.get("/waveform")
 def get_waveform(audio_path: str, points: int = Query(1400, ge=100, le=10000)):
-    path = Path(audio_path)
-    if not path.exists():
-        raise HTTPException(status_code=404, detail="Audio no encontrado.")
+    path = resolve_allowed_audio_path(audio_path)
     try:
         if sf is not None:
             data, sample_rate = sf.read(str(path), always_2d=True)
@@ -2001,9 +2496,7 @@ def retract_annotation(annotation_id: str):
 def create_clip(payload: AudioClipPayload):
     if payload.end_seconds <= payload.start_seconds:
         raise HTTPException(status_code=400, detail="end_seconds debe ser mayor que start_seconds.")
-    source = Path(payload.source_audio_path)
-    if not source.exists():
-        raise HTTPException(status_code=404, detail="Audio original no encontrado.")
+    source = resolve_allowed_audio_path(payload.source_audio_path)
 
     clip_id = str(uuid.uuid4())
     created_at = now_iso()
@@ -2164,9 +2657,7 @@ def detect_activity(payload: ActivityDetectPayload):
 def create_activity_clips(payload: ActivityCreateClipsPayload):
     if payload.format.lower() != "wav":
         raise HTTPException(status_code=400, detail="Por ahora solo se soporta format=wav.")
-    source = Path(payload.audio_path)
-    if not source.exists():
-        raise HTTPException(status_code=404, detail="Audio original no encontrado.")
+    source = resolve_allowed_audio_path(payload.audio_path)
     if not payload.segments:
         raise HTTPException(status_code=400, detail="Debes enviar al menos un segmento.")
 
@@ -2235,6 +2726,7 @@ def run_batch_processing_job(job_id: str, payload: BatchProcessingJobPayload) ->
         update_batch_job(job_id, status="running", started_at=now_iso(), phase="validando archivos", progress=1)
         log_batch_job(job_id, f"Job iniciado modo={payload.mode} preset={payload.preset}")
         total = max(1, len(payload.input_audio_paths))
+        job_roots = [*allowed_audio_roots(), *validate_job_allowed_roots(payload.job_allowed_roots)]
         for index, raw_path in enumerate(payload.input_audio_paths):
             if cancel_event.is_set():
                 update_batch_job(job_id, status="canceled", phase="cancelado", finished_at=now_iso())
@@ -2244,10 +2736,13 @@ def run_batch_processing_job(job_id: str, payload: BatchProcessingJobPayload) ->
             base_progress = (index / total) * 100.0
             update_batch_job(job_id, current_file=str(source), phase="validando archivos", progress=round(base_progress, 2))
             item_id = insert_batch_item(job_id, str(source))
-            if not source.exists():
+            try:
+                source = resolve_allowed_audio_path(raw_path, job_roots)
+            except HTTPException as exc:
                 summary["errors"] += 1
-                update_batch_item(item_id, status="error", error_message="Audio original no encontrado.")
-                log_batch_job(job_id, f"ERROR no existe: {source}")
+                detail = exc.detail if isinstance(exc.detail, dict) else {"message": str(exc.detail)}
+                update_batch_item(item_id, status="error", error_message=json.dumps(detail, ensure_ascii=False))
+                log_batch_job(job_id, f"ERROR ruta no disponible: {raw_path} {detail}")
                 continue
 
             try:
@@ -2433,15 +2928,23 @@ def run_batch_processing_job(job_id: str, payload: BatchProcessingJobPayload) ->
             json.dumps(finished_summary, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
+        final_status = "completed"
+        final_phase = "completado"
+        if summary["errors"] and summary["audios_processed"] == 0:
+            final_status = "failed"
+            final_phase = "fallido"
+        elif summary["errors"]:
+            final_status = "completed_with_errors"
+            final_phase = "completado con errores"
         update_batch_job(
             job_id,
-            status="completed",
-            phase="completado",
+            status=final_status,
+            phase=final_phase,
             progress=100,
             summary_json=json.dumps(finished_summary, ensure_ascii=False),
             finished_at=now_iso(),
         )
-        log_batch_job(job_id, "Job completado")
+        log_batch_job(job_id, "Job completado" if final_status == "completed" else f"Job finalizado: {final_status}")
     except Exception as exc:
         summary["errors"] += 1
         update_batch_job(
@@ -2454,6 +2957,390 @@ def run_batch_processing_job(job_id: str, payload: BatchProcessingJobPayload) ->
         log_batch_job(job_id, f"FATAL {exc}")
     finally:
         BATCH_JOB_CANCEL_EVENTS.pop(job_id, None)
+
+
+def folder_batch_segment_to_manifest_row(job: dict[str, Any], file_row: dict[str, Any], segment: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "audio_path": segment.get("output_audio_path") or "",
+        "original_audio_path": segment.get("original_audio_path") or file_row.get("original_audio_path") or "",
+        "start_seconds": segment.get("start_seconds"),
+        "end_seconds": segment.get("end_seconds"),
+        "duration_seconds": segment.get("duration_seconds"),
+        "normalized_label": safe_filename(job.get("target_label") or "sin_label"),
+        "target_label": job.get("target_label") or "",
+        "source_job_id": job.get("id"),
+        "source_file_id": file_row.get("id"),
+        "processing_preset": job.get("preset"),
+        "frequency_min_hz": segment.get("frequency_min_hz"),
+        "frequency_max_hz": segment.get("frequency_max_hz"),
+        "threshold_dbfs": job.get("threshold_dbfs"),
+        "band_energy_ratio": segment.get("band_energy_ratio"),
+        "rms_dbfs": segment.get("rms_dbfs"),
+        "contaminant_flags": segment.get("contaminant_flags_json") or "[]",
+        "recommendation": segment.get("recommendation"),
+        "split": "",
+    }
+
+
+def write_folder_batch_manifest(job_id: str) -> str:
+    conn = get_connection()
+    try:
+        ensure_audio_lab_extra_schema(conn)
+        job_row = conn.execute("SELECT * FROM audio_lab_folder_batch_jobs WHERE id = ?", (job_id,)).fetchone()
+        if not job_row:
+            raise HTTPException(status_code=404, detail="Job no encontrado.")
+        job = folder_batch_job_to_dict(job_row)
+        rows = conn.execute(
+            """
+            SELECT s.*, f.id AS source_file_id, f.original_audio_path AS file_original_audio_path
+            FROM audio_lab_folder_batch_segments s
+            JOIN audio_lab_folder_batch_files f ON f.id = s.file_id
+            WHERE s.job_id = ?
+            ORDER BY f.rowid ASC, s.start_seconds ASC
+            """,
+            (job_id,),
+        ).fetchall()
+        manifest_dir = folder_batch_job_dir(job_id, "manifests")
+        manifest_path = manifest_dir / "manifest.csv"
+        fieldnames = [
+            "audio_path",
+            "original_audio_path",
+            "start_seconds",
+            "end_seconds",
+            "duration_seconds",
+            "normalized_label",
+            "target_label",
+            "source_job_id",
+            "source_file_id",
+            "processing_preset",
+            "frequency_min_hz",
+            "frequency_max_hz",
+            "threshold_dbfs",
+            "band_energy_ratio",
+            "rms_dbfs",
+            "contaminant_flags",
+            "recommendation",
+            "split",
+        ]
+        with manifest_path.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in rows:
+                segment = dict(row)
+                file_row = {"id": segment.get("source_file_id"), "original_audio_path": segment.get("file_original_audio_path")}
+                writer.writerow(folder_batch_segment_to_manifest_row(job, file_row, segment))
+        conn.execute("UPDATE audio_lab_folder_batch_jobs SET manifest_path = ?, updated_at = ? WHERE id = ?", (str(manifest_path), now_iso(), job_id))
+        conn.commit()
+        return str(manifest_path)
+    finally:
+        conn.close()
+
+
+def build_folder_batch_summary(job_id: str) -> dict[str, Any]:
+    conn = get_connection()
+    try:
+        ensure_audio_lab_extra_schema(conn)
+        job = conn.execute("SELECT * FROM audio_lab_folder_batch_jobs WHERE id = ?", (job_id,)).fetchone()
+        if not job:
+            raise HTTPException(status_code=404, detail="Job no encontrado.")
+        segs = conn.execute("SELECT * FROM audio_lab_folder_batch_segments WHERE job_id = ?", (job_id,)).fetchall()
+        files = conn.execute("SELECT * FROM audio_lab_folder_batch_files WHERE job_id = ?", (job_id,)).fetchall()
+        ratios = [float(row["band_energy_ratio"] or 0) for row in segs]
+        rms_values = [float(row["rms_dbfs"] or -120) for row in segs]
+        top_files = conn.execute(
+            """
+            SELECT f.original_audio_path, COUNT(s.id) AS segments_count, AVG(s.activity_score) AS avg_score
+            FROM audio_lab_folder_batch_files f
+            LEFT JOIN audio_lab_folder_batch_segments s ON s.file_id = f.id
+            WHERE f.job_id = ?
+            GROUP BY f.id
+            ORDER BY segments_count DESC, avg_score DESC
+            LIMIT 10
+            """,
+            (job_id,),
+        ).fetchall()
+        contaminants = sum(1 for row in segs if row["contaminant_flags_json"] and row["contaminant_flags_json"] != "[]")
+        candidates = sum(1 for row in segs if row["recommendation"] == "candidate")
+        discarded = sum(1 for row in segs if row["recommendation"] == "excluded")
+        summary = {
+            "total_files": len(files),
+            "total_duration_seconds": round(sum(float(row["duration_seconds"] or 0) for row in files), 3),
+            "candidates": candidates,
+            "discarded": discarded,
+            "contaminant_suspect": contaminants,
+            "errors": sum(1 for row in files if row["status"] == "error"),
+            "top_files_with_activity": [dict(row) for row in top_files],
+            "band_energy_ratio_distribution": {
+                "min": round(min(ratios), 6) if ratios else None,
+                "mean": round(float(np.mean(ratios)), 6) if ratios else None,
+                "max": round(max(ratios), 6) if ratios else None,
+            },
+            "rms_dbfs_distribution": {
+                "min": round(min(rms_values), 3) if rms_values else None,
+                "mean": round(float(np.mean(rms_values)), 3) if rms_values else None,
+                "max": round(max(rms_values), 3) if rms_values else None,
+            },
+            "manifest_path": job["manifest_path"],
+        }
+        return summary
+    finally:
+        conn.close()
+
+
+def update_folder_batch_counts(job_id: str) -> None:
+    summary = build_folder_batch_summary(job_id)
+    conn = get_connection()
+    try:
+        ensure_audio_lab_extra_schema(conn)
+        processed = conn.execute(
+            "SELECT COUNT(*) AS count FROM audio_lab_folder_batch_files WHERE job_id = ? AND status IN ('processed', 'error')",
+            (job_id,),
+        ).fetchone()["count"]
+        processed_duration = conn.execute(
+            "SELECT COALESCE(SUM(duration_seconds), 0) AS total FROM audio_lab_folder_batch_files WHERE job_id = ? AND status IN ('processed', 'error')",
+            (job_id,),
+        ).fetchone()["total"]
+        conn.execute(
+            """
+            UPDATE audio_lab_folder_batch_jobs
+            SET processed_files = ?, processed_duration_seconds = ?, candidates_count = ?,
+                discarded_count = ?, contaminant_suspect_count = ?, errors_count = ?,
+                summary_json = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                processed,
+                processed_duration,
+                summary["candidates"],
+                summary["discarded"],
+                summary["contaminant_suspect"],
+                summary["errors"],
+                json.dumps(summary, ensure_ascii=False),
+                now_iso(),
+                job_id,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def create_folder_batch_outputs_for_segment(
+    job_id: str,
+    file_id: str,
+    source: Path,
+    payload: FolderBatchJobPayload,
+    segment: dict[str, Any],
+) -> dict[str, Any]:
+    stem = short_safe_stem(source.stem, 70)
+    segment_key = segment["segment_key"]
+    clips_dir = folder_batch_job_dir(job_id, "clips")
+    processed_dir = folder_batch_job_dir(job_id, "processed")
+    summaries_dir = folder_batch_job_dir(job_id, "summaries")
+    clip_path = clips_dir / f"{stem}_{segment_key}.wav"
+    processed_path = processed_dir / f"{stem}_{segment_key}_processed.wav"
+    metadata_path = processed_path.with_suffix(processed_path.suffix + ".json")
+    quality_path = summaries_dir / f"{stem}_{segment_key}.quality.json"
+
+    if payload.create_clips:
+        write_audio_segment_to_path(source, clip_path, segment["start_seconds"], segment["end_seconds"])
+        denoise = BatchDenoiseParams(
+            method="spectral_gate",
+            preset=payload.preset,
+            prop_decrease={"conservador": 0.45, "normal": 0.65, "agresivo": 0.8}.get(payload.preset, 0.65),
+            frequency_min_hz=payload.frequency_min_hz,
+            frequency_max_hz=payload.frequency_max_hz,
+            normalize=payload.normalize,
+        )
+        process_audio_copy(
+            clip_path,
+            processed_path,
+            denoise,
+            use_denoise=payload.noise_reduce,
+            use_normalize=payload.normalize,
+            use_bandpass=payload.bandpass,
+        )
+    else:
+        processed_path = Path("")
+
+    flags = segment.get("contaminant_flags") or []
+    metadata = {
+        "source_job_id": job_id,
+        "source_file_id": file_id,
+        "original_audio_path": str(source),
+        "start_seconds": segment["start_seconds"],
+        "end_seconds": segment["end_seconds"],
+        "duration_seconds": segment["duration_seconds"],
+        "frequency_min_hz": payload.frequency_min_hz,
+        "frequency_max_hz": payload.frequency_max_hz,
+        "threshold_dbfs": payload.threshold_dbfs,
+        "band_energy_ratio": segment["band_energy_ratio"],
+        "rms_dbfs": segment["rms_dbfs"],
+        "activity_score": segment["activity_score"],
+        "contaminant_flags": flags,
+        "recommendation": segment["recommendation"],
+        "dBFS_note": "dBFS es nivel relativo del archivo digital; no es dB acustico calibrado.",
+    }
+    metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+    quality_path.write_text(json.dumps({"recommendation": segment["recommendation"], **metadata}, ensure_ascii=False, indent=2), encoding="utf-8")
+    return {
+        "output_audio_path": str(processed_path) if str(processed_path) else None,
+        "output_metadata_path": str(metadata_path),
+        "quality_report_path": str(quality_path),
+    }
+
+
+def run_folder_batch_job(job_id: str, payload: FolderBatchJobPayload) -> None:
+    update_folder_batch_job(job_id, status="running")
+    log_folder_batch_job(job_id, "Inicio procesamiento por carpeta local")
+    ml_warning_logged = False
+    try:
+        conn = get_connection()
+        try:
+            ensure_audio_lab_extra_schema(conn)
+            file_rows = conn.execute(
+                "SELECT * FROM audio_lab_folder_batch_files WHERE job_id = ? AND status IN ('pending', 'error') ORDER BY rowid ASC",
+                (job_id,),
+            ).fetchall()
+        finally:
+            conn.close()
+        for row in file_rows:
+            status = folder_job_status(job_id)
+            if status == "cancelled":
+                log_folder_batch_job(job_id, "Job cancelado por usuario")
+                return
+            if status == "paused":
+                log_folder_batch_job(job_id, "Job pausado por usuario")
+                return
+            file_id = row["id"]
+            source = Path(row["original_audio_path"])
+            update_folder_batch_job(job_id, current_file=str(source))
+            conn = get_connection()
+            try:
+                ensure_audio_lab_extra_schema(conn)
+                conn.execute("UPDATE audio_lab_folder_batch_files SET status = ? WHERE id = ?", ("running", file_id))
+                conn.commit()
+            finally:
+                conn.close()
+            try:
+                file_info, segments = analyze_folder_audio_file(source, payload)
+                conn = get_connection()
+                try:
+                    ensure_audio_lab_extra_schema(conn)
+                    conn.execute(
+                        """
+                        UPDATE audio_lab_folder_batch_files
+                        SET duration_seconds = ?, sample_rate = ?, size_bytes = ?, status = ?, processed_at = ?
+                        WHERE id = ?
+                        """,
+                        (file_info["duration_seconds"], file_info["sample_rate"], file_info["size_bytes"], "processed", now_iso(), file_id),
+                    )
+                    for segment in segments:
+                        output_info = create_folder_batch_outputs_for_segment(job_id, file_id, source, payload, segment)
+                        frog_positive = False
+                        if payload.detect_frog and output_info.get("output_audio_path"):
+                            prediction, score, detector_error = call_frog_detector(
+                                output_info["output_audio_path"],
+                                BatchDetectorParams(),
+                            )
+                            if detector_error and not ml_warning_logged:
+                                log_folder_batch_job(job_id, "ML API no disponible; se omitio detector rana/sapo.")
+                                ml_warning_logged = True
+                            frog_positive = prediction == "rana_sapo"
+                        segment_id = str(uuid.uuid4())
+                        flags_json = json.dumps(segment.get("contaminant_flags") or [], ensure_ascii=False)
+                        conn.execute(
+                            """
+                            INSERT INTO audio_lab_folder_batch_segments (
+                                id, job_id, file_id, original_audio_path, start_seconds, end_seconds,
+                                duration_seconds, frequency_min_hz, frequency_max_hz, rms_dbfs,
+                                band_rms_dbfs, band_energy_ratio, snr_estimate, activity_score,
+                                contaminant_flags_json, recommendation, output_audio_path,
+                                output_metadata_path, quality_report_path, created_at
+                            )
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                segment_id,
+                                job_id,
+                                file_id,
+                                str(source),
+                                segment["start_seconds"],
+                                segment["end_seconds"],
+                                segment["duration_seconds"],
+                                segment["frequency_min_hz"],
+                                segment["frequency_max_hz"],
+                                segment["rms_dbfs"],
+                                segment["band_rms_dbfs"],
+                                segment["band_energy_ratio"],
+                                segment["snr_estimate"],
+                                segment["activity_score"],
+                                flags_json,
+                                segment["recommendation"],
+                                output_info.get("output_audio_path"),
+                                output_info.get("output_metadata_path"),
+                                output_info.get("quality_report_path"),
+                                now_iso(),
+                            ),
+                        )
+                        conn.execute(
+                            """
+                            INSERT INTO audio_lab_folder_batch_outputs (
+                                id, job_id, file_id, segment_id, original_audio_path, output_audio_path,
+                                output_metadata_path, quality_report_path, recommendation, created_at
+                            )
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                str(uuid.uuid4()),
+                                job_id,
+                                file_id,
+                                segment_id,
+                                str(source),
+                                output_info.get("output_audio_path"),
+                                output_info.get("output_metadata_path"),
+                                output_info.get("quality_report_path"),
+                                segment["recommendation"],
+                                now_iso(),
+                            ),
+                        )
+                        if frog_positive:
+                            conn.execute(
+                                "UPDATE audio_lab_folder_batch_jobs SET frog_positive_count = frog_positive_count + 1 WHERE id = ?",
+                                (job_id,),
+                            )
+                    conn.commit()
+                finally:
+                    conn.close()
+                write_folder_batch_manifest(job_id)
+                update_folder_batch_counts(job_id)
+                log_folder_batch_job(job_id, f"Procesado {source} segmentos={len(segments)}")
+            except Exception as exc:
+                conn = get_connection()
+                try:
+                    ensure_audio_lab_extra_schema(conn)
+                    conn.execute(
+                        "UPDATE audio_lab_folder_batch_files SET status = ?, error = ?, processed_at = ? WHERE id = ?",
+                        ("error", str(exc), now_iso(), file_id),
+                    )
+                    conn.commit()
+                finally:
+                    conn.close()
+                update_folder_batch_counts(job_id)
+                log_folder_batch_job(job_id, f"ERROR {source}: {exc}")
+        write_folder_batch_manifest(job_id)
+        update_folder_batch_counts(job_id)
+        summary = build_folder_batch_summary(job_id)
+        final_status = "completed"
+        if summary.get("errors") and int(summary.get("processed_files") or 0) == 0:
+            final_status = "failed"
+        elif summary.get("errors"):
+            final_status = "completed_with_errors"
+        update_folder_batch_job(job_id, status=final_status, summary_json=json.dumps(summary, ensure_ascii=False), current_file=None)
+        log_folder_batch_job(job_id, "Job completado" if final_status == "completed" else f"Job finalizado: {final_status}")
+    except Exception as exc:
+        update_folder_batch_job(job_id, status="failed", summary_json=json.dumps({"error": str(exc)}, ensure_ascii=False))
+        log_folder_batch_job(job_id, f"FATAL {exc}")
 
 
 @router.post("/batch-processing/jobs")
@@ -2514,6 +3401,228 @@ def create_batch_processing_job(payload: BatchProcessingJobPayload, background_t
     BATCH_JOB_CANCEL_EVENTS[job_id] = threading.Event()
     background_tasks.add_task(run_batch_processing_job, job_id, payload)
     return {"job_id": job_id, "status": "queued", "message": "Batch processing job created"}
+
+
+@router.post("/folder-batch/scan")
+def scan_folder_batch(payload: FolderBatchScanPayload):
+    return scan_folder_payload(payload)
+
+
+@router.post("/folder-batch/jobs")
+def create_folder_batch_job(payload: FolderBatchJobPayload, background_tasks: BackgroundTasks):
+    if payload.mode not in FOLDER_BATCH_MODES:
+        raise HTTPException(status_code=400, detail=f"mode debe ser uno de: {sorted(FOLDER_BATCH_MODES)}")
+    if payload.preset not in FOLDER_BATCH_PRESETS:
+        raise HTTPException(status_code=400, detail=f"preset debe ser uno de: {sorted(FOLDER_BATCH_PRESETS)}")
+    if payload.frequency_min_hz >= payload.frequency_max_hz:
+        raise HTTPException(status_code=400, detail="frequency_min_hz debe ser menor que frequency_max_hz.")
+    if payload.threshold_dbfs > 0:
+        raise HTTPException(status_code=400, detail="threshold_dbfs debe ser un valor dBFS relativo, normalmente negativo.")
+    if min(payload.min_activity_seconds, payload.min_silence_seconds, payload.padding_seconds, payload.clip_duration_seconds) < 0:
+        raise HTTPException(status_code=400, detail="Las duraciones no pueden ser negativas.")
+    scan = scan_folder_payload(payload)
+    if scan["files_found"] == 0:
+        raise HTTPException(status_code=400, detail="No se encontraron audios con las extensiones solicitadas.")
+
+    job_id = str(uuid.uuid4())
+    created_at = now_iso()
+    output_dir = folder_batch_job_dir(job_id)
+    for part in ["clips", "processed", "summaries", "manifests", "logs"]:
+        folder_batch_job_dir(job_id, part)
+    manifest_path = str(folder_batch_job_dir(job_id, "manifests") / "manifest.csv")
+    files = list_folder_audio_files(payload)
+    conn = get_connection()
+    try:
+        ensure_audio_lab_extra_schema(conn)
+        conn.execute(
+            """
+            INSERT INTO audio_lab_folder_batch_jobs (
+                id, job_name, folder_path, folder_path_resolved, target_label, status, mode, preset,
+                frequency_min_hz, frequency_max_hz, threshold_dbfs, total_files,
+                processed_files, total_duration_seconds, processed_duration_seconds,
+                candidates_count, discarded_count, contaminant_suspect_count,
+                frog_positive_count, errors_count, output_dir, manifest_path,
+                params_json, summary_json, current_file, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                job_id,
+                payload.job_name,
+                str(Path(payload.folder_path).expanduser()),
+                scan["folder_path_resolved"],
+                payload.target_label,
+                "pending",
+                payload.mode,
+                payload.preset,
+                payload.frequency_min_hz,
+                payload.frequency_max_hz,
+                payload.threshold_dbfs,
+                len(files),
+                0,
+                scan["estimated_duration_seconds"],
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                str(output_dir),
+                manifest_path,
+                json.dumps(folder_batch_payload_dict(payload), ensure_ascii=False),
+                json.dumps(scan, ensure_ascii=False),
+                None,
+                created_at,
+                created_at,
+            ),
+        )
+        for path in files:
+            info = audio_file_info(path)
+            conn.execute(
+                """
+                INSERT INTO audio_lab_folder_batch_files (
+                    id, job_id, original_audio_path, audio_name, extension, size_bytes,
+                    duration_seconds, sample_rate, status, error, processed_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(uuid.uuid4()),
+                    job_id,
+                    str(path),
+                    path.name,
+                    path.suffix.lower(),
+                    info["size_bytes"],
+                    info["duration_seconds"],
+                    info["sample_rate"],
+                    "pending",
+                    None,
+                    None,
+                ),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+    log_folder_batch_job(job_id, f"Job creado con {len(files)} archivo(s). Originales no se modifican.")
+    background_tasks.add_task(run_folder_batch_job, job_id, payload)
+    return {"job_id": job_id, "status": "pending", "scan": scan, "output_dir": str(output_dir)}
+
+
+@router.get("/folder-batch/jobs")
+def list_folder_batch_jobs(limit: int = Query(50, ge=1, le=200)):
+    conn = get_connection()
+    try:
+        ensure_audio_lab_extra_schema(conn)
+        rows = conn.execute(
+            "SELECT * FROM audio_lab_folder_batch_jobs ORDER BY created_at DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return {"items": [folder_batch_job_to_dict(row) for row in rows], "total": len(rows)}
+    finally:
+        conn.close()
+
+
+@router.get("/folder-batch/jobs/{job_id}")
+def get_folder_batch_job(job_id: str):
+    conn = get_connection()
+    try:
+        ensure_audio_lab_extra_schema(conn)
+        row = conn.execute("SELECT * FROM audio_lab_folder_batch_jobs WHERE id = ?", (job_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Job no encontrado.")
+        files = conn.execute("SELECT * FROM audio_lab_folder_batch_files WHERE job_id = ? ORDER BY rowid ASC LIMIT 200", (job_id,)).fetchall()
+        return {**folder_batch_job_to_dict(row), "files": [dict(item) for item in files]}
+    finally:
+        conn.close()
+
+
+@router.get("/folder-batch/jobs/{job_id}/logs")
+def get_folder_batch_logs(job_id: str):
+    log_path = folder_batch_job_dir(job_id, "logs") / "job.log"
+    return {"job_id": job_id, "logs": log_path.read_text(encoding="utf-8") if log_path.exists() else ""}
+
+
+@router.post("/folder-batch/jobs/{job_id}/cancel")
+def cancel_folder_batch_job(job_id: str):
+    update_folder_batch_job(job_id, status="cancelled", current_file=None)
+    log_folder_batch_job(job_id, "Cancel solicitado")
+    return get_folder_batch_job(job_id)
+
+
+@router.post("/folder-batch/jobs/{job_id}/pause")
+def pause_folder_batch_job(job_id: str):
+    status = folder_job_status(job_id)
+    if status is None:
+        raise HTTPException(status_code=404, detail="Job no encontrado.")
+    if status in {"completed", "failed", "cancelled"}:
+        return get_folder_batch_job(job_id)
+    update_folder_batch_job(job_id, status="paused")
+    log_folder_batch_job(job_id, "Pausa solicitada")
+    return get_folder_batch_job(job_id)
+
+
+@router.post("/folder-batch/jobs/{job_id}/resume")
+def resume_folder_batch_job(job_id: str, background_tasks: BackgroundTasks):
+    conn = get_connection()
+    try:
+        ensure_audio_lab_extra_schema(conn)
+        row = conn.execute("SELECT * FROM audio_lab_folder_batch_jobs WHERE id = ?", (job_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Job no encontrado.")
+        if row["status"] not in {"paused", "failed", "pending"}:
+            return folder_batch_job_to_dict(row)
+        params = json.loads(row["params_json"] or "{}")
+        payload = FolderBatchJobPayload(**params)
+    finally:
+        conn.close()
+    update_folder_batch_job(job_id, status="pending")
+    log_folder_batch_job(job_id, "Reanudacion solicitada")
+    background_tasks.add_task(run_folder_batch_job, job_id, payload)
+    return get_folder_batch_job(job_id)
+
+
+@router.get("/folder-batch/jobs/{job_id}/outputs")
+def get_folder_batch_outputs(job_id: str, limit: int = Query(500, ge=1, le=5000)):
+    conn = get_connection()
+    try:
+        ensure_audio_lab_extra_schema(conn)
+        rows = conn.execute(
+            """
+            SELECT o.*, s.start_seconds, s.end_seconds, s.duration_seconds, s.activity_score,
+                   s.band_energy_ratio, s.rms_dbfs, s.contaminant_flags_json
+            FROM audio_lab_folder_batch_outputs o
+            LEFT JOIN audio_lab_folder_batch_segments s ON s.id = o.segment_id
+            WHERE o.job_id = ?
+            ORDER BY o.created_at ASC
+            LIMIT ?
+            """,
+            (job_id, limit),
+        ).fetchall()
+        items = []
+        for row in rows:
+            item = dict(row)
+            playable_path = item.get("output_audio_path") or item.get("original_audio_path")
+            if playable_path:
+                item["playable_url"] = playable_url_for_path(playable_path)
+                item["audio_url"] = item["playable_url"]
+            items.append(item)
+        return {"job_id": job_id, "items": items, "total": len(items)}
+    finally:
+        conn.close()
+
+
+@router.get("/folder-batch/jobs/{job_id}/manifest")
+def get_folder_batch_manifest(job_id: str):
+    manifest_path = Path(write_folder_batch_manifest(job_id))
+    if not manifest_path.exists():
+        raise HTTPException(status_code=404, detail="Manifest no encontrado.")
+    return FileResponse(str(manifest_path), filename=manifest_path.name, media_type="text/csv")
+
+
+@router.get("/folder-batch/jobs/{job_id}/summary")
+def get_folder_batch_summary(job_id: str):
+    return {"job_id": job_id, "summary": build_folder_batch_summary(job_id)}
 
 
 @router.get("/batch-processing/jobs")
@@ -2742,12 +3851,18 @@ def get_clip_audio(clip_id: str):
         row = conn.execute("SELECT * FROM audio_lab_clips WHERE id = ?", (clip_id,)).fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="Recorte no encontrado.")
-        path = Path(row["output_audio_path"])
-        if not path.exists():
-            raise HTTPException(status_code=404, detail="Archivo de recorte no encontrado.")
+        path = resolve_allowed_audio_path(row["output_audio_path"])
         if path.suffix.lower() != ".wav":
-            raise HTTPException(status_code=400, detail="El recorte registrado no es un WAV reproducible.")
-        return FileResponse(str(path), media_type="audio/wav", filename=path.name)
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": "audio_decode_error",
+                    "message": "El recorte registrado no es un WAV reproducible.",
+                    "audio_path": row["output_audio_path"],
+                    "format": path.suffix.lower(),
+                },
+            )
+        return FileResponse(str(path), media_type=media_type_for_path(path), filename=path.name)
     finally:
         conn.close()
 

@@ -59,6 +59,36 @@ Reglas arquitectonicas:
 - `dataset_curado` no se modifica directamente desde los flujos de revision.
 - El entrenamiento no arranca automaticamente: siempre debe haber dry-run primero.
 
+## Rutas de audio permitidas y portabilidad
+
+Todo audio reproducible debe servirse por backend. El frontend no debe usar rutas locales crudas como `F:\...`, `C:\...` o `/mnt/...` como `src` de un reproductor.
+
+El backend resuelve audios con `resolve_allowed_audio_path(input_path, allowed_roots)`. Las raices permitidas vienen de configuracion local:
+
+- `ACUSTICAFAUNA_DATASET_DIR`
+- `ACUSTICAFAUNA_STORAGE_DIR`
+- uploads, clips, procesados y cache dentro de `storage/audio_lab`
+- `sample_data`
+- extras en `ACUSTICAFAUNA_ALLOWED_AUDIO_ROOTS`
+- compatibilidad legacy con `ACUSTICAFAUNA_ALLOWED_MEDIA_ROOTS`
+
+Si un registro conserva una ruta absoluta vieja de otro PC, el backend puede intentar resolver por nombre o ruta relativa dentro del dataset/storage actual en runtime. Si la ruta contiene `dataset_curado`, intenta reconstruirla bajo `ACUSTICAFAUNA_DATASET_DIR`. Esa recuperacion no modifica la base de datos automaticamente.
+
+Batch processing puede recibir `job_allowed_roots` para autorizar la carpeta padre de un audio elegido por el usuario. Folder-batch usa la carpeta escaneada y validada como root permitido solo para ese job. Ninguna de esas autorizaciones se agrega globalmente a `.env`.
+
+Errores esperados:
+
+- `audio_not_found`: el archivo no existe en este equipo.
+- `audio_path_not_allowed`: el archivo existe, pero esta fuera de las carpetas permitidas.
+- `audio_decode_error`: el formato no se pudo decodificar o reproducir.
+
+Diagnostico local:
+
+```text
+GET  /api/system/paths
+POST /api/audio-lab/debug/resolve-audio
+```
+
 ## Segmentacion de audio largo
 
 El laboratorio incluye el modulo **Segmentar audio / detectar silencios** para trabajar con grabaciones de 10, 30 o 60 minutos sin modificar el archivo original. El backend expone:
@@ -127,6 +157,79 @@ Reglas:
 - No modificar `dataset_curado`.
 - No entrenar ni registrar modelos automaticamente.
 - Todo output requiere revision humana antes de usarse en manifests de entrenamiento.
+
+## Procesamiento masivo por carpeta local
+
+Para lotes grandes, por ejemplo 70 GB de grabaciones de una especie objetivo, el Laboratorio de audio incluye **Procesamiento masivo por carpeta local**. Este flujo evita subir archivos uno por uno desde el navegador: el usuario pega una ruta local y el backend procesa desde el disco del computador.
+
+Endpoints:
+
+```text
+POST /api/audio-lab/folder-batch/scan
+POST /api/audio-lab/folder-batch/jobs
+GET  /api/audio-lab/folder-batch/jobs
+GET  /api/audio-lab/folder-batch/jobs/{job_id}
+GET  /api/audio-lab/folder-batch/jobs/{job_id}/logs
+POST /api/audio-lab/folder-batch/jobs/{job_id}/pause
+POST /api/audio-lab/folder-batch/jobs/{job_id}/resume
+POST /api/audio-lab/folder-batch/jobs/{job_id}/cancel
+GET  /api/audio-lab/folder-batch/jobs/{job_id}/outputs
+GET  /api/audio-lab/folder-batch/jobs/{job_id}/manifest
+GET  /api/audio-lab/folder-batch/jobs/{job_id}/summary
+```
+
+Tablas:
+
+- `audio_lab_folder_batch_jobs`
+- `audio_lab_folder_batch_files`
+- `audio_lab_folder_batch_segments`
+- `audio_lab_folder_batch_outputs`
+
+El analisis DSP trabaja por ventanas/bloques y calcula:
+
+- RMS total en dBFS.
+- RMS en banda objetivo.
+- `band_energy_ratio`.
+- score de actividad.
+- flags heuristicas de contaminantes.
+
+`dBFS` significa nivel relativo del archivo digital. No es dB SPL calibrado.
+
+Reglas de segmentacion:
+
+- Filtrar por banda objetivo, por ejemplo `1800-3000 Hz`.
+- Unir eventos cercanos si el silencio es menor que `min_silence_seconds`.
+- Agregar padding.
+- Descartar eventos demasiado cortos.
+- Dividir eventos largos en clips de duracion controlada.
+
+Contaminantes heurísticos marcados como revision, no como verdad definitiva:
+
+- `voz_humana_suspect`
+- `carro_motor_suspect`
+- `ave_suspect`
+- `broadband_noise_suspect`
+
+Salidas:
+
+```text
+backend/storage/audio_lab/folder_batch_jobs/{job_id}/
+  clips/
+  processed/
+  summaries/
+  manifests/
+  logs/
+```
+
+El manifest CSV incluye rutas derivadas, ruta original, tiempos, label objetivo, parametros DSP, `band_energy_ratio`, `rms_dbfs`, flags y recomendacion. Los segmentos con contaminantes fuertes, ratio bajo, clipping severo, duracion insuficiente o error de decodificacion deben quedar excluidos/revisar, no incluidos automaticamente como datos limpios.
+
+Reglas:
+
+- Nunca modificar ni borrar audios originales.
+- No escribir dentro de la carpeta original por defecto.
+- No modificar `dataset_curado`.
+- No entrenar automaticamente.
+- El job puede correr sin ML API; en ese caso se omite detector rana/sapo y se conserva el procesamiento DSP.
 
 ## Reporte de calidad original vs procesado
 

@@ -4,6 +4,7 @@ import SectionCard from "../components/shared/SectionCard";
 import {
   clearTemporaryCuratedSpectrograms,
   deleteCuratedSegmentSpectrogram,
+  debugResolveAudio,
   fetchCuratedDatasetLabels,
   fetchCuratedDatasetStats,
   fetchCuratedSegmentDetail,
@@ -174,6 +175,8 @@ export default function CuratedDatasetPage() {
   const [spectrogramLoaded, setSpectrogramLoaded] = useState(false);
   const [spectrogramError, setSpectrogramError] = useState("");
   const [detailMessage, setDetailMessage] = useState("");
+  const [audioErrors, setAudioErrors] = useState({});
+  const [routeDiagnostic, setRouteDiagnostic] = useState(null);
   const [confirmAction, setConfirmAction] = useState(null);
 
   const [labelFilter, setLabelFilter] = useState("");
@@ -208,6 +211,11 @@ export default function CuratedDatasetPage() {
 
   function dismissToast(id) {
     setToasts((current) => current.filter((toast) => toast.id !== id));
+  }
+
+  function copyText(text, message = "Copiado.") {
+    navigator.clipboard?.writeText(text || "");
+    pushToast(message);
   }
 
   function isBusy(key) {
@@ -351,6 +359,51 @@ export default function CuratedDatasetPage() {
       window.setTimeout(() => {
         window.scrollTo({ top: previousScrollYRef.current, behavior: "smooth" });
       }, 30);
+  }
+
+  async function diagnoseSegmentAudio(segment = selectedDetail?.segment, options = {}) {
+    if (!segment?.id && !segment?.output_path) {
+      setDetailMessage("No hay ruta de audio para diagnosticar.");
+      return;
+    }
+    try {
+      const result = segment.id
+        ? await debugResolveAudio({ segment_id: segment.id, context: "curated_dataset" })
+        : await debugResolveAudio(segment.output_path);
+      setRouteDiagnostic(result);
+      const allowed = result.allowed || result.audio_clean?.allowed || result.source_original?.allowed;
+      const exists = result.exists || result.audio_clean?.exists || result.source_original?.exists;
+      const status = allowed ? "Audio encontrado y permitido." : exists ? "El audio existe, pero esta fuera de las carpetas permitidas." : "Archivo no encontrado en dataset configurado.";
+      const line = result.suggested_env_line ? ` Sugerencia .env: ${result.suggested_env_line}` : "";
+      const message = `${status} ${result.matched_root ? `Root: ${result.matched_root}` : "Configura ACUSTICAFAUNA_DATASET_DIR o ACUSTICAFAUNA_ALLOWED_AUDIO_ROOTS."}${line}`;
+      if (!options.quiet) setDetailMessage(message);
+      setAudioErrors((current) => ({
+        ...current,
+        [segment.id || segment.output_path]: {
+          message,
+          reason: allowed ? "ok" : exists ? "ruta no autorizada" : "archivo no encontrado",
+          suggested_env_line: result.suggested_env_line,
+        },
+      }));
+      return result;
+    } catch (err) {
+      const message = err.message || "No fue posible diagnosticar la ruta de audio.";
+      if (!options.quiet) setDetailMessage(message);
+      setAudioErrors((current) => ({ ...current, [segment.id || segment.output_path]: { message, reason: "diagnostico fallo" } }));
+      return null;
+    }
+  }
+
+  async function handleCuratedAudioError(segment) {
+    setAudioErrors((current) => ({
+      ...current,
+      [segment.id]: {
+        message: "No se pudo abrir el audio porque la ruta no esta autorizada o no existe en este equipo.",
+        reason: "error al cargar audio",
+      },
+    }));
+    pushToast("Error al cargar audio. Puedes diagnosticar la ruta del segmento.", "error");
+    await diagnoseSegmentAudio(segment, { quiet: true });
   }
 
   async function loadSpectrogram(mode = "preview", force = false) {
@@ -774,8 +827,29 @@ export default function CuratedDatasetPage() {
                             preload="none"
                             src={getCuratedSegmentAudioUrl(segment.id)}
                             className="w-72"
-                            onError={() => pushToast("Error al cargar audio", "error")}
+                            onError={() => handleCuratedAudioError(segment)}
                           />
+                          {audioErrors[segment.id] ? (
+                            <div className="mt-2 space-y-2">
+                              <Badge tone={audioErrors[segment.id].reason === "ruta no autorizada" ? "warning" : "danger"}>
+                                {audioErrors[segment.id].reason}
+                              </Badge>
+                              <p className="max-w-80 text-xs text-red-700">{audioErrors[segment.id].message}</p>
+                              <div className="flex flex-wrap gap-2">
+                                <button type="button" onClick={() => diagnoseSegmentAudio(segment)} className="rounded-lg border border-blue-300 bg-blue-50 px-2 py-1 text-xs font-semibold text-blue-800">
+                                  Diagnosticar ruta
+                                </button>
+                                <button type="button" onClick={() => copyText(segment.output_path, "Ruta copiada.")} className="rounded-lg border border-slate-300 px-2 py-1 text-xs font-semibold">
+                                  Copiar ruta
+                                </button>
+                                {audioErrors[segment.id].suggested_env_line ? (
+                                  <button type="button" onClick={() => copyText(audioErrors[segment.id].suggested_env_line, "Linea .env copiada.")} className="rounded-lg border border-amber-300 bg-amber-50 px-2 py-1 text-xs font-semibold text-amber-900">
+                                    Copiar linea .env
+                                  </button>
+                                ) : null}
+                              </div>
+                            </div>
+                          ) : null}
                           <p className="mt-2 max-w-80 truncate font-mono text-xs text-slate-500">
                             {segment.source_filename || segment.segment_id}
                           </p>
@@ -947,8 +1021,48 @@ export default function CuratedDatasetPage() {
                   preload="metadata"
                   src={getCuratedSegmentAudioUrl(selectedDetail.segment.id)}
                   className="w-full"
-                  onError={() => pushToast("Error al cargar audio", "error")}
+                  onError={() => handleCuratedAudioError(selectedDetail.segment)}
                 />
+                {audioErrors[selectedDetail.segment.id] ? (
+                  <div className="rounded-2xl border border-red-200 bg-red-50 p-3 text-sm text-red-800">
+                    <p className="font-semibold">No se pudo abrir el audio porque la ruta no esta autorizada o no existe en este equipo.</p>
+                    <p className="mt-1">{audioErrors[selectedDetail.segment.id].message}</p>
+                    <div className="mt-3 flex flex-wrap gap-2">
+                      <button type="button" onClick={() => diagnoseSegmentAudio(selectedDetail.segment)} className="rounded-lg border border-blue-300 bg-blue-50 px-3 py-2 text-xs font-semibold text-blue-800">
+                        Diagnosticar ruta
+                      </button>
+                      <button type="button" onClick={() => copyText(selectedDetail.segment.output_path, "Ruta copiada.")} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs font-semibold">
+                        Copiar ruta
+                      </button>
+                      {audioErrors[selectedDetail.segment.id].suggested_env_line ? (
+                        <button type="button" onClick={() => copyText(audioErrors[selectedDetail.segment.id].suggested_env_line, "Linea .env copiada.")} className="rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-xs font-semibold text-amber-900">
+                          Copiar linea .env sugerida
+                        </button>
+                      ) : null}
+                      <button type="button" onClick={() => window.location.assign("/configuracion")} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs font-semibold">
+                        Ver configuracion de rutas
+                      </button>
+                    </div>
+                  </div>
+                ) : null}
+                {routeDiagnostic ? (
+                  <div className="rounded-2xl border border-blue-200 bg-blue-50 p-3 text-xs text-blue-950">
+                    <p className="font-semibold">Diagnostico de ruta</p>
+                    <div className="mt-2 grid gap-1">
+                      <div><strong>Existe:</strong> {routeDiagnostic.exists ? "si" : "no"}</div>
+                      <div><strong>Permitido:</strong> {routeDiagnostic.allowed ? "si" : "no"}</div>
+                      <div><strong>Root coincidente:</strong> {routeDiagnostic.matched_root || "-"}</div>
+                      <div><strong>Ruta final:</strong> <span className="break-all font-mono">{routeDiagnostic.resolved_final || routeDiagnostic.normalized_path || "-"}</span></div>
+                      {routeDiagnostic.warning ? <div className="text-amber-800"><strong>Advertencia:</strong> {routeDiagnostic.warning}</div> : null}
+                      {routeDiagnostic.suggested_env_line ? (
+                        <div>
+                          <strong>Linea .env sugerida:</strong>
+                          <pre className="mt-1 overflow-auto rounded bg-blue-950 p-2 text-blue-50">{routeDiagnostic.suggested_env_line}</pre>
+                        </div>
+                      ) : null}
+                    </div>
+                  </div>
+                ) : null}
 
                 <div className="flex flex-wrap gap-2">
                   <button
@@ -1165,10 +1279,26 @@ export default function CuratedDatasetPage() {
                     <p>
                       <span className="block font-semibold text-slate-800">Fuente original</span>
                       <span className="break-all font-mono">{selectedDetail.segment.source_path}</span>
+                      <button type="button" onClick={() => copyText(selectedDetail.segment.source_path, "Ruta fuente copiada.")} className="mt-2 rounded-lg border border-slate-300 px-3 py-2 text-xs font-semibold">
+                        Copiar fuente
+                      </button>
                     </p>
                     <p>
                       <span className="block font-semibold text-slate-800">Audio limpio</span>
                       <span className="break-all font-mono">{selectedDetail.segment.output_path}</span>
+                      <div className="mt-2 flex flex-wrap gap-2">
+                        <button type="button" onClick={() => diagnoseSegmentAudio(selectedDetail.segment)} className="rounded-lg border border-blue-300 bg-blue-50 px-3 py-2 text-xs font-semibold text-blue-800">
+                          Diagnosticar ruta
+                        </button>
+                        <button type="button" onClick={() => copyText(selectedDetail.segment.output_path, "Ruta limpia copiada.")} className="rounded-lg border border-slate-300 px-3 py-2 text-xs font-semibold">
+                          Copiar audio limpio
+                        </button>
+                        {routeDiagnostic?.suggested_env_line ? (
+                          <button type="button" onClick={() => copyText(routeDiagnostic.suggested_env_line, "Linea .env copiada.")} className="rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-xs font-semibold text-amber-900">
+                            Copiar linea .env sugerida
+                          </button>
+                        ) : null}
+                      </div>
                     </p>
                     <p>
                       <span className="block font-semibold text-slate-800">SHA256 fuente</span>

@@ -389,6 +389,21 @@ def run_advanced_import(payload) -> dict[str, Any]:
         messages.append("No se detectó carpeta de espectrogramas.")
     if skipped_existing_events > 0:
         messages.append(f"Se omitieron {skipped_existing_events} eventos ya existentes.")
+    if imported_spectrograms > 0 and imported_segments == 0:
+        messages.append(
+            "Se importaron predicciones/espectrogramas, pero los audios no estan disponibles o no estan autorizados."
+        )
+
+    route_summary = {
+        "root_path_exists": bool(base_path and base_path.exists()),
+        "selection_tables_found": len(selection_files),
+        "segments_dir_exists": bool(segments_dir and segments_dir.exists()),
+        "spectrograms_dir_exists": bool(spectrograms_dir and spectrograms_dir.exists()),
+        "audios_found": imported_segments,
+        "audios_missing": max(total_events - imported_segments, 0),
+        "audios_outside_allowed_roots": 0,
+        "spectrograms_found": imported_spectrograms,
+    }
 
     return {
         "session_id": session_id,
@@ -405,6 +420,7 @@ def run_advanced_import(payload) -> dict[str, Any]:
         "imported_segments": imported_segments,
         "imported_spectrograms": imported_spectrograms,
         "skipped_existing_events": skipped_existing_events,
+        "route_summary": route_summary,
         "status": "importado",
         "messages": messages,
     }

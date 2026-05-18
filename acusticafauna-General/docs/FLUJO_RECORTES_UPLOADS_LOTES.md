@@ -25,6 +25,28 @@ La tabla de outputs muestra el nombre original legible, el tramo o `audio comple
 
 El historial de jobs y outputs puede buscar por nombre legible, nombre procesado, ruta fuente, ruta procesada y nombre de job. La exportacion CSV de outputs incluye nombres legibles y rutas tecnicas para auditoria externa.
 
+Si el usuario agrega un audio manual desde una carpeta externa, el job puede recibir `job_allowed_roots` con la carpeta padre validada. Esa autorizacion aplica solo al job. No se agrega globalmente a `.env` y no debe ser una raiz de unidad completa como `F:\` sin confirmacion fuerte.
+
+Estados:
+
+- `completed`: todos los audios procesaron.
+- `completed_with_errors`: al menos un audio fallo, pero otros procesaron.
+- `failed`: un job de un solo archivo fallo o no produjo ningun audio procesado.
+
+Los errores de ruta devuelven JSON con `audio_path_not_allowed`, `allowed_roots` y `suggested_env_line`.
+
+## Procesamiento masivo por carpeta local
+
+Folder-batch primero escanea una carpeta local. Si el scan es valido, esa carpeta resuelta queda autorizada solo para ese job y los audios dentro de ella pueden procesarse aunque la carpeta no este en `.env`.
+
+Los outputs siempre se escriben en:
+
+```text
+backend/storage/audio_lab/folder_batch_jobs/{job_id}/
+```
+
+Nunca se escribe sobre los originales.
+
 ## Reporte de calidad
 
 Cada output procesado puede generar un reporte original vs procesado. El JSON se guarda en:

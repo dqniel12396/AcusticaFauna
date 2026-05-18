@@ -7,7 +7,7 @@ AcusticaFauna es una app local-first para curar, revisar y experimentar con audi
 - Laboratorio de audio para abrir, segmentar, limpiar, analizar y dejar feedback.
 - Auditoria de feedback y Constructor de modelos ML.
 - Explorador ML, registry de modelos y entrenamiento web.
-- Procesamiento por lote, reportes de calidad y recortes WAV trazables.
+- Procesamiento por lote, procesamiento masivo por carpeta local, reportes de calidad y recortes WAV trazables.
 
 ## Que no incluye el repo
 
@@ -17,6 +17,8 @@ AcusticaFauna es una app local-first para curar, revisar y experimentar con audi
 - Modelos pesados dentro del Git normal.
 
 Los datos y modelos se configuran localmente por `.env`, Releases/Git LFS o paquetes descargables.
+
+El repo no incluye audios reales. Si ves `Error al cargar audio` en registros importados, configura `ACUSTICAFAUNA_DATASET_DIR` hacia tu dataset local, agrega una ruta segura en `ACUSTICAFAUNA_ALLOWED_AUDIO_ROOTS` o usa uploads temporales en Laboratorio de audio.
 
 ## Estructura
 
@@ -121,6 +123,47 @@ Python 3.13 no es recomendado para AcusticaFauna ML. Dependencias como `torch`, 
 
 Si. Sirve cualquier version 3.11.x. Lo importante es que el comando `py -3.11 --version` funcione. Recomendamos la ultima version disponible de la rama 3.11.x.
 
+## Procesar carpetas grandes de audios
+
+En `/laboratorio-audio` usa **Procesamiento masivo por carpeta local** cuando tengas decenas de GB de audios. Pega una ruta local, por ejemplo:
+
+```text
+C:\Datos\Ranas\lote_01
+```
+
+El backend escanea y procesa desde el mismo computador. No subas archivo por archivo desde el navegador.
+
+El flujo:
+
+1. Escanear carpeta.
+2. Revisar cantidad de archivos, tamano y duracion estimada.
+3. Elegir banda de frecuencia, por ejemplo `1800-3000 Hz`.
+4. Ajustar threshold `dBFS` y ratio minimo de energia en banda.
+5. Iniciar job.
+6. Revisar candidatos, contaminantes y excluidos.
+7. Exportar manifest CSV solo despues de revisar.
+
+Reglas: no modifica audios originales, no borra datos, no entrena automaticamente y guarda outputs en `backend/storage/audio_lab/folder_batch_jobs/{job_id}/`.
+
+## Rutas de audio permitidas
+
+Por seguridad, el backend solo sirve audios desde carpetas permitidas. El frontend nunca debe usar una ruta local como `F:\...` o `C:\...` directamente como fuente del reproductor.
+
+Variables utiles en `.env`:
+
+```env
+ACUSTICAFAUNA_DATASET_DIR=F:\PROYECTO de cosa de sonido\dataset_curado
+ACUSTICAFAUNA_ALLOWED_AUDIO_ROOTS=F:\PC202601\Descargasreal;D:\AudiosCampo
+```
+
+Usa `ACUSTICAFAUNA_DATASET_DIR` para Dataset Curado. Usa `ACUSTICAFAUNA_ALLOWED_AUDIO_ROOTS` para carpetas adicionales de audios locales. No autorices una unidad completa como `F:\` salvo que realmente entiendas el alcance.
+
+## Importacion local
+
+Importacion local sirve para importar resultados externos ya generados: salidas de BirdNET, CSV de resumen, `selection.table.txt`, espectrogramas o sesiones externas con eventos/predicciones.
+
+No es el flujo para limpiar audios, segmentar por frecuencia, reducir ruido ni procesar 70 GB. Para eso usa **Laboratorio de audio -> Procesamiento masivo por carpeta local**.
+
 ## Si no tienes Git instalado
 
 Puedes descargar el ZIP desde GitHub:
@@ -193,6 +236,34 @@ Solucion:
 py -3.11 --version
 ```
 
+## Error: audio_path_not_allowed
+
+Si ves `audio_path_not_allowed`, el archivo existe pero esta fuera de las carpetas que el backend puede servir.
+
+Solucion:
+
+1. Si es Dataset Curado, configura `ACUSTICAFAUNA_DATASET_DIR` con la carpeta real del dataset.
+2. Si es una carpeta externa de audios, agrega solo esa carpeta a `ACUSTICAFAUNA_ALLOWED_AUDIO_ROOTS`.
+3. Reinicia backend/frontend.
+4. En la app abre Configuracion -> Rutas de audio permitidas y pulsa `Probar rutas`.
+
+Si clonaste el repo en otro PC, recuerda que los audios reales no vienen con GitHub.
+
+### Dataset Curado: Error al cargar audio
+
+Si Dataset Curado muestra `Error al cargar audio`, revisa que `ACUSTICAFAUNA_DATASET_DIR` apunte al dataset real, no a una carpeta vacia del clon:
+
+```env
+ACUSTICAFAUNA_DATASET_DIR=F:\PROYECTO de cosa de sonido\dataset_curado
+ACUSTICAFAUNA_ALLOWED_AUDIO_ROOTS=F:\PROYECTO de cosa de sonido\dataset_ranas-20260512T141405Z-3-004
+```
+
+En la pantalla de Dataset Curado usa `Diagnosticar ruta` para copiar la linea `.env` sugerida.
+
+### Errores content-script en consola
+
+Mensajes como `content-script.bundle.js: i.startsWith is not a function` suelen venir de extensiones del navegador. Si la app carga y los endpoints responden, no los trates como error de AcusticaFauna.
+
 ## Arranque rapido
 
 En tres terminales:
@@ -221,6 +292,7 @@ Variables clave:
 - `ACUSTICAFAUNA_STORAGE_DIR`
 - `ACUSTICAFAUNA_MODELS_DIR`
 - `ACUSTICAFAUNA_MANIFESTS_DIR`
+- `ACUSTICAFAUNA_ALLOWED_AUDIO_ROOTS`
 - `ACUSTICAFAUNA_RESOURCE_PROFILE`
 
 Si no tienes dataset, puedes usar uploads temporales en Laboratorio de audio.

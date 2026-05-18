@@ -1,4 +1,5 @@
 import os
+import re
 from pathlib import Path
 
 
@@ -84,10 +85,10 @@ class Settings:
 
     @property
     def MEDIA_ALLOWED_ROOTS(self) -> tuple[Path, ...]:
-        extra_roots = os.getenv("ACUSTICAFAUNA_ALLOWED_MEDIA_ROOTS", "")
+        extra_roots = os.getenv("ACUSTICAFAUNA_ALLOWED_AUDIO_ROOTS") or os.getenv("ACUSTICAFAUNA_ALLOWED_MEDIA_ROOTS", "")
         roots = [self.CURATED_DATASET_DIR, self.STORAGE_DIR]
 
-        for raw_path in extra_roots.split(os.pathsep):
+        for raw_path in re.split(r"[;,]" if os.pathsep == ";" else rf"[;,{re.escape(os.pathsep)}]", extra_roots):
             raw_path = raw_path.strip()
             if raw_path:
                 roots.append(resolve_project_path(raw_path, self.WORKSPACE_DIR, self.WORKSPACE_DIR))

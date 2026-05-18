@@ -183,6 +183,54 @@ Flujo recomendado:
 
 El paso de deteccion reduce el audio a zonas candidatas. La decision biologica sigue dependiendo del detector ML, clasificador especializado y revision humana.
 
+## Procesamiento masivo por carpeta local
+
+Usar este flujo cuando la carpeta es demasiado grande para upload manual, por ejemplo 70 GB de audios de una grabadora Raspberry o de varias estaciones. El usuario pega la ruta local en `/laboratorio-audio`, en **Procesamiento masivo por carpeta local**.
+
+Ejemplo:
+
+```text
+C:\Datos\Ranas\lote_01
+```
+
+Flujo recomendado:
+
+1. Escanear carpeta.
+2. Revisar archivos encontrados, tamano total, duracion estimada y advertencias.
+3. Escribir label objetivo, por ejemplo `Boana_boans`.
+4. Elegir frecuencia minima y maxima. Si la especie canta entre 2 y 3 kHz, usar `2000` y `3000`.
+5. Ajustar `threshold_dbfs`, `min_activity_seconds`, `min_silence_seconds`, padding, duracion de clip y ratio minimo de energia en banda.
+6. Iniciar job.
+7. Pausar, reanudar o cancelar si hace falta.
+8. Revisar tabla de resultados antes de usar cualquier audio para entrenamiento.
+9. Exportar manifest CSV.
+
+Interpretacion:
+
+- `dBFS` es nivel digital relativo del archivo; no es dB SPL calibrado.
+- `band_energy_ratio` alto significa que una parte importante de la energia cae dentro de la banda objetivo.
+- `candidate` significa candidato para revision, no ejemplo limpio confirmado.
+- Los flags `voz_humana_suspect`, `carro_motor_suspect`, `ave_suspect` y `broadband_noise_suspect` son señales de revision humana.
+
+Salidas:
+
+```text
+backend/storage/audio_lab/folder_batch_jobs/{job_id}/
+  clips/
+  processed/
+  summaries/
+  manifests/
+  logs/
+```
+
+Restricciones:
+
+- No modificar ni borrar audios originales.
+- No escribir dentro de la carpeta original por defecto.
+- No entrenar automaticamente.
+- No agregar automaticamente a `dataset_curado`.
+- Si ML API esta apagada, el DSP sigue corriendo y solo se omite detector rana/sapo.
+
 ## Procesamiento por lote
 
 La web ofrece dos modos de pipeline:
@@ -197,6 +245,8 @@ El panel muestra una lista visible de **Audios listos para procesamiento**. Esa 
 - el audio activo del laboratorio mediante **Agregar audio actual al lote**.
 
 Si el audio activo no esta en la cola, la web muestra un aviso para agregarlo. La cola evita duplicados por `audio_path` y permite quitar items sin borrar archivos fisicos. Iniciar procesamiento sin audios muestra ayuda: primero debe agregarse al menos un audio.
+
+Si un audio elegido manualmente existe fuera de las rutas permitidas globales, la UI puede autorizar su carpeta padre solo para ese job mediante `job_allowed_roots`. No se autoriza una unidad completa como `F:\` sin confirmacion fuerte y no se escribe nada en `.env`.
 
 ### Solo limpiar lote existente
 
@@ -233,6 +283,14 @@ El pipeline detecta actividad, corta segmentos, descarta vacios, limpia copias d
 - `error`
 
 Ningun output pasa automaticamente a entrenamiento. Para construir manifests, primero debe abrirse en laboratorio, revisarse y recibir feedback humano.
+
+Estados esperados del job:
+
+- `completed`: todos los audios procesaron.
+- `completed_with_errors`: algunos audios fallaron, pero hubo outputs validos.
+- `failed`: un job de un solo archivo fallo o no produjo outputs.
+
+Si falla por permisos de ruta, el backend responde `audio_path_not_allowed` con `suggested_env_line`.
 
 ### Reporte de calidad
 
