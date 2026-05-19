@@ -62,7 +62,22 @@ BATCH_JOB_PRESETS = {"conservador", "normal", "agresivo", "personalizado"}
 FOLDER_BATCH_EXTENSIONS = {".wav", ".flac", ".mp3", ".ogg", ".m4a"}
 FOLDER_BATCH_STATUSES = {"pending", "running", "paused", "completed", "failed", "cancelled"}
 FOLDER_BATCH_MODES = {"species_folder_cleanup"}
-FOLDER_BATCH_PRESETS = {"conservador", "normal", "agresivo", "personalizado"}
+FOLDER_BATCH_PRESETS = {"conservador", "normal", "agresivo", "personalizado", "exploratory_wide", "intermedia_exploratoria"}
+INTERMEDIATE_EXPLORATORY_CONFIG = {
+    "name": "intermedia_exploratoria",
+    "frequency_min_hz": 2200,
+    "frequency_max_hz": 5500,
+    "threshold_dbfs": -53,
+    "min_band_energy_ratio": 0.20,
+    "bandpass": True,
+    "noise_reduce": False,
+    "normalize": False,
+    "min_activity_seconds": 0.25,
+    "min_silence_seconds": 0.5,
+    "padding_seconds": 0.15,
+    "clip_duration_seconds": 5,
+    "max_segment_seconds": 10,
+}
 
 
 class AudioLabAnnotationPayload(BaseModel):
@@ -252,6 +267,8 @@ class FolderBatchJobPayload(BaseModel):
     target_label: str
     mode: str = "species_folder_cleanup"
     preset: str = "normal"
+    config_name: str | None = None
+    calibration_mode: str = "recommended"
     frequency_min_hz: float = 1800
     frequency_max_hz: float = 3000
     threshold_dbfs: float = -45
@@ -3036,13 +3053,63 @@ def write_folder_batch_manifest(job_id: str) -> str:
         conn.close()
 
 
+def folder_batch_is_exploratory(job: dict[str, Any], params: dict[str, Any] | None = None) -> bool:
+    params = params or {}
+    return (
+        job.get("preset") == "exploratory_wide"
+        or params.get("config_name") == "exploratory_wide"
+        or params.get("name") == "exploratory_wide"
+        or params.get("calibration_mode") == "exploratory"
+    )
+
+
+def folder_batch_exploratory_result(candidates: int, job: dict[str, Any], params: dict[str, Any] | None = None) -> dict[str, Any]:
+    params = params or {}
+    result = {
+        "title": "Resultado exploratorio",
+        "safe_for_batch_processing": False,
+        "summary": "Se encontró actividad con configuración amplia, pero no se considera segura.",
+        "warning": "Esta configuración es exploratoria. Sirve para encontrar actividad posible, no para procesar toda la carpeta.",
+        "training_warning": "No usar para entrenamiento ni procesamiento masivo sin revisar.",
+        "suggested_intermediate_config": INTERMEDIATE_EXPLORATORY_CONFIG,
+        "markdown": "\n".join(
+            [
+                "## Resultado exploratorio",
+                "",
+                "Se encontró actividad con configuración amplia, pero no se considera segura.",
+                "",
+                "Configuración intermedia sugerida:",
+                f"- frequency_min_hz: {INTERMEDIATE_EXPLORATORY_CONFIG['frequency_min_hz']}",
+                f"- frequency_max_hz: {INTERMEDIATE_EXPLORATORY_CONFIG['frequency_max_hz']}",
+                f"- threshold_dbfs: {INTERMEDIATE_EXPLORATORY_CONFIG['threshold_dbfs']}",
+                f"- min_band_energy_ratio: {INTERMEDIATE_EXPLORATORY_CONFIG['min_band_energy_ratio']}",
+                "- bandpass: true",
+                "- noise_reduce: false",
+                "- normalize: false",
+            ]
+        ),
+    }
+    if candidates > 0:
+        result["best_next_step"] = "try_intermediate_config"
+        result["recommendation"] = "too_many_candidates"
+        result["next_step_text"] = "Hay actividad, pero la configuración es demasiado abierta. Siguiente paso: probar una configuración intermedia."
+    else:
+        result["recommendation"] = params.get("recommendation") or "exploratory_only"
+    return result
+
+
 def build_folder_batch_summary(job_id: str) -> dict[str, Any]:
     conn = get_connection()
     try:
         ensure_audio_lab_extra_schema(conn)
-        job = conn.execute("SELECT * FROM audio_lab_folder_batch_jobs WHERE id = ?", (job_id,)).fetchone()
-        if not job:
+        job_row = conn.execute("SELECT * FROM audio_lab_folder_batch_jobs WHERE id = ?", (job_id,)).fetchone()
+        if not job_row:
             raise HTTPException(status_code=404, detail="Job no encontrado.")
+        job = dict(job_row)
+        try:
+            params = json.loads(job.get("params_json") or "{}")
+        except json.JSONDecodeError:
+            params = {}
         segs = conn.execute("SELECT * FROM audio_lab_folder_batch_segments WHERE job_id = ?", (job_id,)).fetchall()
         files = conn.execute("SELECT * FROM audio_lab_folder_batch_files WHERE job_id = ?", (job_id,)).fetchall()
         ratios = [float(row["band_energy_ratio"] or 0) for row in segs]
@@ -3082,6 +3149,8 @@ def build_folder_batch_summary(job_id: str) -> dict[str, Any]:
             },
             "manifest_path": job["manifest_path"],
         }
+        if folder_batch_is_exploratory(job, params):
+            summary["exploratory_result"] = folder_batch_exploratory_result(candidates, job, params)
         return summary
     finally:
         conn.close()
@@ -3181,6 +3250,14 @@ def create_folder_batch_outputs_for_segment(
         "recommendation": segment["recommendation"],
         "dBFS_note": "dBFS es nivel relativo del archivo digital; no es dB acustico calibrado.",
     }
+    if payload.preset == "exploratory_wide" or payload.config_name == "exploratory_wide" or payload.calibration_mode == "exploratory":
+        metadata["exploratory_result"] = {
+            "title": "Resultado exploratorio",
+            "summary": "Se encontró actividad con configuración amplia, pero no se considera segura.",
+            "warning": "No usar para entrenamiento ni procesamiento masivo sin revisar.",
+            "recommendation": "too_many_candidates" if segment["recommendation"] == "candidate" else "exploratory_only",
+            "suggested_intermediate_config": INTERMEDIATE_EXPLORATORY_CONFIG,
+        }
     metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
     quality_path.write_text(json.dumps({"recommendation": segment["recommendation"], **metadata}, ensure_ascii=False, indent=2), encoding="utf-8")
     return {

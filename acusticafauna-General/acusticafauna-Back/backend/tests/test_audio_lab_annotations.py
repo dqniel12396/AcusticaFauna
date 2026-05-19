@@ -564,3 +564,51 @@ def test_folder_batch_detects_in_band_audio_without_ml_api(client, tmp_path):
     manifest = client.get(f"/api/audio-lab/folder-batch/jobs/{job_id}/manifest")
     assert manifest.status_code == 200
     assert "boana_candidate" in manifest.text
+
+
+def test_folder_batch_exploratory_summary_recommends_intermediate_config(client, tmp_path):
+    folder = tmp_path / "folder_batch_exploratory"
+    write_tone_wav(folder / "possible_activity.wav", 2400)
+
+    job = client.post(
+        "/api/audio-lab/folder-batch/jobs",
+        json={
+            "job_name": "pytest_folder_batch_exploratory",
+            "folder_path": str(folder),
+            "recursive": True,
+            "target_label": "Boana_boans",
+            "mode": "species_folder_cleanup",
+            "preset": "exploratory_wide",
+            "config_name": "exploratory_wide",
+            "calibration_mode": "exploratory",
+            "frequency_min_hz": 1800,
+            "frequency_max_hz": 6000,
+            "threshold_dbfs": -55,
+            "min_activity_seconds": 0.25,
+            "min_silence_seconds": 0.5,
+            "padding_seconds": 0.15,
+            "clip_duration_seconds": 1.0,
+            "max_segment_seconds": 1.0,
+            "min_band_ratio": 0.15,
+            "bandpass": True,
+            "noise_reduce": False,
+            "normalize": False,
+            "discard_empty": True,
+            "detect_frog": False,
+            "detect_contaminants_heuristic": True,
+            "create_clips": True,
+            "create_manifest": True,
+            "resource_profile": "eco",
+            "extensions": [".wav"],
+        },
+    )
+    assert job.status_code == 200
+    job_id = job.json()["job_id"]
+
+    summary = client.get(f"/api/audio-lab/folder-batch/jobs/{job_id}/summary")
+    assert summary.status_code == 200
+    exploratory = summary.json()["summary"]["exploratory_result"]
+    assert exploratory["safe_for_batch_processing"] is False
+    assert exploratory["best_next_step"] == "try_intermediate_config"
+    assert exploratory["suggested_intermediate_config"]["name"] == "intermedia_exploratoria"
+    assert "Resultado exploratorio" in exploratory["markdown"]

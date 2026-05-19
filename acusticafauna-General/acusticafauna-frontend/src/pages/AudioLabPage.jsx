@@ -97,6 +97,8 @@ const FOLDER_BATCH_DEFAULT_FORM = {
   target_label: "Boana_boans",
   job_name: "",
   preset: "normal",
+  config_name: "safe_strict",
+  calibration_mode: "safe",
   frequency_min_hz: 1800,
   frequency_max_hz: 3000,
   threshold_dbfs: -45,
@@ -116,11 +118,64 @@ const FOLDER_BATCH_DEFAULT_FORM = {
   create_manifest: true,
   resource_profile: "auto",
 };
+const FOLDER_BATCH_SAFE_RECOMMENDED_CONFIG = {
+  name: "safe_strict",
+  preset: "normal",
+  calibration_mode: "safe",
+  frequency_min_hz: 1800,
+  frequency_max_hz: 3000,
+  threshold_dbfs: -45,
+  min_band_ratio: 0.45,
+  bandpass: true,
+  noise_reduce: true,
+  normalize: true,
+  min_activity_seconds: 0.4,
+  min_silence_seconds: 1.0,
+  padding_seconds: 0.3,
+  clip_duration_seconds: 5,
+  max_segment_seconds: 10,
+};
+const FOLDER_BATCH_EXPLORATORY_WIDE_CONFIG = {
+  name: "exploratory_wide",
+  preset: "exploratory_wide",
+  calibration_mode: "exploratory",
+  frequency_min_hz: 1800,
+  frequency_max_hz: 6000,
+  threshold_dbfs: -55,
+  min_band_ratio: 0.15,
+  bandpass: true,
+  noise_reduce: false,
+  normalize: false,
+  min_activity_seconds: 0.25,
+  min_silence_seconds: 0.5,
+  padding_seconds: 0.15,
+  clip_duration_seconds: 5,
+  max_segment_seconds: 10,
+};
+const FOLDER_BATCH_INTERMEDIATE_CONFIG = {
+  name: "intermedia_exploratoria",
+  preset: "intermedia_exploratoria",
+  calibration_mode: "intermediate",
+  frequency_min_hz: 2200,
+  frequency_max_hz: 5500,
+  threshold_dbfs: -53,
+  min_band_ratio: 0.2,
+  bandpass: true,
+  noise_reduce: false,
+  normalize: false,
+  min_activity_seconds: 0.25,
+  min_silence_seconds: 0.5,
+  padding_seconds: 0.15,
+  clip_duration_seconds: 5,
+  max_segment_seconds: 10,
+};
 const FOLDER_BATCH_PRESETS = {
-  conservador: { threshold_dbfs: -38, min_band_ratio: 0.6, min_activity_seconds: 0.6, noise_reduce: false },
-  normal: { threshold_dbfs: -45, min_band_ratio: 0.45, min_activity_seconds: 0.4, noise_reduce: true },
-  agresivo: { threshold_dbfs: -52, min_band_ratio: 0.3, min_activity_seconds: 0.25, noise_reduce: true },
-  personalizado: {},
+  conservador: { config_name: "safe_strict", calibration_mode: "safe", threshold_dbfs: -38, min_band_ratio: 0.6, min_activity_seconds: 0.6, noise_reduce: false },
+  normal: FOLDER_BATCH_SAFE_RECOMMENDED_CONFIG,
+  agresivo: { config_name: "recommended_sensitive", calibration_mode: "recommended", threshold_dbfs: -52, min_band_ratio: 0.3, min_activity_seconds: 0.25, noise_reduce: true },
+  exploratory_wide: FOLDER_BATCH_EXPLORATORY_WIDE_CONFIG,
+  intermedia_exploratoria: FOLDER_BATCH_INTERMEDIATE_CONFIG,
+  personalizado: { config_name: "personalizado", calibration_mode: "recommended" },
 };
 
 function Spinner() {
@@ -860,6 +915,36 @@ export default function AudioLabPage() {
   const [autoIdentifyExperimental, setAutoIdentifyExperimental] = useState(false);
   const [batchAutoIdentifyRunning, setBatchAutoIdentifyRunning] = useState(false);
   const [batchAutoIdentifyResults, setBatchAutoIdentifyResults] = useState([]);
+
+  const folderBatchIsExploratory = folderBatchConfigIsExploratory(folderBatchForm);
+  const folderBatchCurrentRecommendation = folderBatchRecommendationFor(folderBatchForm);
+  const folderBatchCandidateCount = Number(activeFolderBatchJob?.candidates_count || folderBatchSummary?.summary?.candidates || 0);
+  const folderBatchTooManyCandidates = folderBatchIsExploratory || folderBatchCurrentRecommendation === "too_many_candidates";
+  const folderBatchHasSafeRecommendation = !folderBatchTooManyCandidates;
+  const folderBatchBestNextStep = folderBatchIsExploratory && folderBatchCandidateCount > 0 ? "try_intermediate_config" : null;
+  const folderBatchComparisonRows = [
+    {
+      ...FOLDER_BATCH_SAFE_RECOMMENDED_CONFIG,
+      label: "Segura estricta",
+      badge: "Segura",
+      tone: "success",
+      recommendationText: "Apta para procesar carpeta cuando la muestra revisada es consistente.",
+    },
+    {
+      ...FOLDER_BATCH_INTERMEDIATE_CONFIG,
+      label: "Intermedia exploratoria",
+      badge: "Intermedia",
+      tone: "info",
+      recommendationText: "Siguiente paso si la amplia encuentra actividad pero abre demasiado el filtro.",
+    },
+    {
+      ...FOLDER_BATCH_EXPLORATORY_WIDE_CONFIG,
+      label: "Exploratoria amplia",
+      badge: "Exploratoria",
+      tone: "warning",
+      recommendationText: "Demasiado amplia; puede incluir lluvia/viento/ruido.",
+    },
+  ];
 
   const labelOptions = useMemo(() => labels.map((item) => item.label).filter(Boolean), [labels]);
   const selectableModels = useMemo(() => {
@@ -2099,13 +2184,47 @@ export default function AudioLabPage() {
     setFolderBatchForm((current) => ({ ...current, [key]: value }));
   }
 
-  function applyFolderBatchPreset(preset) {
-    const values = FOLDER_BATCH_PRESETS[preset] || {};
+  function normalizeFolderBatchConfig(config) {
+    return {
+      ...config,
+      config_name: config.config_name || config.name || config.preset || "personalizado",
+    };
+  }
+
+  function applyFolderBatchConfig(config) {
+    const values = normalizeFolderBatchConfig(config);
     setFolderBatchForm((current) => ({
       ...current,
-      preset,
       ...values,
+      preset: values.preset || current.preset || "personalizado",
     }));
+  }
+
+  function applyFolderBatchPreset(preset) {
+    const values = FOLDER_BATCH_PRESETS[preset] || {};
+    applyFolderBatchConfig({ ...values, preset });
+  }
+
+  function folderBatchConfigIsExploratory(config = folderBatchForm) {
+    return config.config_name === "exploratory_wide" || config.name === "exploratory_wide" || config.preset === "exploratory_wide" || config.calibration_mode === "exploratory";
+  }
+
+  function folderBatchRecommendationFor(config = folderBatchForm) {
+    if (folderBatchConfigIsExploratory(config)) return "too_many_candidates";
+    return config.calibration_mode === "safe" ? "safe_recommended" : "recommended";
+  }
+
+  function useFolderBatchComparisonRow(config) {
+    if (folderBatchConfigIsExploratory(config)) {
+      const confirmed = window.confirm("Esta configuración puede generar muchos falsos candidatos. Úsala solo para una muestra pequeña.");
+      if (!confirmed) return;
+      const filesFound = Number(folderBatchScan?.files_found || 0);
+      if (filesFound > 20) {
+        const sampleConfirmed = window.confirm(`La carpeta escaneada tiene ${filesFound} audios. Esta configuración queda en modo exploratorio; confirma solo si vas a probar una muestra pequeña, no toda la carpeta.`);
+        if (!sampleConfirmed) return;
+      }
+    }
+    applyFolderBatchConfig(config);
   }
 
   function buildFolderBatchScanPayload() {
@@ -2144,6 +2263,8 @@ export default function AudioLabPage() {
       target_label: folderBatchForm.target_label.trim() || "target_species",
       mode: "species_folder_cleanup",
       preset: folderBatchForm.preset,
+      config_name: folderBatchForm.config_name,
+      calibration_mode: folderBatchForm.calibration_mode,
       frequency_min_hz: Number(folderBatchForm.frequency_min_hz),
       frequency_max_hz: Number(folderBatchForm.frequency_max_hz),
       threshold_dbfs: Number(folderBatchForm.threshold_dbfs),
@@ -2173,6 +2294,18 @@ export default function AudioLabPage() {
     if (!folderBatchScan) {
       setError("Escanea la carpeta antes de iniciar el procesamiento.");
       return;
+    }
+    if (folderBatchConfigIsExploratory()) {
+      const filesFound = Number(folderBatchScan.files_found || 0);
+      if (filesFound > 20) {
+        const confirmedExploratory = window.confirm(
+          `Esta configuración puede generar muchos falsos candidatos. Úsala solo para una muestra pequeña.\n\nLa carpeta tiene ${filesFound} audios. No se recomienda procesar toda la carpeta con exploratory_wide.`
+        );
+        if (!confirmedExploratory) return;
+      } else {
+        const confirmedSample = window.confirm("Esta configuración es exploratoria. Sirve para encontrar actividad posible, no para procesar toda la carpeta.");
+        if (!confirmedSample) return;
+      }
     }
     const confirmed = window.confirm(
       `Iniciar procesamiento masivo por carpeta?\n\nCarpeta: ${folderBatchForm.folder_path}\nArchivos: ${folderBatchScan.files_found || 0}\nBanda: ${folderBatchForm.frequency_min_hz}-${folderBatchForm.frequency_max_hz} Hz\nDestino: backend/storage/audio_lab/folder_batch_jobs/{job_id}\n\nNo se modificaran ni borraran audios originales.`
@@ -3637,10 +3770,55 @@ python -m uvicorn ml_api.main:app --host 127.0.0.1 --port 8010 --reload`}
                 Buscar en subcarpetas
               </label>
 
+              <div className={`rounded-lg border p-3 text-sm ${folderBatchIsExploratory ? "border-amber-300 bg-amber-50 text-amber-950" : "border-emerald-200 bg-emerald-50 text-emerald-950"}`}>
+                <div className="flex flex-wrap items-start justify-between gap-2">
+                  <div>
+                    <h3 className="font-bold">{folderBatchIsExploratory ? "Configuración exploratoria actual" : "Recomendación actual"}</h3>
+                    <p className="mt-1">
+                      Frecuencia: <strong>{folderBatchForm.frequency_min_hz}-{folderBatchForm.frequency_max_hz} Hz</strong> · Threshold: <strong>{folderBatchForm.threshold_dbfs} dBFS</strong> · Ratio banda: <strong>{folderBatchForm.min_band_ratio}</strong>
+                    </p>
+                  </div>
+                  <Badge tone={folderBatchIsExploratory ? "warning" : "success"}>{folderBatchForm.config_name || folderBatchForm.preset}</Badge>
+                </div>
+                {folderBatchIsExploratory ? (
+                  <div className="mt-3 space-y-2">
+                    <p className="font-semibold">Esta configuración es exploratoria. Sirve para encontrar actividad posible, no para procesar toda la carpeta.</p>
+                    <p>No usar para entrenamiento ni procesamiento masivo sin revisar.</p>
+                    {folderBatchCandidateCount > 0 ? (
+                      <p>Hay actividad, pero la configuración es demasiado abierta. Siguiente paso: probar una configuración intermedia.</p>
+                    ) : null}
+                  </div>
+                ) : null}
+                <div className="mt-3 flex flex-wrap gap-2">
+                  {folderBatchHasSafeRecommendation ? (
+                    <button type="button" onClick={() => applyFolderBatchConfig(FOLDER_BATCH_SAFE_RECOMMENDED_CONFIG)} className="rounded-lg bg-emerald-600 px-3 py-2 text-xs font-semibold text-white">
+                      Usar configuración segura en carpeta
+                    </button>
+                  ) : (
+                    <button type="button" disabled className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs font-semibold text-slate-500 opacity-60">
+                      Usar configuración segura en carpeta
+                    </button>
+                  )}
+                  {folderBatchIsExploratory ? (
+                    <>
+                      <button type="button" onClick={() => applyFolderBatchConfig(FOLDER_BATCH_EXPLORATORY_WIDE_CONFIG)} className="rounded-lg border border-amber-300 bg-white px-3 py-2 text-xs font-semibold text-amber-900">
+                        Usar exploratoria solo en muestra
+                      </button>
+                      <button type="button" onClick={() => applyFolderBatchConfig(FOLDER_BATCH_INTERMEDIATE_CONFIG)} className="rounded-lg border border-blue-300 bg-white px-3 py-2 text-xs font-semibold text-blue-800">
+                        Crear configuración intermedia
+                      </button>
+                    </>
+                  ) : null}
+                </div>
+                {folderBatchBestNextStep === "try_intermediate_config" ? (
+                  <p className="mt-2 text-xs font-semibold">best_next_step: try_intermediate_config</p>
+                ) : null}
+              </div>
+
               <div>
                 <div className="mb-2 text-sm font-semibold text-slate-700">Preset</div>
                 <div className="flex flex-wrap gap-2">
-                  {["conservador", "normal", "agresivo", "personalizado"].map((preset) => (
+                  {["conservador", "normal", "agresivo", "intermedia_exploratoria", "exploratory_wide", "personalizado"].map((preset) => (
                     <button
                       key={preset}
                       type="button"
@@ -3650,6 +3828,42 @@ python -m uvicorn ml_api.main:app --host 127.0.0.1 --port 8010 --reload`}
                       {preset}
                     </button>
                   ))}
+                </div>
+              </div>
+
+              <div className="rounded-lg border border-slate-200 bg-white p-3">
+                <h3 className="text-sm font-bold text-slate-800">Comparación de configuraciones</h3>
+                <div className="mt-3 overflow-x-auto">
+                  <table className="min-w-full text-left text-xs">
+                    <thead className="bg-slate-50 uppercase text-slate-500">
+                      <tr>
+                        <th className="px-2 py-2">Config</th>
+                        <th className="px-2 py-2">Tipo</th>
+                        <th className="px-2 py-2">Frecuencia</th>
+                        <th className="px-2 py-2">Threshold</th>
+                        <th className="px-2 py-2">Ratio</th>
+                        <th className="px-2 py-2">Recomendación</th>
+                        <th className="px-2 py-2">Acción</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {folderBatchComparisonRows.map((row) => (
+                        <tr key={row.name} className="border-t border-slate-100">
+                          <td className="px-2 py-2 font-semibold">{row.label}</td>
+                          <td className="px-2 py-2"><Badge tone={row.tone}>{row.badge}</Badge></td>
+                          <td className="px-2 py-2">{row.frequency_min_hz}-{row.frequency_max_hz} Hz</td>
+                          <td className="px-2 py-2">{row.threshold_dbfs} dBFS</td>
+                          <td className="px-2 py-2">{row.min_band_ratio}</td>
+                          <td className="px-2 py-2">{row.recommendationText}</td>
+                          <td className="px-2 py-2">
+                            <button type="button" onClick={() => useFolderBatchComparisonRow(row)} className="rounded-lg border border-slate-300 px-2 py-1 font-semibold">
+                              Usar
+                            </button>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
                 </div>
               </div>
 
