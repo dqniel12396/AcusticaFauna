@@ -6,7 +6,10 @@ import csv
 import fnmatch
 import json
 import math
+import os
 import re
+import subprocess
+import sys
 import threading
 import wave
 from datetime import datetime
@@ -778,7 +781,72 @@ def folder_batch_job_to_dict(row) -> dict[str, Any]:
     else:
         item["progress"] = 0.0
     item["output_dir"] = item.get("output_dir") or str(folder_batch_job_dir(item["id"]))
+    item["logs_dir"] = item.get("logs_dir") or str(folder_batch_job_dir(item["id"], "logs"))
     return item
+
+
+def is_path_inside(base: Path, candidate: Path) -> bool:
+    try:
+        base_resolved = base.expanduser().resolve(strict=False)
+        candidate_resolved = candidate.expanduser().resolve(strict=False)
+        return os.path.commonpath([str(base_resolved), str(candidate_resolved)]) == str(base_resolved)
+    except (OSError, ValueError):
+        return False
+
+
+def get_folder_batch_job_row(job_id: str):
+    conn = get_connection()
+    try:
+        ensure_audio_lab_extra_schema(conn)
+        row = conn.execute("SELECT * FROM audio_lab_folder_batch_jobs WHERE id = ?", (job_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Job no encontrado.")
+        return row
+    finally:
+        conn.close()
+
+
+def secure_folder_batch_output_dir(job: dict[str, Any]) -> Path:
+    root = audio_lab_dir("folder_batch_jobs")
+    fallback = root / job["id"]
+    output_dir = Path(job.get("output_dir") or fallback).expanduser().resolve(strict=False)
+    if not is_path_inside(root, output_dir):
+        raise HTTPException(status_code=400, detail="output_dir del job queda fuera del storage de folder_batch_jobs.")
+    return output_dir
+
+
+def folder_batch_job_paths(job: dict[str, Any]) -> dict[str, Any]:
+    output_dir = secure_folder_batch_output_dir(job)
+    manifest_path = Path(job.get("manifest_path") or (output_dir / "manifests" / "manifest.csv")).expanduser().resolve(strict=False)
+    logs_dir = Path(job.get("logs_dir") or (output_dir / "logs")).expanduser().resolve(strict=False)
+    if not is_path_inside(output_dir, manifest_path):
+        manifest_path = (output_dir / "manifests" / "manifest.csv").resolve(strict=False)
+    if not is_path_inside(output_dir, logs_dir):
+        logs_dir = (output_dir / "logs").resolve(strict=False)
+    paths = {
+        "source_folder": Path(job.get("folder_path_resolved") or job.get("folder_path") or "").expanduser().resolve(strict=False),
+        "output_dir": output_dir,
+        "clips_dir": output_dir / "clips",
+        "processed_dir": output_dir / "processed",
+        "manifest_path": manifest_path,
+        "logs_dir": logs_dir,
+    }
+    return {key: {"path": str(path), "exists": path.exists()} for key, path in paths.items()}
+
+
+def local_open_output_enabled() -> bool:
+    env_name = os.getenv("ACUSTICAFAUNA_ENV", os.getenv("ENV", "local")).strip().lower()
+    disabled = os.getenv("ACUSTICAFAUNA_DISABLE_LOCAL_OPEN_OUTPUTS", "").strip().lower()
+    return env_name not in {"production", "prod"} and disabled not in {"1", "true", "yes", "on"}
+
+
+def open_local_folder(path: Path) -> None:
+    if sys.platform.startswith("win"):
+        os.startfile(str(path))  # type: ignore[attr-defined]
+    elif sys.platform == "darwin":
+        subprocess.run(["open", str(path)], check=True)
+    else:
+        subprocess.run(["xdg-open", str(path)], check=True)
 
 
 def folder_job_status(job_id: str) -> str | None:
@@ -1964,6 +2032,7 @@ def ensure_audio_lab_extra_schema(conn) -> None:
             errors_count INTEGER DEFAULT 0,
             output_dir TEXT,
             manifest_path TEXT,
+            logs_dir TEXT,
             params_json TEXT,
             summary_json TEXT,
             current_file TEXT,
@@ -1975,6 +2044,8 @@ def ensure_audio_lab_extra_schema(conn) -> None:
     existing_folder_job_columns = {row["name"] for row in conn.execute("PRAGMA table_info(audio_lab_folder_batch_jobs)").fetchall()}
     if "folder_path_resolved" not in existing_folder_job_columns:
         conn.execute("ALTER TABLE audio_lab_folder_batch_jobs ADD COLUMN folder_path_resolved TEXT")
+    if "logs_dir" not in existing_folder_job_columns:
+        conn.execute("ALTER TABLE audio_lab_folder_batch_jobs ADD COLUMN logs_dir TEXT")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS audio_lab_folder_batch_files (
@@ -3507,6 +3578,7 @@ def create_folder_batch_job(payload: FolderBatchJobPayload, background_tasks: Ba
     for part in ["clips", "processed", "summaries", "manifests", "logs"]:
         folder_batch_job_dir(job_id, part)
     manifest_path = str(folder_batch_job_dir(job_id, "manifests") / "manifest.csv")
+    logs_dir = str(folder_batch_job_dir(job_id, "logs"))
     files = list_folder_audio_files(payload)
     conn = get_connection()
     try:
@@ -3518,10 +3590,10 @@ def create_folder_batch_job(payload: FolderBatchJobPayload, background_tasks: Ba
                 frequency_min_hz, frequency_max_hz, threshold_dbfs, total_files,
                 processed_files, total_duration_seconds, processed_duration_seconds,
                 candidates_count, discarded_count, contaminant_suspect_count,
-                frog_positive_count, errors_count, output_dir, manifest_path,
+                frog_positive_count, errors_count, output_dir, manifest_path, logs_dir,
                 params_json, summary_json, current_file, created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 job_id,
@@ -3546,6 +3618,7 @@ def create_folder_batch_job(payload: FolderBatchJobPayload, background_tasks: Ba
                 0,
                 str(output_dir),
                 manifest_path,
+                logs_dir,
                 json.dumps(folder_batch_payload_dict(payload), ensure_ascii=False),
                 json.dumps(scan, ensure_ascii=False),
                 None,
@@ -3612,6 +3685,40 @@ def get_folder_batch_job(job_id: str):
         return {**folder_batch_job_to_dict(row), "files": [dict(item) for item in files]}
     finally:
         conn.close()
+
+
+@router.get("/folder-batch/jobs/{job_id}/paths")
+def get_folder_batch_paths(job_id: str):
+    job = dict(get_folder_batch_job_row(job_id))
+    paths = folder_batch_job_paths(job)
+    return {"job_id": job_id, **paths}
+
+
+@router.post("/folder-batch/jobs/{job_id}/open-output-folder")
+def open_folder_batch_output_folder(job_id: str):
+    job = dict(get_folder_batch_job_row(job_id))
+    output_dir = secure_folder_batch_output_dir(job)
+    if not output_dir.exists() or not output_dir.is_dir():
+        return {
+            "opened": False,
+            "output_dir": str(output_dir),
+            "message": "Copia esta ruta y abrela manualmente.",
+        }
+    if not local_open_output_enabled():
+        return {
+            "opened": False,
+            "output_dir": str(output_dir),
+            "message": "Copia esta ruta y abrela manualmente.",
+        }
+    try:
+        open_local_folder(output_dir)
+        return {"opened": True, "output_dir": str(output_dir)}
+    except Exception:
+        return {
+            "opened": False,
+            "output_dir": str(output_dir),
+            "message": "Copia esta ruta y abrela manualmente.",
+        }
 
 
 @router.get("/folder-batch/jobs/{job_id}/logs")

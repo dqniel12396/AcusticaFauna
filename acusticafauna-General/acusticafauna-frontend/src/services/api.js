@@ -678,6 +678,16 @@ export async function fetchAudioLabFolderBatchLogs(jobId) {
   return handleResponse(response);
 }
 
+export async function fetchAudioLabFolderBatchPaths(jobId) {
+  const response = await fetch(`${API_BASE}/audio-lab/folder-batch/jobs/${encodeURIComponent(jobId)}/paths`);
+  return handleResponse(response);
+}
+
+export async function openAudioLabFolderBatchOutputFolder(jobId) {
+  const response = await fetch(`${API_BASE}/audio-lab/folder-batch/jobs/${encodeURIComponent(jobId)}/open-output-folder`, { method: "POST" });
+  return handleResponse(response);
+}
+
 export async function pauseAudioLabFolderBatchJob(jobId) {
   const response = await fetch(`${API_BASE}/audio-lab/folder-batch/jobs/${encodeURIComponent(jobId)}/pause`, { method: "POST" });
   return handleResponse(response);

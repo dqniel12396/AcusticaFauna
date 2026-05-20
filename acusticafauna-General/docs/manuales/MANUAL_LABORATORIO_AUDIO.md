@@ -44,6 +44,28 @@ C:\Datos\Ranas\lote_01
 10. Revisa candidatos, excluidos y sospechosos de contaminantes.
 11. Exporta el manifest CSV cuando termines la revision.
 
+Rutas que veras en la pantalla:
+
+- **Carpeta actual del formulario**: la ruta que esta escrita ahora en el campo de carpeta local.
+- **Carpeta origen del job**: la carpeta que se escaneo cuando se creo el job seleccionado.
+- **Carpeta de outputs**: carpeta interna donde AcusticaFauna guarda clips, procesados, manifests y logs del job.
+- **Manifest CSV**: archivo `manifest.csv` generado para revisar trazabilidad y resultados.
+- **Logs**: carpeta y texto de eventos del procesamiento.
+
+Los outputs no se guardan junto al audio original. Se guardan dentro de:
+
+```text
+backend/storage/audio_lab/folder_batch_jobs/{job_id}/
+```
+
+Si cambias la ruta local despues de escanear, debes pulsar **Escanear carpeta** otra vez antes de iniciar un nuevo procesamiento. Si seleccionas un job viejo cuyo origen no coincide con la carpeta escrita ahora, la interfaz lo marca como **historico** y muestra una alerta. Ese job sigue siendo consultable, pero pertenece a otra carpeta.
+
+Para abrir outputs:
+
+- Usa **Abrir carpeta de outputs** para pedir al backend local que abra la carpeta en el Explorador.
+- Si no se puede abrir automaticamente, usa **Copiar ruta** y pegala en el Explorador de Windows.
+- **Ver ruta** muestra la ruta completa para comprobar que corresponde al job seleccionado.
+
 Que significan los resultados:
 
 - `candidate`: segmento candidato para revision humana.
@@ -65,6 +87,7 @@ Importante:
 - No se modifican ni borran audios originales.
 - El sistema no entrena automaticamente.
 - Los outputs quedan en `backend/storage/audio_lab/folder_batch_jobs/{job_id}/`.
+- Un job historico no procesa la carpeta actual del formulario; solo muestra resultados de su carpeta origen.
 - Si ML API esta apagada, el procesamiento DSP sigue funcionando y solo se omite detector rana/sapo.
 
 Cuando escaneas una carpeta, esa carpeta queda validada para ese job. No se agrega globalmente a `.env`; solo se permite durante el procesamiento de ese lote.

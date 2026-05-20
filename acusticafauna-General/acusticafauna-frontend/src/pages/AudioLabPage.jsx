@@ -19,6 +19,7 @@ import {
   fetchAudioLabFolderBatchJobs,
   fetchAudioLabFolderBatchLogs,
   fetchAudioLabFolderBatchOutputs,
+  fetchAudioLabFolderBatchPaths,
   fetchAudioLabFolderBatchSummary,
   fetchAudioLabClips,
   fetchAudioLabWaveform,
@@ -33,6 +34,7 @@ import {
   getCuratedSegmentAudioUrl,
   getMediaFileUrl,
   getPlayableAudioUrl,
+  openAudioLabFolderBatchOutputFolder,
   pauseAudioLabFolderBatchJob,
   predictAudioPath,
   predictUploadedAudio,
@@ -519,6 +521,37 @@ function formatBytes(value) {
   return `${(bytes / (1024 ** index)).toFixed(index === 0 ? 0 : 1)} ${units[index]}`;
 }
 
+function formatDateTime(value) {
+  if (!value) return "-";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return String(value);
+  return date.toLocaleString();
+}
+
+function pathFromApiPath(value) {
+  if (!value) return "";
+  if (typeof value === "string") return value;
+  return value.path || "";
+}
+
+function normalizeFolderPathForCompare(value) {
+  return String(value || "")
+    .trim()
+    .replace(/[\\/]+$/g, "")
+    .replace(/\\/g, "/")
+    .toLowerCase();
+}
+
+function sameFolderPath(left, right) {
+  const normalizedLeft = normalizeFolderPathForCompare(left);
+  const normalizedRight = normalizeFolderPathForCompare(right);
+  return Boolean(normalizedLeft && normalizedRight && normalizedLeft === normalizedRight);
+}
+
+function jobFolderPath(job) {
+  return job?.folder_path_resolved || job?.folder_path || "";
+}
+
 function qualityLabelText(label) {
   const mapping = {
     bueno_para_revision: "Bueno para revision",
@@ -900,6 +933,8 @@ export default function AudioLabPage() {
   const [folderBatchLogs, setFolderBatchLogs] = useState("");
   const [folderBatchOutputs, setFolderBatchOutputs] = useState([]);
   const [folderBatchSummary, setFolderBatchSummary] = useState(null);
+  const [folderBatchPaths, setFolderBatchPaths] = useState(null);
+  const [folderBatchOutputDialog, setFolderBatchOutputDialog] = useState(null);
   const [folderBatchScanning, setFolderBatchScanning] = useState(false);
   const [folderBatchSubmitting, setFolderBatchSubmitting] = useState(false);
   const [folderBatchSearch, setFolderBatchSearch] = useState("");
@@ -922,6 +957,18 @@ export default function AudioLabPage() {
   const folderBatchTooManyCandidates = folderBatchIsExploratory || folderBatchCurrentRecommendation === "too_many_candidates";
   const folderBatchHasSafeRecommendation = !folderBatchTooManyCandidates;
   const folderBatchBestNextStep = folderBatchIsExploratory && folderBatchCandidateCount > 0 ? "try_intermediate_config" : null;
+  const currentFolderPath = folderBatchForm.folder_path.trim();
+  const activeFolderBatchSourcePath = jobFolderPath(activeFolderBatchJob);
+  const activeFolderBatchOutputDir = pathFromApiPath(folderBatchPaths?.output_dir) || activeFolderBatchJob?.output_dir || "";
+  const activeFolderBatchManifestPath = pathFromApiPath(folderBatchPaths?.manifest_path) || activeFolderBatchJob?.manifest_path || "";
+  const activeFolderBatchLogsDir = pathFromApiPath(folderBatchPaths?.logs_dir) || activeFolderBatchJob?.logs_dir || "";
+  const activeFolderBatchIsHistorical = Boolean(
+    activeFolderBatchJob &&
+      currentFolderPath &&
+      activeFolderBatchSourcePath &&
+      !sameFolderPath(currentFolderPath, activeFolderBatchSourcePath)
+  );
+  const folderBatchCanStart = Boolean(folderBatchScan && sameFolderPath(folderBatchScan.folder_path_resolved || folderBatchScan.folder_path, currentFolderPath));
   const folderBatchComparisonRows = [
     {
       ...FOLDER_BATCH_SAFE_RECOMMENDED_CONFIG,
@@ -2181,6 +2228,15 @@ export default function AudioLabPage() {
   }
 
   function updateFolderBatchField(key, value) {
+    if (key === "folder_path") {
+      setFolderBatchForm((current) => {
+        if (current.folder_path === value) return current;
+        return { ...current, [key]: value };
+      });
+      setFolderBatchScan(null);
+      setMessage("Ruta cambiada. Escanea la carpeta actual para iniciar un nuevo procesamiento.");
+      return;
+    }
     setFolderBatchForm((current) => ({ ...current, [key]: value }));
   }
 
@@ -2295,6 +2351,10 @@ export default function AudioLabPage() {
       setError("Escanea la carpeta antes de iniciar el procesamiento.");
       return;
     }
+    if (!folderBatchCanStart) {
+      setError("Ruta cambiada. Escanea la carpeta actual para iniciar un nuevo procesamiento.");
+      return;
+    }
     if (folderBatchConfigIsExploratory()) {
       const filesFound = Number(folderBatchScan.files_found || 0);
       if (filesFound > 20) {
@@ -2327,16 +2387,18 @@ export default function AudioLabPage() {
 
   async function refreshFolderBatchJob(jobId, options = {}) {
     try {
-      const [detail, logs, outputs, summary] = await Promise.all([
+      const [detail, logs, outputs, summary, paths] = await Promise.all([
         fetchAudioLabFolderBatchJob(jobId),
         fetchAudioLabFolderBatchLogs(jobId),
         fetchAudioLabFolderBatchOutputs(jobId),
         fetchAudioLabFolderBatchSummary(jobId),
+        fetchAudioLabFolderBatchPaths(jobId),
       ]);
       setActiveFolderBatchJob(detail);
       setFolderBatchLogs(logs.logs || "");
       setFolderBatchOutputs(outputs.items || []);
       setFolderBatchSummary(summary);
+      setFolderBatchPaths(paths);
       setFolderBatchJobs((current) => {
         const exists = current.some((item) => item.id === detail.id);
         return exists ? current.map((item) => (item.id === detail.id ? detail : item)) : [detail, ...current];
@@ -2441,6 +2503,30 @@ export default function AudioLabPage() {
   function openFolderBatchManifest() {
     if (!activeFolderBatchJob?.id) return;
     window.open(getAudioLabFolderBatchManifestUrl(activeFolderBatchJob.id), "_blank", "noopener,noreferrer");
+  }
+
+  async function openFolderBatchOutputFolder() {
+    if (!activeFolderBatchJob?.id) return;
+    const outputDir = activeFolderBatchOutputDir || activeFolderBatchJob.output_dir;
+    try {
+      const response = await openAudioLabFolderBatchOutputFolder(activeFolderBatchJob.id);
+      const resolvedDir = response.output_dir || outputDir;
+      if (response.opened) {
+        setMessage("Carpeta de outputs abierta desde el backend.");
+        setFolderBatchOutputDialog(null);
+        return;
+      }
+      setFolderBatchOutputDialog({
+        outputDir: resolvedDir,
+        message: response.message || "No se pudo abrir automaticamente. Copia esta ruta y abrela en el Explorador.",
+      });
+    } catch (err) {
+      setFolderBatchOutputDialog({
+        outputDir,
+        message: "No se pudo abrir automaticamente. Copia esta ruta y abrela en el Explorador.",
+      });
+      setError(err.message || "No fue posible abrir la carpeta de outputs.");
+    }
   }
 
   async function copyTextToClipboard(text, successMessage = "Copiado.") {
@@ -3086,13 +3172,20 @@ export default function AudioLabPage() {
       job.job_name,
       job.id,
       job.folder_path,
+      job.folder_path_resolved,
       job.target_label,
       job.status,
       job.output_dir,
+      job.created_at,
     ].some((value) => String(value || "").toLowerCase().includes(normalizedFolderBatchSearch));
     const matchesStatus = !folderBatchStatusFilter || job.status === folderBatchStatusFilter;
     return matchesSearch && matchesStatus;
   });
+  const folderBatchJobIsHistorical = (job) => Boolean(
+    currentFolderPath &&
+      jobFolderPath(job) &&
+      !sameFolderPath(currentFolderPath, jobFolderPath(job))
+  );
   const folderBatchProgress = activeFolderBatchJob?.total_files
     ? Math.round((Number(activeFolderBatchJob.processed_files || 0) / Number(activeFolderBatchJob.total_files || 1)) * 100)
     : 0;
@@ -3753,6 +3846,15 @@ python -m uvicorn ml_api.main:app --host 127.0.0.1 --port 8010 --reload`}
                 />
                 <span className="mt-1 block text-xs text-slate-500">La ruta debe existir en este computador. Ejemplo: C:\Datos\Ranas\lote_01.</span>
               </label>
+              <div className="rounded-lg border border-slate-200 bg-white p-3 text-xs text-slate-700">
+                <div className="font-semibold text-slate-900">Carpeta actual del formulario</div>
+                <div className="mt-1 break-all font-mono">{currentFolderPath || "Sin ruta escrita."}</div>
+                {currentFolderPath && !folderBatchCanStart ? (
+                  <p className="mt-2 rounded-lg border border-amber-200 bg-amber-50 p-2 font-semibold text-amber-900">
+                    Ruta cambiada. Escanea la carpeta actual para iniciar un nuevo procesamiento.
+                  </p>
+                ) : null}
+              </div>
 
               <div className="grid gap-3 md:grid-cols-2">
                 <label className="text-sm">
@@ -3923,7 +4025,7 @@ python -m uvicorn ml_api.main:app --host 127.0.0.1 --port 8010 --reload`}
                 <button type="button" onClick={scanFolderBatch} disabled={folderBatchScanning} className="rounded-lg bg-emerald-600 px-4 py-2 text-sm font-semibold text-white disabled:opacity-50">
                   <LoadingText loading={folderBatchScanning} loadingText="Escaneando...">Escanear carpeta</LoadingText>
                 </button>
-                <button type="button" onClick={startFolderBatchJob} disabled={folderBatchSubmitting || !folderBatchScan} className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-semibold text-white disabled:opacity-50">
+                <button type="button" onClick={startFolderBatchJob} disabled={folderBatchSubmitting || !folderBatchCanStart} className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-semibold text-white disabled:opacity-50">
                   <LoadingText loading={folderBatchSubmitting} loadingText="Creando job...">Iniciar procesamiento</LoadingText>
                 </button>
               </div>
@@ -3959,12 +4061,15 @@ python -m uvicorn ml_api.main:app --host 127.0.0.1 --port 8010 --reload`}
               )}
 
               {activeFolderBatchJob ? (
-                <div className="rounded-lg border border-blue-200 bg-blue-50 p-4">
+                <div className={`rounded-lg border p-4 ${activeFolderBatchIsHistorical ? "border-amber-300 bg-amber-50" : "border-blue-200 bg-blue-50"}`}>
                   <div className="flex flex-wrap items-start justify-between gap-3">
                     <div className="min-w-0">
-                      <h3 className="truncate font-bold text-blue-950">{activeFolderBatchJob.job_name || activeFolderBatchJob.id}</h3>
+                      <div className="flex flex-wrap items-center gap-2">
+                        <h3 className="truncate font-bold text-blue-950">{activeFolderBatchJob.job_name || activeFolderBatchJob.id}</h3>
+                        {activeFolderBatchIsHistorical ? <Badge tone="warning">historico</Badge> : <Badge tone="info">carpeta actual</Badge>}
+                      </div>
                       <p className="text-sm text-blue-900">{activeFolderBatchJob.status} - {activeFolderBatchJob.target_label || "-"}</p>
-                      <p className="mt-1 truncate text-xs text-blue-800" title={activeFolderBatchJob.current_file || activeFolderBatchJob.folder_path}>{activeFolderBatchJob.current_file || activeFolderBatchJob.folder_path}</p>
+                      <p className="mt-1 truncate text-xs text-blue-800" title={activeFolderBatchJob.current_file || activeFolderBatchSourcePath}>{activeFolderBatchJob.current_file || activeFolderBatchSourcePath}</p>
                     </div>
                     <div className="flex flex-wrap gap-2">
                       <button type="button" onClick={() => refreshFolderBatchJob(activeFolderBatchJob.id)} className="rounded-lg border border-blue-300 bg-white px-3 py-2 text-xs font-semibold">Refrescar</button>
@@ -3973,6 +4078,14 @@ python -m uvicorn ml_api.main:app --host 127.0.0.1 --port 8010 --reload`}
                       <button type="button" onClick={cancelFolderBatchJob} disabled={!["pending", "running", "paused"].includes(activeFolderBatchJob.status)} className="rounded-lg border border-red-300 bg-white px-3 py-2 text-xs font-semibold text-red-700 disabled:opacity-50">Cancelar</button>
                     </div>
                   </div>
+                  {activeFolderBatchIsHistorical ? (
+                    <div className="mt-3 rounded-lg border border-amber-300 bg-white p-3 text-sm text-amber-950">
+                      <p className="font-bold">Este job pertenece a otra carpeta.</p>
+                      <p className="mt-1"><strong>Carpeta actual:</strong> <span className="break-all font-mono">{currentFolderPath}</span></p>
+                      <p className="mt-1"><strong>Carpeta del job seleccionado:</strong> <span className="break-all font-mono">{activeFolderBatchSourcePath}</span></p>
+                      <p className="mt-1">Para procesar la carpeta actual, escanea la carpeta y crea un nuevo job.</p>
+                    </div>
+                  ) : null}
                   <div className="mt-3 h-3 overflow-hidden rounded-full bg-white">
                     <div className="h-full bg-blue-600" style={{ width: `${Math.max(0, Math.min(100, folderBatchProgress))}%` }} />
                   </div>
@@ -3986,10 +4099,37 @@ python -m uvicorn ml_api.main:app --host 127.0.0.1 --port 8010 --reload`}
                     <span>Duracion proc.: <strong>{formatTime(activeFolderBatchJob.processed_duration_seconds)}</strong></span>
                     <span>Progreso: <strong>{folderBatchProgress}%</strong></span>
                   </div>
+                  <div className="mt-3 grid gap-2 rounded-lg border border-white/70 bg-white p-3 text-xs text-slate-700 md:grid-cols-2">
+                    <div>
+                      <span className="block font-semibold text-slate-900">Carpeta origen del job</span>
+                      <span className="break-all font-mono">{activeFolderBatchSourcePath || "-"}</span>
+                    </div>
+                    <div>
+                      <span className="block font-semibold text-slate-900">Carpeta de outputs</span>
+                      <span className="break-all font-mono">{activeFolderBatchOutputDir || "-"}</span>
+                    </div>
+                    <div>
+                      <span className="block font-semibold text-slate-900">Manifest CSV</span>
+                      <span className="break-all font-mono">{activeFolderBatchManifestPath || "-"}</span>
+                    </div>
+                    <div>
+                      <span className="block font-semibold text-slate-900">Logs</span>
+                      <span className="break-all font-mono">{activeFolderBatchLogsDir || "-"}</span>
+                    </div>
+                    <div>
+                      <span className="block font-semibold text-slate-900">Cantidad de outputs</span>
+                      <span>{folderBatchOutputs.length}</span>
+                    </div>
+                    <div>
+                      <span className="block font-semibold text-slate-900">Estado</span>
+                      <span>{activeFolderBatchJob.status || "-"}</span>
+                    </div>
+                  </div>
                   <div className="mt-3 flex flex-wrap gap-2">
                     <button type="button" onClick={() => setFolderBatchLogs((current) => current || "")} className="rounded-lg border border-blue-300 bg-white px-3 py-2 text-xs font-semibold">Ver logs</button>
-                    <button type="button" onClick={openFolderBatchManifest} disabled={!activeFolderBatchJob.manifest_path} className="rounded-lg border border-blue-300 bg-white px-3 py-2 text-xs font-semibold disabled:opacity-50">Exportar manifest</button>
-                    <button type="button" onClick={() => copyTextToClipboard(activeFolderBatchJob.output_dir, "Ruta de outputs copiada.")} disabled={!activeFolderBatchJob.output_dir} className="rounded-lg border border-blue-300 bg-white px-3 py-2 text-xs font-semibold disabled:opacity-50">Abrir carpeta de outputs</button>
+                    <button type="button" onClick={openFolderBatchManifest} disabled={!activeFolderBatchManifestPath} className="rounded-lg border border-blue-300 bg-white px-3 py-2 text-xs font-semibold disabled:opacity-50">Exportar manifest</button>
+                    <button type="button" onClick={openFolderBatchOutputFolder} disabled={!activeFolderBatchOutputDir} className="rounded-lg border border-blue-300 bg-white px-3 py-2 text-xs font-semibold disabled:opacity-50">Abrir carpeta de outputs</button>
+                    <button type="button" onClick={() => copyTextToClipboard(activeFolderBatchOutputDir, "Ruta de outputs copiada.")} disabled={!activeFolderBatchOutputDir} className="rounded-lg border border-blue-300 bg-white px-3 py-2 text-xs font-semibold disabled:opacity-50">Copiar ruta outputs</button>
                   </div>
                   {folderBatchLogs ? <pre className="mt-3 max-h-32 overflow-auto rounded-lg bg-slate-950 p-3 text-xs text-slate-100">{folderBatchLogs}</pre> : null}
                 </div>
@@ -4013,15 +4153,33 @@ python -m uvicorn ml_api.main:app --host 127.0.0.1 --port 8010 --reload`}
                 </div>
                 <div className="mt-3 max-h-44 overflow-auto rounded-lg border border-slate-200">
                   {filteredFolderBatchJobs.length ? (
-                    filteredFolderBatchJobs.map((job) => (
-                      <button key={job.id} type="button" onClick={() => refreshFolderBatchJob(job.id)} className="block w-full border-b border-slate-100 p-3 text-left text-sm last:border-b-0 hover:bg-slate-50">
-                        <div className="flex flex-wrap items-center justify-between gap-2">
-                          <strong>{job.job_name || job.id}</strong>
-                          <Badge tone={job.status === "completed" ? "success" : job.status === "failed" ? "danger" : job.status === "cancelled" ? "warning" : "info"}>{job.status}</Badge>
-                        </div>
-                        <div className="mt-1 truncate text-xs text-slate-500" title={job.folder_path}>{job.target_label || "-"} - {job.folder_path}</div>
-                      </button>
-                    ))
+                    filteredFolderBatchJobs.map((job) => {
+                      const historical = folderBatchJobIsHistorical(job);
+                      const selected = activeFolderBatchJob?.id === job.id;
+                      return (
+                        <button
+                          key={job.id}
+                          type="button"
+                          onClick={() => refreshFolderBatchJob(job.id)}
+                          className={`block w-full border-b border-slate-100 p-3 text-left text-sm last:border-b-0 hover:bg-slate-50 ${selected && !historical ? "bg-blue-50" : ""} ${selected && historical ? "bg-amber-50" : ""}`}
+                        >
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <strong className="min-w-0 truncate" title={job.job_name || job.id}>{job.job_name || job.id}</strong>
+                            <span className="flex flex-wrap gap-2">
+                              {historical ? <Badge tone="warning">historico</Badge> : null}
+                              <Badge tone={job.status === "completed" ? "success" : job.status === "failed" ? "danger" : job.status === "cancelled" ? "warning" : "info"}>{job.status}</Badge>
+                            </span>
+                          </div>
+                          <div className="mt-2 grid gap-1 text-xs text-slate-600 md:grid-cols-2">
+                            <div><span className="font-semibold">Especie:</span> {job.target_label || "-"}</div>
+                            <div><span className="font-semibold">Fecha:</span> {formatDateTime(job.created_at)}</div>
+                            <div className="md:col-span-2" title={jobFolderPath(job)}>
+                              <span className="font-semibold">Carpeta origen:</span> {shortPath(jobFolderPath(job)) || "-"}
+                            </div>
+                          </div>
+                        </button>
+                      );
+                    })
                   ) : (
                     <p className="p-4 text-sm text-slate-500">{folderBatchJobs.length ? "No hay jobs que coincidan con los filtros." : "Sin jobs de carpeta local."}</p>
                   )}
@@ -4108,6 +4266,34 @@ python -m uvicorn ml_api.main:app --host 127.0.0.1 --port 8010 --reload`}
                     )}
                   </tbody>
                 </table>
+              </div>
+            </div>
+          ) : null}
+
+          {folderBatchOutputDialog ? (
+            <div className="rounded-lg border border-amber-300 bg-amber-50 p-4 text-sm text-amber-950">
+              <div className="flex flex-wrap items-start justify-between gap-3">
+                <div>
+                  <h3 className="font-bold">No se pudo abrir automaticamente.</h3>
+                  <p className="mt-1">{folderBatchOutputDialog.message || "Copia esta ruta y abrela en el Explorador."}</p>
+                </div>
+                <button type="button" onClick={() => setFolderBatchOutputDialog(null)} className="rounded-lg border border-amber-300 bg-white px-3 py-2 text-xs font-semibold">
+                  Cerrar
+                </button>
+              </div>
+              <div className="mt-3 rounded-lg border border-amber-200 bg-white p-3 font-mono text-xs text-slate-800 break-all">
+                {folderBatchOutputDialog.outputDir || activeFolderBatchOutputDir || "-"}
+              </div>
+              <div className="mt-3 flex flex-wrap gap-2">
+                <button type="button" onClick={() => copyTextToClipboard(folderBatchOutputDialog.outputDir || activeFolderBatchOutputDir, "Ruta de outputs copiada.")} className="rounded-lg bg-amber-600 px-3 py-2 text-xs font-semibold text-white">
+                  Copiar ruta
+                </button>
+                <button type="button" onClick={() => setMessage(folderBatchOutputDialog.outputDir || activeFolderBatchOutputDir)} className="rounded-lg border border-amber-300 bg-white px-3 py-2 text-xs font-semibold">
+                  Ver ruta
+                </button>
+                <button type="button" onClick={openFolderBatchOutputFolder} className="rounded-lg border border-amber-300 bg-white px-3 py-2 text-xs font-semibold">
+                  Abrir desde backend
+                </button>
               </div>
             </div>
           ) : null}
