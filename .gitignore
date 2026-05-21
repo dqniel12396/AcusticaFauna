@@ -94,3 +94,7 @@ Thumbs.db
 .idea/
 .vscode/*
 !.vscode/extensions.json
+
+# Local analysis / code graph metadata
+.codegraph/
+**/.codegraph/

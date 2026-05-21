@@ -44,28 +44,6 @@ C:\Datos\Ranas\lote_01
 10. Revisa candidatos, excluidos y sospechosos de contaminantes.
 11. Exporta el manifest CSV cuando termines la revision.
 
-Rutas que veras en la pantalla:
-
-- **Carpeta actual del formulario**: la ruta que esta escrita ahora en el campo de carpeta local.
-- **Carpeta origen del job**: la carpeta que se escaneo cuando se creo el job seleccionado.
-- **Carpeta de outputs**: carpeta interna donde AcusticaFauna guarda clips, procesados, manifests y logs del job.
-- **Manifest CSV**: archivo `manifest.csv` generado para revisar trazabilidad y resultados.
-- **Logs**: carpeta y texto de eventos del procesamiento.
-
-Los outputs no se guardan junto al audio original. Se guardan dentro de:
-
-```text
-backend/storage/audio_lab/folder_batch_jobs/{job_id}/
-```
-
-Si cambias la ruta local despues de escanear, debes pulsar **Escanear carpeta** otra vez antes de iniciar un nuevo procesamiento. Si seleccionas un job viejo cuyo origen no coincide con la carpeta escrita ahora, la interfaz lo marca como **historico** y muestra una alerta. Ese job sigue siendo consultable, pero pertenece a otra carpeta.
-
-Para abrir outputs:
-
-- Usa **Abrir carpeta de outputs** para pedir al backend local que abra la carpeta en el Explorador.
-- Si no se puede abrir automaticamente, usa **Copiar ruta** y pegala en el Explorador de Windows.
-- **Ver ruta** muestra la ruta completa para comprobar que corresponde al job seleccionado.
-
 Que significan los resultados:
 
 - `candidate`: segmento candidato para revision humana.
@@ -87,10 +65,82 @@ Importante:
 - No se modifican ni borran audios originales.
 - El sistema no entrena automaticamente.
 - Los outputs quedan en `backend/storage/audio_lab/folder_batch_jobs/{job_id}/`.
-- Un job historico no procesa la carpeta actual del formulario; solo muestra resultados de su carpeta origen.
 - Si ML API esta apagada, el procesamiento DSP sigue funcionando y solo se omite detector rana/sapo.
 
 Cuando escaneas una carpeta, esa carpeta queda validada para ese job. No se agrega globalmente a `.env`; solo se permite durante el procesamiento de ese lote.
+
+## Calibrar antes de procesar una carpeta grande
+
+Usa **Asistente de calibracion acustica** antes de procesar una carpeta grande o ruidosa. La idea es analizar una muestra pequena, comparar configuraciones y aplicar la mejor al procesamiento masivo.
+
+Flujo recomendado:
+
+1. Pega la ruta local de la carpeta.
+2. Escribe la especie objetivo.
+3. Elige una muestra de 5, 10, 20 o 50 audios.
+4. Marca el ruido predominante: lluvia, rio, viento, insectos, trafico o mezcla.
+5. Elige el modo de calibracion. Para lluvia, rio o viento empieza con **Detectar y cortar candidatos**.
+6. Pulsa **Analizar perfil acustico**.
+7. Revisa banda sugerida, threshold dBFS, ratio minimo de energia en banda y advertencias.
+8. Pulsa **Probar configuraciones** para comparar opciones intermedias.
+9. Revisa por separado la mejor configuracion para detectar y la mejor configuracion para limpiar.
+10. Si no hay limpieza segura, usa deteccion/corte sin normalizacion y revisa clips.
+11. Usa **Usar esta configuracion en Procesamiento masivo por carpeta local**.
+12. Escanea de nuevo la carpeta y procesa solo cuando la configuracion tenga sentido.
+
+Origen de la ruta del asistente:
+
+- Si el campo aparece vacio, no hay ruta activa y debes escribir una o sincronizarla desde procesamiento masivo.
+- Si aparece el badge **Ultima ruta usada**, la ruta viene de `localStorage` del navegador. Es solo una ayuda visual; no ejecuta analisis automaticamente.
+- Si aparece el badge **Ruta desde reporte**, la ruta corresponde al reporte de calibracion mostrado. Si cambias la ruta, ese reporte queda como historico/no aplicable hasta ejecutar de nuevo el analisis.
+- Si aparece el badge **Ruta sincronizada desde procesamiento masivo**, la ruta fue copiada desde el formulario de **Procesamiento masivo por carpeta local**.
+
+Controles utiles:
+
+- **Limpiar ruta** vacia el campo del asistente y no borra audios, outputs ni reportes fisicos.
+- **Usar ruta de procesamiento masivo** copia la ruta escrita en Procesamiento masivo al asistente. Si ya escribiste otra ruta, la app pide confirmacion antes de reemplazarla.
+- Si la ruta del asistente y la ruta de procesamiento masivo son diferentes, la interfaz muestra ambas y permite copiar una hacia la otra.
+
+La ruta del asistente sirve para calibrar una muestra. La ruta de procesamiento masivo sirve para escanear y crear jobs de procesamiento. Pueden ser distintas, pero si lo son revisa cuidadosamente antes de aplicar configuraciones.
+
+Ejemplo para `Pristimantis_simoterus` con lluvia, viento o rio:
+
+- Conservadora: `3000-4500 Hz`, threshold `-48 dBFS`, ratio `0.35`.
+- Balanceada: `2500-4500 Hz`, threshold `-50 dBFS`, ratio `0.30`.
+- Sensible: `2500-5000 Hz`, threshold `-52 dBFS`, ratio `0.25`.
+- Intermedia sin normalizacion: `2500-5000 Hz`, threshold `-51 dBFS`, ratio `0.25`.
+- Balanceada abierta: `2500-5000 Hz`, threshold `-51 dBFS`, ratio `0.28`.
+- Alta conservadora: `3000-5000 Hz`, threshold `-52 dBFS`, ratio `0.22`.
+
+Para `Pristimantis_simoterus`, un buen punto de partida suele ser `2500-4500 Hz`. Evita empezar en `0-1000 Hz` porque esa zona captura viento, golpes, rio y mucho ruido de baja frecuencia.
+
+Como interpretar `threshold dBFS`:
+
+- Valores mas bajos, por ejemplo `-52`, detectan cantos suaves o lejanos, pero tambien pueden incluir lluvia o rio.
+- Valores mas altos, por ejemplo `-45`, filtran mas ruido, pero pueden perder cantos tenues.
+- dBFS es nivel digital relativo del archivo; no es dB SPL calibrado.
+
+Como interpretar `ratio energia banda`:
+
+- Exige que una parte importante de la energia este dentro de la banda donde canta la especie.
+- Es clave con lluvia o rio porque evita aceptar segmentos donde la energia viene de ruido amplio o baja frecuencia.
+- Si hay pocos candidatos, baja el ratio un poco; si hay demasiados falsos positivos, subelo.
+
+Como elegir entre configuraciones:
+
+- **Conservadora**: primera opcion si el ruido es fuerte y no quieres falsos positivos.
+- **Balanceada**: primera opcion general para revisar una carpeta nueva.
+- **Sensible**: util si los cantos son suaves, lejanos o escasos; requiere mas revision humana.
+
+Si un reporte marca `possible_damage` o `requires_review`:
+
+- No uses esos derivados automaticamente para entrenamiento.
+- Revisa espectrograma y escucha antes de aceptar.
+- Sospecha dano si el ruido de fondo sube mas de 6 dB, el contraste baja mas de 3 dB, aparece clipping o aumenta energia de 2000-8000 Hz sin mejorar contraste.
+- Para lluvia/rio/viento, prefiere deteccion/corte con bandpass, reduccion suave o apagada, y normalizacion apagada.
+- Si la limpieza empeora el contraste, conserva los clips candidatos como material de revision, no como audio final limpio.
+
+Los reportes de calibracion se guardan como JSON, CSV y Markdown en `backend/storage/audio_lab/calibration_reports`. Los previews son derivados de prueba; los audios originales no se modifican.
 
 ## Rutas locales y reproduccion
 
@@ -123,6 +173,27 @@ ACUSTICAFAUNA_ALLOWED_AUDIO_ROOTS=F:\PC202601\Descargasreal;D:\AudiosCampo
 - El audio original nunca se modifica.
 - Los audios procesados no se usan automaticamente para entrenamiento.
 - Si una grabadora externa detecta demasiado ruido, ajusta threshold o sensibilidad.
+
+## Limpieza de resultados de prueba
+
+Cuando pruebas limpieza, procesamiento por lote o reportes de calidad, AcusticaFauna guarda derivados para trazabilidad:
+
+- uploads temporales en `backend/storage/audio_lab/uploads`;
+- outputs procesados en `backend/storage/audio_lab/batch_jobs/{job_id}`;
+- reportes en `backend/storage/audio_lab/quality_reports`;
+- registros del job en SQLite.
+
+Esto no modifica ni borra el audio original. Si solo era una prueba, usa **Mantenimiento de laboratorio**.
+
+Acciones disponibles:
+
+- **Marcar como prueba**: marca el job como temporal para limpiarlo despues.
+- **Eliminar outputs de este job**: borra WAV/metadata derivados dentro del job y marca los outputs como `deleted`.
+- **Eliminar reporte de calidad**: borra el JSON del reporte y actualiza la referencia del output.
+- **Eliminar uploads temporales**: borra copias en uploads solo si no estan usadas por otros jobs.
+- **Limpiar pruebas antiguas**: limpia jobs marcados como prueba.
+
+La confirmacion siempre debe decir que se eliminan derivados generados por la app, no audios originales. Si un reporte recomienda `possible_damage` o `requires_review`, no lo uses automaticamente para entrenamiento.
 
 ## Errores comunes
 

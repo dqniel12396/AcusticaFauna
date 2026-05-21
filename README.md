@@ -145,6 +145,10 @@ El flujo:
 
 Reglas: no modifica audios originales, no borra datos, no entrena automaticamente y guarda outputs en `backend/storage/audio_lab/folder_batch_jobs/{job_id}/`.
 
+## Limpieza de pruebas del Laboratorio
+
+Los uploads temporales, outputs de batch y reportes de calidad son derivados guardados para trazabilidad. Si una corrida era solo prueba, usa **Laboratorio de audio -> Mantenimiento de laboratorio** para marcar jobs como prueba y limpiar derivados. Esta limpieza no borra audios originales ni toca `dataset_curado`.
+
 ## Rutas de audio permitidas
 
 Por seguridad, el backend solo sirve audios desde carpetas permitidas. El frontend nunca debe usar una ruta local como `F:\...` o `C:\...` directamente como fuente del reproductor.

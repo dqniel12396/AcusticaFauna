@@ -36,38 +36,6 @@ def write_tone_wav(path: Path, frequency_hz: float, sample_rate: int = 8000, dur
     return path
 
 
-def folder_batch_job_payload(folder: Path, **overrides):
-    payload = {
-        "job_name": "pytest_folder_batch_paths",
-        "folder_path": str(folder),
-        "recursive": True,
-        "target_label": "Boana_boans",
-        "mode": "species_folder_cleanup",
-        "preset": "normal",
-        "frequency_min_hz": 2000,
-        "frequency_max_hz": 3000,
-        "threshold_dbfs": -45,
-        "min_activity_seconds": 0.2,
-        "min_silence_seconds": 0.2,
-        "padding_seconds": 0.05,
-        "clip_duration_seconds": 1.0,
-        "max_segment_seconds": 1.0,
-        "min_band_ratio": 0.45,
-        "bandpass": True,
-        "noise_reduce": False,
-        "normalize": True,
-        "discard_empty": True,
-        "detect_frog": False,
-        "detect_contaminants_heuristic": True,
-        "create_clips": True,
-        "create_manifest": True,
-        "resource_profile": "eco",
-        "extensions": [".wav"],
-    }
-    payload.update(overrides)
-    return payload
-
-
 def test_audio_lab_annotation_lifecycle(client):
     payload = {
         "audio_path": "F:/audios/boana.wav",
@@ -466,6 +434,30 @@ def test_audio_lab_batch_processing_clean_existing_and_full_auto(client, test_se
     assert logs.status_code == 200
     assert "Job completado" in logs.json()["logs"]
 
+    maintenance = client.get("/api/audio-lab/maintenance")
+    assert maintenance.status_code == 200
+    assert maintenance.json()["batch_jobs"]["size_bytes"] >= 0
+
+    marked = client.post(f"/api/audio-lab/batch-processing/jobs/{clean_id}/mark-test")
+    assert marked.status_code == 200
+    assert marked.json()["is_temporary"] == 1
+
+    delete_report = client.delete(f"/api/audio-lab/batch-processing/outputs/{clean_payload['outputs'][0]['id']}/quality-report")
+    assert delete_report.status_code == 200
+    assert not report_path.exists()
+
+    processed_path = Path(clean_payload["outputs"][0]["processed_audio_path"])
+    delete_outputs = client.delete(f"/api/audio-lab/batch-processing/jobs/{clean_id}/outputs")
+    assert delete_outputs.status_code == 200
+    assert delete_outputs.json()["outputs_marked_deleted"] == 2
+    assert not processed_path.exists()
+    assert first.exists()
+    assert first.stat().st_size == original_size
+
+    cleaned_detail = client.get(f"/api/audio-lab/batch-processing/jobs/{clean_id}")
+    assert cleaned_detail.status_code == 200
+    assert cleaned_detail.json()["outputs"][0]["file_status"] == "deleted"
+
 
 def test_audio_lab_batch_processing_job_allowed_roots_and_failed_single_file(client, tmp_path):
     external_audio = write_activity_wav(tmp_path / "external" / "manual.wav")
@@ -580,6 +572,13 @@ def test_folder_batch_detects_in_band_audio_without_ml_api(client, tmp_path):
     assert payload["status"] == "completed"
     assert payload["processed_files"] == 2
     assert payload["candidates_count"] >= 1
+    assert payload["job_id"] == job_id
+    assert payload["job_name"] == "pytest_folder_batch"
+    assert payload["label"] == "Boana_boans"
+    assert payload["folder_path_original"] == str(folder)
+    assert Path(payload["folder_path_resolved"]) == folder.resolve()
+    assert Path(payload["output_dir"]).exists()
+    assert "outputs_count" in payload
 
     outputs = client.get(f"/api/audio-lab/folder-batch/jobs/{job_id}/outputs")
     assert outputs.status_code == 200
@@ -588,6 +587,11 @@ def test_folder_batch_detects_in_band_audio_without_ml_api(client, tmp_path):
     assert any(str(in_band) == item["original_audio_path"] for item in items)
     assert not any(str(out_band) == item["original_audio_path"] for item in items)
     assert Path(items[0]["output_audio_path"]).exists()
+    assert items[0]["job_id"] == job_id
+    assert items[0]["source_folder"] == payload["folder_path_resolved"]
+    assert items[0]["processed_audio_path"] == items[0]["output_audio_path"]
+    assert items[0]["output_dir"] == payload["output_dir"]
+    assert items[0]["playable_url"]
 
     summary = client.get(f"/api/audio-lab/folder-batch/jobs/{job_id}/summary")
     assert summary.status_code == 200
@@ -596,118 +600,3 @@ def test_folder_batch_detects_in_band_audio_without_ml_api(client, tmp_path):
     manifest = client.get(f"/api/audio-lab/folder-batch/jobs/{job_id}/manifest")
     assert manifest.status_code == 200
     assert "boana_candidate" in manifest.text
-
-
-def test_folder_batch_paths_endpoint_returns_safe_storage_paths(client, tmp_path):
-    from app.core.config import settings
-
-    folder = tmp_path / "folder_batch_paths"
-    write_tone_wav(folder / "boana_candidate.wav", 2400)
-    created = client.post("/api/audio-lab/folder-batch/jobs", json=folder_batch_job_payload(folder))
-    assert created.status_code == 200
-    job_id = created.json()["job_id"]
-
-    paths = client.get(f"/api/audio-lab/folder-batch/jobs/{job_id}/paths")
-    assert paths.status_code == 200
-    payload = paths.json()
-    output_dir = Path(payload["output_dir"]["path"]).resolve(strict=False)
-    storage_root = (settings.STORAGE_DIR / "audio_lab" / "folder_batch_jobs").resolve(strict=False)
-    assert output_dir.is_relative_to(storage_root)
-    assert payload["source_folder"]["path"] == str(folder.resolve(strict=False))
-    assert payload["clips_dir"]["exists"] is True
-    assert payload["processed_dir"]["exists"] is True
-    assert payload["logs_dir"]["exists"] is True
-    assert payload["manifest_path"]["path"].endswith("manifest.csv")
-
-
-def test_folder_batch_open_output_folder_uses_backend_opener(client, tmp_path, monkeypatch):
-    from app.api.routes import audio_lab
-
-    folder = tmp_path / "folder_batch_open"
-    write_tone_wav(folder / "boana_candidate.wav", 2400)
-    created = client.post("/api/audio-lab/folder-batch/jobs", json=folder_batch_job_payload(folder))
-    assert created.status_code == 200
-    job_id = created.json()["job_id"]
-    opened_paths = []
-
-    def fake_open(path: Path) -> None:
-        opened_paths.append(path)
-
-    monkeypatch.setattr(audio_lab, "open_local_folder", fake_open)
-    opened = client.post(f"/api/audio-lab/folder-batch/jobs/{job_id}/open-output-folder")
-    assert opened.status_code == 200
-    payload = opened.json()
-    assert payload["opened"] is True
-    assert opened_paths == [Path(payload["output_dir"])]
-
-
-def test_folder_batch_open_output_folder_rejects_paths_outside_storage(client, tmp_path):
-    from app.db.database import get_connection
-
-    folder = tmp_path / "folder_batch_reject"
-    write_tone_wav(folder / "boana_candidate.wav", 2400)
-    created = client.post("/api/audio-lab/folder-batch/jobs", json=folder_batch_job_payload(folder))
-    assert created.status_code == 200
-    job_id = created.json()["job_id"]
-    outside = tmp_path / "outside_outputs"
-    outside.mkdir()
-
-    conn = get_connection()
-    try:
-        conn.execute("UPDATE audio_lab_folder_batch_jobs SET output_dir = ? WHERE id = ?", (str(outside), job_id))
-        conn.commit()
-    finally:
-        conn.close()
-
-    paths = client.get(f"/api/audio-lab/folder-batch/jobs/{job_id}/paths")
-    assert paths.status_code == 400
-    opened = client.post(f"/api/audio-lab/folder-batch/jobs/{job_id}/open-output-folder")
-    assert opened.status_code == 400
-
-
-def test_folder_batch_exploratory_summary_recommends_intermediate_config(client, tmp_path):
-    folder = tmp_path / "folder_batch_exploratory"
-    write_tone_wav(folder / "possible_activity.wav", 2400)
-
-    job = client.post(
-        "/api/audio-lab/folder-batch/jobs",
-        json={
-            "job_name": "pytest_folder_batch_exploratory",
-            "folder_path": str(folder),
-            "recursive": True,
-            "target_label": "Boana_boans",
-            "mode": "species_folder_cleanup",
-            "preset": "exploratory_wide",
-            "config_name": "exploratory_wide",
-            "calibration_mode": "exploratory",
-            "frequency_min_hz": 1800,
-            "frequency_max_hz": 6000,
-            "threshold_dbfs": -55,
-            "min_activity_seconds": 0.25,
-            "min_silence_seconds": 0.5,
-            "padding_seconds": 0.15,
-            "clip_duration_seconds": 1.0,
-            "max_segment_seconds": 1.0,
-            "min_band_ratio": 0.15,
-            "bandpass": True,
-            "noise_reduce": False,
-            "normalize": False,
-            "discard_empty": True,
-            "detect_frog": False,
-            "detect_contaminants_heuristic": True,
-            "create_clips": True,
-            "create_manifest": True,
-            "resource_profile": "eco",
-            "extensions": [".wav"],
-        },
-    )
-    assert job.status_code == 200
-    job_id = job.json()["job_id"]
-
-    summary = client.get(f"/api/audio-lab/folder-batch/jobs/{job_id}/summary")
-    assert summary.status_code == 200
-    exploratory = summary.json()["summary"]["exploratory_result"]
-    assert exploratory["safe_for_batch_processing"] is False
-    assert exploratory["best_next_step"] == "try_intermediate_config"
-    assert exploratory["suggested_intermediate_config"]["name"] == "intermedia_exploratoria"
-    assert "Resultado exploratorio" in exploratory["markdown"]

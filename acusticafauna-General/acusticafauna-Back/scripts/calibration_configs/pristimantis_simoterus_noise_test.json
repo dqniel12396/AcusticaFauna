@@ -1,0 +1,52 @@
+{
+  "configs": [
+    {
+      "name": "intermedia_sin_norm",
+      "label": "Intermedia sin normalizacion",
+      "frequency_min_hz": 2500,
+      "frequency_max_hz": 5000,
+      "threshold_dbfs": -51,
+      "min_band_energy_ratio": 0.25,
+      "bandpass": true,
+      "noise_reduce": true,
+      "noise_reduce_strength": "soft",
+      "normalize": false
+    },
+    {
+      "name": "sensible_sin_norm",
+      "label": "Sensible sin normalizacion",
+      "frequency_min_hz": 2500,
+      "frequency_max_hz": 5000,
+      "threshold_dbfs": -52,
+      "min_band_energy_ratio": 0.25,
+      "bandpass": true,
+      "noise_reduce": true,
+      "noise_reduce_strength": "soft",
+      "normalize": false
+    },
+    {
+      "name": "balanceada_abierta",
+      "label": "Balanceada abierta",
+      "frequency_min_hz": 2500,
+      "frequency_max_hz": 5000,
+      "threshold_dbfs": -51,
+      "min_band_energy_ratio": 0.28,
+      "bandpass": true,
+      "noise_reduce": true,
+      "noise_reduce_strength": "soft",
+      "normalize": false
+    },
+    {
+      "name": "alta_conservadora",
+      "label": "Alta conservadora",
+      "frequency_min_hz": 3000,
+      "frequency_max_hz": 5000,
+      "threshold_dbfs": -52,
+      "min_band_energy_ratio": 0.22,
+      "bandpass": true,
+      "noise_reduce": true,
+      "noise_reduce_strength": "soft",
+      "normalize": false
+    }
+  ]
+}

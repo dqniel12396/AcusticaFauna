@@ -645,12 +645,41 @@ export async function createAudioLabBatchProcessingJob(payload) {
   return handleResponse(response);
 }
 
-export async function scanAudioLabFolderBatch(payload) {
+export async function scanAudioLabFolderBatch(payload, options = {}) {
   const response = await fetch(`${API_BASE}/audio-lab/folder-batch/scan`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
+    signal: options.signal,
   });
+  return handleResponse(response);
+}
+
+export async function profileAudioLabCalibrationFolder(payload) {
+  const response = await fetch(`${API_BASE}/audio-lab/calibration/profile-folder`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  return handleResponse(response);
+}
+
+export async function testAudioLabCalibrationConfigs(payload) {
+  const response = await fetch(`${API_BASE}/audio-lab/calibration/test-configs`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  return handleResponse(response);
+}
+
+export async function fetchAudioLabCalibrationReports() {
+  const response = await fetch(`${API_BASE}/audio-lab/calibration/reports`);
+  return handleResponse(response);
+}
+
+export async function fetchAudioLabCalibrationReport(reportId) {
+  const response = await fetch(`${API_BASE}/audio-lab/calibration/reports/${encodeURIComponent(reportId)}`);
   return handleResponse(response);
 }
 
@@ -675,16 +704,6 @@ export async function fetchAudioLabFolderBatchJob(jobId) {
 
 export async function fetchAudioLabFolderBatchLogs(jobId) {
   const response = await fetch(`${API_BASE}/audio-lab/folder-batch/jobs/${encodeURIComponent(jobId)}/logs`);
-  return handleResponse(response);
-}
-
-export async function fetchAudioLabFolderBatchPaths(jobId) {
-  const response = await fetch(`${API_BASE}/audio-lab/folder-batch/jobs/${encodeURIComponent(jobId)}/paths`);
-  return handleResponse(response);
-}
-
-export async function openAudioLabFolderBatchOutputFolder(jobId) {
-  const response = await fetch(`${API_BASE}/audio-lab/folder-batch/jobs/${encodeURIComponent(jobId)}/open-output-folder`, { method: "POST" });
   return handleResponse(response);
 }
 
@@ -736,6 +755,36 @@ export async function cancelAudioLabBatchProcessingJob(jobId) {
   const response = await fetch(`${API_BASE}/audio-lab/batch-processing/jobs/${encodeURIComponent(jobId)}/cancel`, {
     method: "POST",
   });
+  return handleResponse(response);
+}
+
+export async function fetchAudioLabMaintenance() {
+  const response = await fetch(`${API_BASE}/audio-lab/maintenance`);
+  return handleResponse(response);
+}
+
+export async function markAudioLabBatchJobAsTest(jobId) {
+  const response = await fetch(`${API_BASE}/audio-lab/batch-processing/jobs/${encodeURIComponent(jobId)}/mark-test`, { method: "POST" });
+  return handleResponse(response);
+}
+
+export async function deleteAudioLabBatchJobOutputs(jobId) {
+  const response = await fetch(`${API_BASE}/audio-lab/batch-processing/jobs/${encodeURIComponent(jobId)}/outputs`, { method: "DELETE" });
+  return handleResponse(response);
+}
+
+export async function deleteAudioLabBatchJobUploads(jobId) {
+  const response = await fetch(`${API_BASE}/audio-lab/batch-processing/jobs/${encodeURIComponent(jobId)}/uploads`, { method: "DELETE" });
+  return handleResponse(response);
+}
+
+export async function deleteAudioLabOutputQualityReport(outputId) {
+  const response = await fetch(`${API_BASE}/audio-lab/batch-processing/outputs/${encodeURIComponent(outputId)}/quality-report`, { method: "DELETE" });
+  return handleResponse(response);
+}
+
+export async function cleanupAudioLabTestDerivatives() {
+  const response = await fetch(`${API_BASE}/audio-lab/maintenance/cleanup-tests`, { method: "POST" });
   return handleResponse(response);
 }
 

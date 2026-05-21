@@ -6,10 +6,8 @@ import csv
 import fnmatch
 import json
 import math
-import os
 import re
-import subprocess
-import sys
+import shutil
 import threading
 import wave
 from datetime import datetime
@@ -30,6 +28,16 @@ from app.services.audio_path_service import (
     media_type_for_path,
     playable_url_for_path,
     resolve_allowed_audio_path,
+)
+from app.services.audio_calibration_service import (
+    CalibrationError,
+    CalibrationPermissionError,
+    analyze_audio_folder_profile,
+    default_profile_output,
+    default_test_output_dir,
+    list_calibration_reports,
+    read_calibration_report,
+    test_audio_processing_configs,
 )
 
 try:
@@ -65,22 +73,7 @@ BATCH_JOB_PRESETS = {"conservador", "normal", "agresivo", "personalizado"}
 FOLDER_BATCH_EXTENSIONS = {".wav", ".flac", ".mp3", ".ogg", ".m4a"}
 FOLDER_BATCH_STATUSES = {"pending", "running", "paused", "completed", "failed", "cancelled"}
 FOLDER_BATCH_MODES = {"species_folder_cleanup"}
-FOLDER_BATCH_PRESETS = {"conservador", "normal", "agresivo", "personalizado", "exploratory_wide", "intermedia_exploratoria"}
-INTERMEDIATE_EXPLORATORY_CONFIG = {
-    "name": "intermedia_exploratoria",
-    "frequency_min_hz": 2200,
-    "frequency_max_hz": 5500,
-    "threshold_dbfs": -53,
-    "min_band_energy_ratio": 0.20,
-    "bandpass": True,
-    "noise_reduce": False,
-    "normalize": False,
-    "min_activity_seconds": 0.25,
-    "min_silence_seconds": 0.5,
-    "padding_seconds": 0.15,
-    "clip_duration_seconds": 5,
-    "max_segment_seconds": 10,
-}
+FOLDER_BATCH_PRESETS = {"conservador", "normal", "agresivo", "personalizado"}
 
 
 class AudioLabAnnotationPayload(BaseModel):
@@ -238,6 +231,7 @@ class BatchProcessingJobPayload(BaseModel):
     detector_params: BatchDetectorParams = BatchDetectorParams()
     output_policy: BatchOutputPolicy = BatchOutputPolicy()
     job_allowed_roots: list[str] = []
+    temporary: bool = False
 
 
 class QualityReportPayload(BaseModel):
@@ -270,8 +264,6 @@ class FolderBatchJobPayload(BaseModel):
     target_label: str
     mode: str = "species_folder_cleanup"
     preset: str = "normal"
-    config_name: str | None = None
-    calibration_mode: str = "recommended"
     frequency_min_hz: float = 1800
     frequency_max_hz: float = 3000
     threshold_dbfs: float = -45
@@ -293,6 +285,26 @@ class FolderBatchJobPayload(BaseModel):
     include_patterns: list[str] = []
     exclude_patterns: list[str] = []
     extensions: list[str] = [".wav", ".flac", ".mp3", ".ogg", ".m4a"]
+
+
+class CalibrationProfilePayload(BaseModel):
+    folder_path: str
+    label: str
+    sample_size: int = 20
+    noise_type: str | None = None
+    job_allowed_roots: list[str] = []
+
+
+class CalibrationTestConfigsPayload(BaseModel):
+    folder_path: str
+    label: str
+    sample_size: int = 10
+    configs: list[str] = ["conservadora", "balanceada", "sensible"]
+    config_definitions: list[dict[str, Any]] = []
+    noise_type: str | None = None
+    calibration_mode: str = "detect"
+    detection_only: bool | None = None
+    job_allowed_roots: list[str] = []
 
 
 class CleanManifestPayload(BaseModel):
@@ -336,6 +348,48 @@ def audio_lab_dir(*parts: str) -> Path:
         path = path / part
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def dir_size_bytes(path: Path) -> int:
+    if not path.exists():
+        return 0
+    total = 0
+    for item in path.rglob("*"):
+        try:
+            if item.is_file():
+                total += item.stat().st_size
+        except OSError:
+            continue
+    return total
+
+
+def is_inside_path(path: Path, root: Path) -> bool:
+    try:
+        path.resolve(strict=False).relative_to(root.resolve(strict=False))
+        return True
+    except ValueError:
+        return False
+
+
+def safe_delete_file(path_value: str | None, allowed_root: Path) -> bool:
+    if not path_value:
+        return False
+    path = Path(path_value)
+    if not is_inside_path(path, allowed_root):
+        raise HTTPException(status_code=403, detail="Solo se pueden eliminar derivados dentro de storage/audio_lab.")
+    if path.exists() and path.is_file():
+        path.unlink()
+        return True
+    return False
+
+
+def safe_delete_tree(path: Path, allowed_root: Path) -> bool:
+    if not is_inside_path(path, allowed_root):
+        raise HTTPException(status_code=403, detail="Solo se pueden eliminar derivados dentro de storage/audio_lab.")
+    if path.exists() and path.is_dir():
+        shutil.rmtree(path)
+        return True
+    return False
 
 
 def safe_filename(name: str) -> str:
@@ -776,77 +830,16 @@ def validate_job_allowed_roots(raw_roots: list[str] | None, require_confirmation
 
 def folder_batch_job_to_dict(row) -> dict[str, Any]:
     item = dict(row)
+    item["job_id"] = item.get("id")
+    item["folder_path_original"] = item.get("folder_path")
+    item["label"] = item.get("target_label")
     if item.get("total_files"):
         item["progress"] = round(float(item.get("processed_files") or 0) / float(item["total_files"]), 4)
     else:
         item["progress"] = 0.0
     item["output_dir"] = item.get("output_dir") or str(folder_batch_job_dir(item["id"]))
-    item["logs_dir"] = item.get("logs_dir") or str(folder_batch_job_dir(item["id"], "logs"))
+    item["outputs_count"] = int(item.get("outputs_count") or 0)
     return item
-
-
-def is_path_inside(base: Path, candidate: Path) -> bool:
-    try:
-        base_resolved = base.expanduser().resolve(strict=False)
-        candidate_resolved = candidate.expanduser().resolve(strict=False)
-        return os.path.commonpath([str(base_resolved), str(candidate_resolved)]) == str(base_resolved)
-    except (OSError, ValueError):
-        return False
-
-
-def get_folder_batch_job_row(job_id: str):
-    conn = get_connection()
-    try:
-        ensure_audio_lab_extra_schema(conn)
-        row = conn.execute("SELECT * FROM audio_lab_folder_batch_jobs WHERE id = ?", (job_id,)).fetchone()
-        if not row:
-            raise HTTPException(status_code=404, detail="Job no encontrado.")
-        return row
-    finally:
-        conn.close()
-
-
-def secure_folder_batch_output_dir(job: dict[str, Any]) -> Path:
-    root = audio_lab_dir("folder_batch_jobs")
-    fallback = root / job["id"]
-    output_dir = Path(job.get("output_dir") or fallback).expanduser().resolve(strict=False)
-    if not is_path_inside(root, output_dir):
-        raise HTTPException(status_code=400, detail="output_dir del job queda fuera del storage de folder_batch_jobs.")
-    return output_dir
-
-
-def folder_batch_job_paths(job: dict[str, Any]) -> dict[str, Any]:
-    output_dir = secure_folder_batch_output_dir(job)
-    manifest_path = Path(job.get("manifest_path") or (output_dir / "manifests" / "manifest.csv")).expanduser().resolve(strict=False)
-    logs_dir = Path(job.get("logs_dir") or (output_dir / "logs")).expanduser().resolve(strict=False)
-    if not is_path_inside(output_dir, manifest_path):
-        manifest_path = (output_dir / "manifests" / "manifest.csv").resolve(strict=False)
-    if not is_path_inside(output_dir, logs_dir):
-        logs_dir = (output_dir / "logs").resolve(strict=False)
-    paths = {
-        "source_folder": Path(job.get("folder_path_resolved") or job.get("folder_path") or "").expanduser().resolve(strict=False),
-        "output_dir": output_dir,
-        "clips_dir": output_dir / "clips",
-        "processed_dir": output_dir / "processed",
-        "manifest_path": manifest_path,
-        "logs_dir": logs_dir,
-    }
-    return {key: {"path": str(path), "exists": path.exists()} for key, path in paths.items()}
-
-
-def local_open_output_enabled() -> bool:
-    env_name = os.getenv("ACUSTICAFAUNA_ENV", os.getenv("ENV", "local")).strip().lower()
-    disabled = os.getenv("ACUSTICAFAUNA_DISABLE_LOCAL_OPEN_OUTPUTS", "").strip().lower()
-    return env_name not in {"production", "prod"} and disabled not in {"1", "true", "yes", "on"}
-
-
-def open_local_folder(path: Path) -> None:
-    if sys.platform.startswith("win"):
-        os.startfile(str(path))  # type: ignore[attr-defined]
-    elif sys.platform == "darwin":
-        subprocess.run(["open", str(path)], check=True)
-    else:
-        subprocess.run(["xdg-open", str(path)], check=True)
 
 
 def folder_job_status(job_id: str) -> str | None:
@@ -890,6 +883,7 @@ def batch_payload_dict(payload: BatchProcessingJobPayload) -> dict[str, Any]:
         "detector_params": pydantic_to_dict(payload.detector_params),
         "output_policy": pydantic_to_dict(payload.output_policy),
         "job_allowed_roots": payload.job_allowed_roots,
+        "temporary": payload.temporary,
     }
 
 
@@ -1073,9 +1067,9 @@ def enrich_batch_outputs_with_quality_reports(conn, outputs, job: dict[str, Any]
         elif item.get("processed_audio_path"):
             report = conn.execute(
                 """
-                SELECT report_path, recommendation_label, contrast_improvement_db, clipping_processed_ratio, created_at
+                SELECT id, report_path, recommendation_label, contrast_improvement_db, clipping_processed_ratio, created_at, status, deleted_at
                 FROM audio_lab_quality_reports
-                WHERE processed_audio_path = ?
+                WHERE processed_audio_path = ? AND COALESCE(status, 'active') != 'deleted'
                 ORDER BY created_at DESC
                 LIMIT 1
                 """,
@@ -1088,6 +1082,16 @@ def enrich_batch_outputs_with_quality_reports(conn, outputs, job: dict[str, Any]
             item["quality_report"] = report_dict
         else:
             item["quality_report"] = None
+        item["file_status"] = item.get("status") or "active"
+        item["deleted"] = item["file_status"] == "deleted"
+        for path_key, exists_key in [
+            ("segment_audio_path", "segment_audio_exists"),
+            ("processed_audio_path", "processed_audio_exists"),
+            ("processing_metadata_path", "processing_metadata_exists"),
+            ("quality_report_path", "quality_report_exists"),
+        ]:
+            value = item.get(path_key)
+            item[exists_key] = bool(value and Path(value).exists())
         enriched.append(item)
     return enriched
 
@@ -1963,9 +1967,21 @@ def ensure_audio_lab_extra_schema(conn) -> None:
     for name, definition in {
         "quality_report_path": "TEXT",
         "quality_report_label": "TEXT",
+        "status": "TEXT DEFAULT 'active'",
+        "deleted_at": "TEXT",
+        "deletion_note": "TEXT",
     }.items():
         if name not in existing_output_columns:
             conn.execute(f"ALTER TABLE audio_lab_batch_outputs ADD COLUMN {name} {definition}")
+    existing_job_columns = {row["name"] for row in conn.execute("PRAGMA table_info(audio_lab_batch_jobs)").fetchall()}
+    for name, definition in {
+        "is_temporary": "INTEGER DEFAULT 0",
+        "marked_test_at": "TEXT",
+        "cleaned_at": "TEXT",
+        "cleanup_note": "TEXT",
+    }.items():
+        if name not in existing_job_columns:
+            conn.execute(f"ALTER TABLE audio_lab_batch_jobs ADD COLUMN {name} {definition}")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS audio_lab_quality_reports (
@@ -1985,6 +2001,13 @@ def ensure_audio_lab_extra_schema(conn) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_audio_lab_quality_reports_processed ON audio_lab_quality_reports(processed_audio_path)"
     )
+    existing_report_columns = {row["name"] for row in conn.execute("PRAGMA table_info(audio_lab_quality_reports)").fetchall()}
+    for name, definition in {
+        "deleted_at": "TEXT",
+        "status": "TEXT DEFAULT 'active'",
+    }.items():
+        if name not in existing_report_columns:
+            conn.execute(f"ALTER TABLE audio_lab_quality_reports ADD COLUMN {name} {definition}")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS audio_lab_clean_manifests (
@@ -2007,6 +2030,13 @@ def ensure_audio_lab_extra_schema(conn) -> None:
         )
         """
     )
+    existing_upload_columns = {row["name"] for row in conn.execute("PRAGMA table_info(audio_lab_uploads)").fetchall()}
+    for name, definition in {
+        "deleted_at": "TEXT",
+        "status": "TEXT DEFAULT 'active'",
+    }.items():
+        if name not in existing_upload_columns:
+            conn.execute(f"ALTER TABLE audio_lab_uploads ADD COLUMN {name} {definition}")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS audio_lab_folder_batch_jobs (
@@ -2032,7 +2062,6 @@ def ensure_audio_lab_extra_schema(conn) -> None:
             errors_count INTEGER DEFAULT 0,
             output_dir TEXT,
             manifest_path TEXT,
-            logs_dir TEXT,
             params_json TEXT,
             summary_json TEXT,
             current_file TEXT,
@@ -2044,8 +2073,6 @@ def ensure_audio_lab_extra_schema(conn) -> None:
     existing_folder_job_columns = {row["name"] for row in conn.execute("PRAGMA table_info(audio_lab_folder_batch_jobs)").fetchall()}
     if "folder_path_resolved" not in existing_folder_job_columns:
         conn.execute("ALTER TABLE audio_lab_folder_batch_jobs ADD COLUMN folder_path_resolved TEXT")
-    if "logs_dir" not in existing_folder_job_columns:
-        conn.execute("ALTER TABLE audio_lab_folder_batch_jobs ADD COLUMN logs_dir TEXT")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS audio_lab_folder_batch_files (
@@ -3124,63 +3151,13 @@ def write_folder_batch_manifest(job_id: str) -> str:
         conn.close()
 
 
-def folder_batch_is_exploratory(job: dict[str, Any], params: dict[str, Any] | None = None) -> bool:
-    params = params or {}
-    return (
-        job.get("preset") == "exploratory_wide"
-        or params.get("config_name") == "exploratory_wide"
-        or params.get("name") == "exploratory_wide"
-        or params.get("calibration_mode") == "exploratory"
-    )
-
-
-def folder_batch_exploratory_result(candidates: int, job: dict[str, Any], params: dict[str, Any] | None = None) -> dict[str, Any]:
-    params = params or {}
-    result = {
-        "title": "Resultado exploratorio",
-        "safe_for_batch_processing": False,
-        "summary": "Se encontró actividad con configuración amplia, pero no se considera segura.",
-        "warning": "Esta configuración es exploratoria. Sirve para encontrar actividad posible, no para procesar toda la carpeta.",
-        "training_warning": "No usar para entrenamiento ni procesamiento masivo sin revisar.",
-        "suggested_intermediate_config": INTERMEDIATE_EXPLORATORY_CONFIG,
-        "markdown": "\n".join(
-            [
-                "## Resultado exploratorio",
-                "",
-                "Se encontró actividad con configuración amplia, pero no se considera segura.",
-                "",
-                "Configuración intermedia sugerida:",
-                f"- frequency_min_hz: {INTERMEDIATE_EXPLORATORY_CONFIG['frequency_min_hz']}",
-                f"- frequency_max_hz: {INTERMEDIATE_EXPLORATORY_CONFIG['frequency_max_hz']}",
-                f"- threshold_dbfs: {INTERMEDIATE_EXPLORATORY_CONFIG['threshold_dbfs']}",
-                f"- min_band_energy_ratio: {INTERMEDIATE_EXPLORATORY_CONFIG['min_band_energy_ratio']}",
-                "- bandpass: true",
-                "- noise_reduce: false",
-                "- normalize: false",
-            ]
-        ),
-    }
-    if candidates > 0:
-        result["best_next_step"] = "try_intermediate_config"
-        result["recommendation"] = "too_many_candidates"
-        result["next_step_text"] = "Hay actividad, pero la configuración es demasiado abierta. Siguiente paso: probar una configuración intermedia."
-    else:
-        result["recommendation"] = params.get("recommendation") or "exploratory_only"
-    return result
-
-
 def build_folder_batch_summary(job_id: str) -> dict[str, Any]:
     conn = get_connection()
     try:
         ensure_audio_lab_extra_schema(conn)
-        job_row = conn.execute("SELECT * FROM audio_lab_folder_batch_jobs WHERE id = ?", (job_id,)).fetchone()
-        if not job_row:
+        job = conn.execute("SELECT * FROM audio_lab_folder_batch_jobs WHERE id = ?", (job_id,)).fetchone()
+        if not job:
             raise HTTPException(status_code=404, detail="Job no encontrado.")
-        job = dict(job_row)
-        try:
-            params = json.loads(job.get("params_json") or "{}")
-        except json.JSONDecodeError:
-            params = {}
         segs = conn.execute("SELECT * FROM audio_lab_folder_batch_segments WHERE job_id = ?", (job_id,)).fetchall()
         files = conn.execute("SELECT * FROM audio_lab_folder_batch_files WHERE job_id = ?", (job_id,)).fetchall()
         ratios = [float(row["band_energy_ratio"] or 0) for row in segs]
@@ -3220,8 +3197,6 @@ def build_folder_batch_summary(job_id: str) -> dict[str, Any]:
             },
             "manifest_path": job["manifest_path"],
         }
-        if folder_batch_is_exploratory(job, params):
-            summary["exploratory_result"] = folder_batch_exploratory_result(candidates, job, params)
         return summary
     finally:
         conn.close()
@@ -3321,14 +3296,6 @@ def create_folder_batch_outputs_for_segment(
         "recommendation": segment["recommendation"],
         "dBFS_note": "dBFS es nivel relativo del archivo digital; no es dB acustico calibrado.",
     }
-    if payload.preset == "exploratory_wide" or payload.config_name == "exploratory_wide" or payload.calibration_mode == "exploratory":
-        metadata["exploratory_result"] = {
-            "title": "Resultado exploratorio",
-            "summary": "Se encontró actividad con configuración amplia, pero no se considera segura.",
-            "warning": "No usar para entrenamiento ni procesamiento masivo sin revisar.",
-            "recommendation": "too_many_candidates" if segment["recommendation"] == "candidate" else "exploratory_only",
-            "suggested_intermediate_config": INTERMEDIATE_EXPLORATORY_CONFIG,
-        }
     metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
     quality_path.write_text(json.dumps({"recommendation": segment["recommendation"], **metadata}, ensure_ascii=False, indent=2), encoding="utf-8")
     return {
@@ -3491,6 +3458,85 @@ def run_folder_batch_job(job_id: str, payload: FolderBatchJobPayload) -> None:
         log_folder_batch_job(job_id, f"FATAL {exc}")
 
 
+def calibration_http_error(exc: Exception) -> HTTPException:
+    if isinstance(exc, CalibrationPermissionError):
+        detail = exc.args[1] if len(exc.args) > 1 and isinstance(exc.args[1], dict) else {}
+        return HTTPException(
+            status_code=403,
+            detail={
+                "error": "calibration_folder_not_allowed",
+                "message": str(exc.args[0]),
+                **detail,
+            },
+        )
+    if isinstance(exc, CalibrationError):
+        return HTTPException(status_code=400, detail={"error": "calibration_error", "message": str(exc)})
+    return HTTPException(status_code=500, detail={"error": "calibration_failed", "message": str(exc)})
+
+
+@router.post("/calibration/profile-folder")
+def profile_calibration_folder(payload: CalibrationProfilePayload):
+    try:
+        output = default_profile_output(payload.label)
+        return analyze_audio_folder_profile(
+            payload.folder_path,
+            payload.label,
+            sample_size=payload.sample_size,
+            output=output,
+            job_allowed_roots=payload.job_allowed_roots,
+            allow_unrestricted=False,
+        )
+    except Exception as exc:
+        raise calibration_http_error(exc) from exc
+
+
+@router.post("/calibration/test-configs")
+def test_calibration_configs(payload: CalibrationTestConfigsPayload):
+    try:
+        output_dir = default_test_output_dir(payload.label)
+        detection_only = payload.detection_only
+        if detection_only is None:
+            detection_only = payload.calibration_mode == "detect"
+        return test_audio_processing_configs(
+            payload.folder_path,
+            payload.label,
+            sample_size=payload.sample_size,
+            configs=payload.configs,
+            config_definitions=payload.config_definitions,
+            output_dir=output_dir,
+            job_allowed_roots=payload.job_allowed_roots,
+            allow_unrestricted=False,
+            detection_only=detection_only,
+        )
+    except Exception as exc:
+        raise calibration_http_error(exc) from exc
+
+
+@router.get("/calibration/reports")
+def get_calibration_reports():
+    return {"items": list_calibration_reports()}
+
+
+@router.get("/calibration/reports/{report_id:path}")
+def get_calibration_report(report_id: str):
+    try:
+        return read_calibration_report(report_id)
+    except Exception as exc:
+        root = audio_lab_dir("calibration_reports")
+        report_path = (root / report_id).expanduser().resolve(strict=False)
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": "report_not_found",
+                "message": str(exc),
+                "report_id": report_id,
+                "report_path": str(report_path),
+                "current_path": "",
+                "report_folder_path": None,
+            },
+        ) from exc
+
+
 @router.post("/batch-processing/jobs")
 def create_batch_processing_job(payload: BatchProcessingJobPayload, background_tasks: BackgroundTasks):
     if payload.mode not in BATCH_JOB_MODES:
@@ -3522,9 +3568,9 @@ def create_batch_processing_job(payload: BatchProcessingJobPayload, background_t
             """
             INSERT INTO audio_lab_batch_jobs (
                 id, job_name, mode, preset, status, progress, phase, current_file,
-                params_json, summary_json, created_at, started_at, finished_at
+                params_json, summary_json, created_at, started_at, finished_at, is_temporary
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 job_id,
@@ -3540,6 +3586,7 @@ def create_batch_processing_job(payload: BatchProcessingJobPayload, background_t
                 created_at,
                 None,
                 None,
+                1 if payload.temporary else 0,
             ),
         )
         conn.commit()
@@ -3578,7 +3625,6 @@ def create_folder_batch_job(payload: FolderBatchJobPayload, background_tasks: Ba
     for part in ["clips", "processed", "summaries", "manifests", "logs"]:
         folder_batch_job_dir(job_id, part)
     manifest_path = str(folder_batch_job_dir(job_id, "manifests") / "manifest.csv")
-    logs_dir = str(folder_batch_job_dir(job_id, "logs"))
     files = list_folder_audio_files(payload)
     conn = get_connection()
     try:
@@ -3590,10 +3636,10 @@ def create_folder_batch_job(payload: FolderBatchJobPayload, background_tasks: Ba
                 frequency_min_hz, frequency_max_hz, threshold_dbfs, total_files,
                 processed_files, total_duration_seconds, processed_duration_seconds,
                 candidates_count, discarded_count, contaminant_suspect_count,
-                frog_positive_count, errors_count, output_dir, manifest_path, logs_dir,
+                frog_positive_count, errors_count, output_dir, manifest_path,
                 params_json, summary_json, current_file, created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 job_id,
@@ -3618,7 +3664,6 @@ def create_folder_batch_job(payload: FolderBatchJobPayload, background_tasks: Ba
                 0,
                 str(output_dir),
                 manifest_path,
-                logs_dir,
                 json.dumps(folder_batch_payload_dict(payload), ensure_ascii=False),
                 json.dumps(scan, ensure_ascii=False),
                 None,
@@ -3665,7 +3710,14 @@ def list_folder_batch_jobs(limit: int = Query(50, ge=1, le=200)):
     try:
         ensure_audio_lab_extra_schema(conn)
         rows = conn.execute(
-            "SELECT * FROM audio_lab_folder_batch_jobs ORDER BY created_at DESC LIMIT ?",
+            """
+            SELECT j.*, COUNT(o.id) AS outputs_count
+            FROM audio_lab_folder_batch_jobs j
+            LEFT JOIN audio_lab_folder_batch_outputs o ON o.job_id = j.id
+            GROUP BY j.id
+            ORDER BY j.created_at DESC
+            LIMIT ?
+            """,
             (limit,),
         ).fetchall()
         return {"items": [folder_batch_job_to_dict(row) for row in rows], "total": len(rows)}
@@ -3678,47 +3730,22 @@ def get_folder_batch_job(job_id: str):
     conn = get_connection()
     try:
         ensure_audio_lab_extra_schema(conn)
-        row = conn.execute("SELECT * FROM audio_lab_folder_batch_jobs WHERE id = ?", (job_id,)).fetchone()
+        row = conn.execute(
+            """
+            SELECT j.*, COUNT(o.id) AS outputs_count
+            FROM audio_lab_folder_batch_jobs j
+            LEFT JOIN audio_lab_folder_batch_outputs o ON o.job_id = j.id
+            WHERE j.id = ?
+            GROUP BY j.id
+            """,
+            (job_id,),
+        ).fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="Job no encontrado.")
         files = conn.execute("SELECT * FROM audio_lab_folder_batch_files WHERE job_id = ? ORDER BY rowid ASC LIMIT 200", (job_id,)).fetchall()
         return {**folder_batch_job_to_dict(row), "files": [dict(item) for item in files]}
     finally:
         conn.close()
-
-
-@router.get("/folder-batch/jobs/{job_id}/paths")
-def get_folder_batch_paths(job_id: str):
-    job = dict(get_folder_batch_job_row(job_id))
-    paths = folder_batch_job_paths(job)
-    return {"job_id": job_id, **paths}
-
-
-@router.post("/folder-batch/jobs/{job_id}/open-output-folder")
-def open_folder_batch_output_folder(job_id: str):
-    job = dict(get_folder_batch_job_row(job_id))
-    output_dir = secure_folder_batch_output_dir(job)
-    if not output_dir.exists() or not output_dir.is_dir():
-        return {
-            "opened": False,
-            "output_dir": str(output_dir),
-            "message": "Copia esta ruta y abrela manualmente.",
-        }
-    if not local_open_output_enabled():
-        return {
-            "opened": False,
-            "output_dir": str(output_dir),
-            "message": "Copia esta ruta y abrela manualmente.",
-        }
-    try:
-        open_local_folder(output_dir)
-        return {"opened": True, "output_dir": str(output_dir)}
-    except Exception:
-        return {
-            "opened": False,
-            "output_dir": str(output_dir),
-            "message": "Copia esta ruta y abrela manualmente.",
-        }
 
 
 @router.get("/folder-batch/jobs/{job_id}/logs")
@@ -3774,9 +3801,11 @@ def get_folder_batch_outputs(job_id: str, limit: int = Query(500, ge=1, le=5000)
         rows = conn.execute(
             """
             SELECT o.*, s.start_seconds, s.end_seconds, s.duration_seconds, s.activity_score,
-                   s.band_energy_ratio, s.rms_dbfs, s.contaminant_flags_json
+                   s.band_energy_ratio, s.rms_dbfs, s.contaminant_flags_json,
+                   j.job_name, j.target_label, j.folder_path, j.folder_path_resolved, j.output_dir
             FROM audio_lab_folder_batch_outputs o
             LEFT JOIN audio_lab_folder_batch_segments s ON s.id = o.segment_id
+            LEFT JOIN audio_lab_folder_batch_jobs j ON j.id = o.job_id
             WHERE o.job_id = ?
             ORDER BY o.created_at ASC
             LIMIT ?
@@ -3787,6 +3816,12 @@ def get_folder_batch_outputs(job_id: str, limit: int = Query(500, ge=1, le=5000)
         for row in rows:
             item = dict(row)
             playable_path = item.get("output_audio_path") or item.get("original_audio_path")
+            source_folder = item.get("folder_path_resolved") or item.get("folder_path")
+            item["source_folder"] = source_folder
+            item["processed_audio_path"] = item.get("output_audio_path")
+            item["batch_job_name"] = item.get("job_name")
+            item["batch_job_id"] = item.get("job_id")
+            item["folder_path_original"] = item.get("folder_path")
             if playable_path:
                 item["playable_url"] = playable_url_for_path(playable_path)
                 item["audio_url"] = item["playable_url"]
@@ -3899,6 +3934,208 @@ def cancel_batch_processing_job(job_id: str):
         conn.commit()
         row = conn.execute("SELECT * FROM audio_lab_batch_jobs WHERE id = ?", (job_id,)).fetchone()
         return batch_job_to_dict(row)
+    finally:
+        conn.close()
+
+
+@router.get("/maintenance")
+def audio_lab_maintenance():
+    conn = get_connection()
+    try:
+        ensure_audio_lab_extra_schema(conn)
+        uploads_dir = audio_lab_dir("uploads")
+        batch_dir = audio_lab_dir("batch_jobs")
+        reports_dir = audio_lab_dir("quality_reports")
+        uploads = conn.execute(
+            "SELECT COUNT(*) AS total, COALESCE(SUM(size_bytes), 0) AS bytes FROM audio_lab_uploads WHERE COALESCE(status, 'active') != 'deleted'"
+        ).fetchone()
+        temporary_jobs = conn.execute(
+            "SELECT COUNT(*) AS total FROM audio_lab_batch_jobs WHERE COALESCE(is_temporary, 0) = 1 OR marked_test_at IS NOT NULL"
+        ).fetchone()
+        deleted_outputs = conn.execute(
+            "SELECT COUNT(*) AS total FROM audio_lab_batch_outputs WHERE COALESCE(status, 'active') = 'deleted'"
+        ).fetchone()
+        return {
+            "message": "Estos archivos son derivados generados por la app. Los audios originales no se modifican.",
+            "uploads": {"path": str(uploads_dir), "size_bytes": dir_size_bytes(uploads_dir), "active_db_bytes": int(uploads["bytes"] or 0), "active_count": int(uploads["total"] or 0)},
+            "batch_jobs": {"path": str(batch_dir), "size_bytes": dir_size_bytes(batch_dir), "temporary_or_test_count": int(temporary_jobs["total"] or 0), "deleted_outputs_count": int(deleted_outputs["total"] or 0)},
+            "quality_reports": {"path": str(reports_dir), "size_bytes": dir_size_bytes(reports_dir)},
+        }
+    finally:
+        conn.close()
+
+
+@router.post("/batch-processing/jobs/{job_id}/mark-test")
+def mark_batch_job_as_test(job_id: str):
+    conn = get_connection()
+    try:
+        ensure_audio_lab_extra_schema(conn)
+        row = conn.execute("SELECT * FROM audio_lab_batch_jobs WHERE id = ?", (job_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Job no encontrado.")
+        conn.execute(
+            "UPDATE audio_lab_batch_jobs SET is_temporary = 1, marked_test_at = ?, cleanup_note = ? WHERE id = ?",
+            (now_iso(), "Marcado como prueba por el usuario.", job_id),
+        )
+        conn.commit()
+        row = conn.execute("SELECT * FROM audio_lab_batch_jobs WHERE id = ?", (job_id,)).fetchone()
+        return batch_job_to_dict(row)
+    finally:
+        conn.close()
+
+
+def delete_outputs_for_job(conn, job_id: str) -> dict[str, Any]:
+    row = conn.execute("SELECT * FROM audio_lab_batch_jobs WHERE id = ?", (job_id,)).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Job no encontrado.")
+    job_root = batch_job_dir(job_id)
+    outputs = conn.execute("SELECT * FROM audio_lab_batch_outputs WHERE job_id = ?", (job_id,)).fetchall()
+    deleted_files = 0
+    for output in outputs:
+        for key in ["segment_audio_path", "processed_audio_path", "processing_metadata_path"]:
+            if safe_delete_file(output[key], job_root):
+                deleted_files += 1
+        processed_path = output["processed_audio_path"]
+        if processed_path:
+            metadata_candidate = f"{processed_path}.json"
+            if safe_delete_file(metadata_candidate, job_root):
+                deleted_files += 1
+    for part in ["segments", "processed", "summaries"]:
+        safe_delete_tree(job_root / part, job_root)
+        (job_root / part).mkdir(parents=True, exist_ok=True)
+    conn.execute(
+        """
+        UPDATE audio_lab_batch_outputs
+        SET status = 'deleted', deleted_at = ?, deletion_note = ?
+        WHERE job_id = ?
+        """,
+        (now_iso(), "Derivados eliminados por limpieza de prueba. Audios originales intactos.", job_id),
+    )
+    conn.execute(
+        "UPDATE audio_lab_batch_jobs SET cleaned_at = ?, cleanup_note = ?, phase = ? WHERE id = ?",
+        (now_iso(), "Outputs derivados eliminados. No se tocaron audios originales.", "outputs_cleaned", job_id),
+    )
+    return {"job_id": job_id, "deleted_files": deleted_files, "outputs_marked_deleted": len(outputs)}
+
+
+@router.delete("/batch-processing/jobs/{job_id}/outputs")
+def delete_batch_job_outputs(job_id: str):
+    conn = get_connection()
+    try:
+        ensure_audio_lab_extra_schema(conn)
+        result = delete_outputs_for_job(conn, job_id)
+        conn.commit()
+        return {
+            **result,
+            "message": "Esto elimino derivados generados por la app, no audios originales.",
+        }
+    finally:
+        conn.close()
+
+
+@router.delete("/batch-processing/outputs/{output_id}/quality-report")
+def delete_quality_report_for_output(output_id: str):
+    conn = get_connection()
+    try:
+        ensure_audio_lab_extra_schema(conn)
+        output = conn.execute("SELECT * FROM audio_lab_batch_outputs WHERE id = ?", (output_id,)).fetchone()
+        if not output:
+            raise HTTPException(status_code=404, detail="Output no encontrado.")
+        report = None
+        if output["quality_report_path"]:
+            report = conn.execute(
+                "SELECT * FROM audio_lab_quality_reports WHERE report_path = ? ORDER BY created_at DESC LIMIT 1",
+                (output["quality_report_path"],),
+            ).fetchone()
+        if report is None and output["processed_audio_path"]:
+            report = conn.execute(
+                "SELECT * FROM audio_lab_quality_reports WHERE processed_audio_path = ? AND COALESCE(status, 'active') != 'deleted' ORDER BY created_at DESC LIMIT 1",
+                (output["processed_audio_path"],),
+            ).fetchone()
+        if not report:
+            conn.execute("UPDATE audio_lab_batch_outputs SET quality_report_path = NULL, quality_report_label = NULL WHERE id = ?", (output_id,))
+            conn.commit()
+            return {"deleted": False, "message": "No habia reporte activo asociado."}
+        deleted = safe_delete_file(report["report_path"], audio_lab_dir("quality_reports"))
+        conn.execute("UPDATE audio_lab_quality_reports SET status = 'deleted', deleted_at = ? WHERE id = ?", (now_iso(), report["id"]))
+        conn.execute("UPDATE audio_lab_batch_outputs SET quality_report_path = NULL, quality_report_label = NULL WHERE id = ?", (output_id,))
+        conn.commit()
+        return {"deleted": deleted, "report_id": report["id"], "message": "Reporte de calidad derivado eliminado. Audios originales intactos."}
+    finally:
+        conn.close()
+
+
+@router.delete("/uploads/{upload_id}")
+def delete_upload(upload_id: str):
+    conn = get_connection()
+    try:
+        ensure_audio_lab_extra_schema(conn)
+        upload = conn.execute("SELECT * FROM audio_lab_uploads WHERE id = ?", (upload_id,)).fetchone()
+        if not upload:
+            raise HTTPException(status_code=404, detail="Upload no encontrado.")
+        used = conn.execute(
+            "SELECT COUNT(*) AS total FROM audio_lab_batch_items WHERE source_audio_path = ?",
+            (upload["stored_path"],),
+        ).fetchone()["total"]
+        if used:
+            raise HTTPException(status_code=409, detail="Este upload esta usado por uno o mas jobs. Limpia esos jobs primero o conserva trazabilidad.")
+        deleted = safe_delete_file(upload["stored_path"], audio_lab_dir("uploads"))
+        conn.execute("UPDATE audio_lab_uploads SET status = 'deleted', deleted_at = ? WHERE id = ?", (now_iso(), upload_id))
+        conn.commit()
+        return {"deleted": deleted, "upload_id": upload_id, "message": "Upload temporal eliminado. No se tocaron audios originales."}
+    finally:
+        conn.close()
+
+
+@router.delete("/batch-processing/jobs/{job_id}/uploads")
+def delete_batch_job_uploads(job_id: str):
+    conn = get_connection()
+    try:
+        ensure_audio_lab_extra_schema(conn)
+        job = conn.execute("SELECT * FROM audio_lab_batch_jobs WHERE id = ?", (job_id,)).fetchone()
+        if not job:
+            raise HTTPException(status_code=404, detail="Job no encontrado.")
+        upload_rows = conn.execute(
+            """
+            SELECT DISTINCT u.*
+            FROM audio_lab_uploads u
+            JOIN audio_lab_batch_items i ON i.source_audio_path = u.stored_path
+            WHERE i.job_id = ? AND COALESCE(u.status, 'active') != 'deleted'
+            """,
+            (job_id,),
+        ).fetchall()
+        deleted = 0
+        skipped = []
+        for upload in upload_rows:
+            other = conn.execute(
+                "SELECT COUNT(*) AS total FROM audio_lab_batch_items WHERE source_audio_path = ? AND job_id != ?",
+                (upload["stored_path"], job_id),
+            ).fetchone()["total"]
+            if other:
+                skipped.append({"upload_id": upload["id"], "reason": "usado por otro job"})
+                continue
+            if safe_delete_file(upload["stored_path"], audio_lab_dir("uploads")):
+                deleted += 1
+            conn.execute("UPDATE audio_lab_uploads SET status = 'deleted', deleted_at = ? WHERE id = ?", (now_iso(), upload["id"]))
+        conn.commit()
+        return {"job_id": job_id, "deleted_uploads": deleted, "skipped": skipped, "message": "Se eliminaron uploads temporales no usados por otros jobs."}
+    finally:
+        conn.close()
+
+
+@router.post("/maintenance/cleanup-tests")
+def cleanup_test_derivatives():
+    conn = get_connection()
+    try:
+        ensure_audio_lab_extra_schema(conn)
+        jobs = conn.execute(
+            "SELECT * FROM audio_lab_batch_jobs WHERE (COALESCE(is_temporary, 0) = 1 OR marked_test_at IS NOT NULL) AND cleaned_at IS NULL"
+        ).fetchall()
+        results = []
+        for job in jobs:
+            results.append(delete_outputs_for_job(conn, job["id"]))
+        conn.commit()
+        return {"jobs_cleaned": len(results), "results": results, "message": "Limpieza de pruebas completada. No se tocaron audios originales."}
     finally:
         conn.close()
 

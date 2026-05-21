@@ -4,6 +4,7 @@ import SectionCard from "../components/shared/SectionCard";
 import {
   cancelAudioLabBatchProcessingJob,
   cancelAudioLabFolderBatchJob,
+  cleanupAudioLabTestDerivatives,
   createAudioLabAnnotation,
   createAudioLabActivityClips,
   createAudioLabBatchProcessingJob,
@@ -11,15 +12,18 @@ import {
   createAudioLabFolderBatchJob,
   createAudioLabQualityReport,
   debugResolveAudio,
+  deleteAudioLabBatchJobOutputs,
+  deleteAudioLabBatchJobUploads,
+  deleteAudioLabOutputQualityReport,
   detectAudioLabActivity,
   fetchAudioLabBatchProcessingJob,
   fetchAudioLabBatchProcessingJobs,
   fetchAudioLabBatchProcessingLogs,
+  fetchAudioLabMaintenance,
   fetchAudioLabFolderBatchJob,
   fetchAudioLabFolderBatchJobs,
   fetchAudioLabFolderBatchLogs,
   fetchAudioLabFolderBatchOutputs,
-  fetchAudioLabFolderBatchPaths,
   fetchAudioLabFolderBatchSummary,
   fetchAudioLabClips,
   fetchAudioLabWaveform,
@@ -34,13 +38,15 @@ import {
   getCuratedSegmentAudioUrl,
   getMediaFileUrl,
   getPlayableAudioUrl,
-  openAudioLabFolderBatchOutputFolder,
+  markAudioLabBatchJobAsTest,
   pauseAudioLabFolderBatchJob,
   predictAudioPath,
   predictUploadedAudio,
+  profileAudioLabCalibrationFolder,
   resumeAudioLabFolderBatchJob,
   retractAudioLabAnnotation,
   scanAudioLabFolderBatch,
+  testAudioLabCalibrationConfigs,
   updateAudioLabAnnotation,
   uploadAudioLabBatch,
 } from "../services/api";
@@ -99,8 +105,6 @@ const FOLDER_BATCH_DEFAULT_FORM = {
   target_label: "Boana_boans",
   job_name: "",
   preset: "normal",
-  config_name: "safe_strict",
-  calibration_mode: "safe",
   frequency_min_hz: 1800,
   frequency_max_hz: 3000,
   threshold_dbfs: -45,
@@ -119,65 +123,189 @@ const FOLDER_BATCH_DEFAULT_FORM = {
   create_clips: true,
   create_manifest: true,
   resource_profile: "auto",
+  exploratory_mode: false,
+  calibration_mode_tag: "",
 };
-const FOLDER_BATCH_SAFE_RECOMMENDED_CONFIG = {
-  name: "safe_strict",
-  preset: "normal",
-  calibration_mode: "safe",
-  frequency_min_hz: 1800,
-  frequency_max_hz: 3000,
-  threshold_dbfs: -45,
-  min_band_ratio: 0.45,
-  bandpass: true,
-  noise_reduce: true,
-  normalize: true,
-  min_activity_seconds: 0.4,
-  min_silence_seconds: 1.0,
-  padding_seconds: 0.3,
+const FOLDER_BATCH_PRESETS = {
+  conservador: { threshold_dbfs: -38, min_band_ratio: 0.6, min_activity_seconds: 0.6, noise_reduce: false },
+  normal: { threshold_dbfs: -45, min_band_ratio: 0.45, min_activity_seconds: 0.4, noise_reduce: true },
+  agresivo: { threshold_dbfs: -52, min_band_ratio: 0.3, min_activity_seconds: 0.25, noise_reduce: true },
+  pristimantis_lluvia_viento: {
+    frequency_min_hz: 2500,
+    frequency_max_hz: 5000,
+    threshold_dbfs: -51,
+    min_band_ratio: 0.25,
+    min_activity_seconds: 0.25,
+    min_silence_seconds: 0.35,
+    padding_seconds: 0.12,
+    clip_duration_seconds: 5,
+    max_segment_seconds: 10,
+    bandpass: true,
+    noise_reduce: false,
+    normalize: false,
+  },
+  personalizado: {},
+};
+const FOLDER_BATCH_PRESET_OPTIONS = [
+  ["conservador", "conservador"],
+  ["normal", "normal"],
+  ["agresivo", "agresivo"],
+  ["pristimantis_lluvia_viento", "Pristimantis lluvia/viento - detección suave"],
+  ["personalizado", "personalizado"],
+];
+const FOLDER_BATCH_CALIBRATION_PARAM_KEYS = [
+  "frequency_min_hz",
+  "frequency_max_hz",
+  "threshold_dbfs",
+  "min_band_energy_ratio",
+  "min_band_ratio",
+  "min_activity_seconds",
+  "min_silence_seconds",
+  "padding_seconds",
+  "clip_duration_seconds",
+  "max_segment_seconds",
+  "bandpass",
+  "noise_reduce",
+  "normalize",
+  "discard_empty",
+  "create_clips",
+  "create_manifest",
+];
+const CALIBRATION_DEFAULT_FORM = {
+  folder_path: "",
+  label: "Pristimantis_simoterus",
+  sample_size: 20,
+  noise_type: "mezcla",
+  calibration_mode: "detect",
+};
+const CALIBRATION_LAST_PATH_STORAGE_KEYS = [
+  "acusticafauna_audio_lab_last_calibration_folder_path",
+  "acusticafauna_calibration_folder_path",
+  "audio_lab_calibration_folder_path",
+  "calibrationFolderPath",
+  "folderCalibrationPath",
+];
+const CALIBRATION_CONFIGS = ["intermedia_sin_norm", "sensible_sin_norm", "balanceada_abierta", "alta_conservadora"];
+const MORE_SENSITIVE_CALIBRATION_CONFIG = {
+  name: "variante_mas_sensible",
+  label: "Variante mas sensible",
+  frequency_min_hz: 2500,
+  frequency_max_hz: 5000,
+  threshold_dbfs: -52,
+  min_band_energy_ratio: 0.22,
+  min_band_ratio: 0.22,
+  min_activity_seconds: 0.2,
+  min_silence_seconds: 0.3,
+  padding_seconds: 0.15,
   clip_duration_seconds: 5,
   max_segment_seconds: 10,
+  bandpass: true,
+  noise_reduce: true,
+  noise_reduce_strength: "soft",
+  normalize: false,
+  prop_decrease: 0.2,
+  preset: "personalizado",
+  detection_only: false,
 };
-const FOLDER_BATCH_EXPLORATORY_WIDE_CONFIG = {
+const EXPLORATORY_WIDE_CALIBRATION_CONFIG = {
   name: "exploratory_wide",
-  preset: "exploratory_wide",
-  calibration_mode: "exploratory",
+  label: "Exploratoria amplia",
   frequency_min_hz: 1800,
   frequency_max_hz: 6000,
   threshold_dbfs: -55,
+  min_band_energy_ratio: 0.15,
   min_band_ratio: 0.15,
-  bandpass: true,
-  noise_reduce: false,
-  normalize: false,
   min_activity_seconds: 0.25,
   min_silence_seconds: 0.5,
   padding_seconds: 0.15,
   clip_duration_seconds: 5,
   max_segment_seconds: 10,
+  bandpass: true,
+  noise_reduce: false,
+  normalize: false,
+  preset: "personalizado",
+  detection_only: true,
+  purpose: "Solo para encontrar actividad posible. No usar automáticamente para entrenamiento.",
 };
-const FOLDER_BATCH_INTERMEDIATE_CONFIG = {
+const EXPLORATORY_INTERMEDIATE_CALIBRATION_CONFIG = {
+  ...EXPLORATORY_WIDE_CALIBRATION_CONFIG,
   name: "intermedia_exploratoria",
-  preset: "intermedia_exploratoria",
-  calibration_mode: "intermediate",
+  label: "Intermedia exploratoria",
   frequency_min_hz: 2200,
   frequency_max_hz: 5500,
   threshold_dbfs: -53,
+  min_band_energy_ratio: 0.2,
   min_band_ratio: 0.2,
   bandpass: true,
   noise_reduce: false,
   normalize: false,
-  min_activity_seconds: 0.25,
-  min_silence_seconds: 0.5,
-  padding_seconds: 0.15,
-  clip_duration_seconds: 5,
-  max_segment_seconds: 10,
+  detection_only: true,
+  purpose: "Prueba intermedia después de exploratory_wide; revisar manualmente antes de usar en lote grande.",
 };
-const FOLDER_BATCH_PRESETS = {
-  conservador: { config_name: "safe_strict", calibration_mode: "safe", threshold_dbfs: -38, min_band_ratio: 0.6, min_activity_seconds: 0.6, noise_reduce: false },
-  normal: FOLDER_BATCH_SAFE_RECOMMENDED_CONFIG,
-  agresivo: { config_name: "recommended_sensitive", calibration_mode: "recommended", threshold_dbfs: -52, min_band_ratio: 0.3, min_activity_seconds: 0.25, noise_reduce: true },
-  exploratory_wide: FOLDER_BATCH_EXPLORATORY_WIDE_CONFIG,
-  intermedia_exploratoria: FOLDER_BATCH_INTERMEDIATE_CONFIG,
-  personalizado: { config_name: "personalizado", calibration_mode: "recommended" },
+
+const EXPLORATORY_NARROW_CALIBRATION_CONFIG = {
+  ...EXPLORATORY_INTERMEDIATE_CALIBRATION_CONFIG,
+  name: "intermedia_cerrada",
+  label: "Intermedia cerrada",
+  frequency_min_hz: 2000,
+  frequency_max_hz: 3300,
+  threshold_dbfs: -52,
+  min_band_energy_ratio: 0.2,
+  min_band_ratio: 0.2,
+  bandpass: true,
+  noise_reduce: false,
+  normalize: false,
+  detection_only: true,
+  purpose: "Cerrar filtros despues de intermedia_exploratoria; revisar manualmente antes de usar en lote grande.",
+};
+const EXPLORATORY_NARROW_SELECTIVE_CALIBRATION_CONFIG = {
+  ...EXPLORATORY_NARROW_CALIBRATION_CONFIG,
+  name: "intermedia_cerrada_mas_selectiva",
+  label: "Intermedia cerrada mas selectiva",
+  frequency_min_hz: 2200,
+  frequency_max_hz: 3300,
+  threshold_dbfs: -51,
+  min_band_energy_ratio: 0.23,
+  min_band_ratio: 0.23,
+  purpose: "Comparar contra intermedia_cerrada cuando sigue demasiado amplia; usar solo en muestra pequena.",
+};
+const EXPLORATORY_NARROW_SELECTIVE_RATIO025_CALIBRATION_CONFIG = {
+  ...EXPLORATORY_NARROW_SELECTIVE_CALIBRATION_CONFIG,
+  name: "intermedia_cerrada_mas_selectiva_ratio025",
+  label: "Intermedia cerrada mas selectiva ratio 0.25",
+  min_band_energy_ratio: 0.25,
+  min_band_ratio: 0.25,
+};
+const EXPLORATORY_NARROW_STRICT_CALIBRATION_CONFIG = {
+  ...EXPLORATORY_NARROW_CALIBRATION_CONFIG,
+  name: "intermedia_cerrada_estricta",
+  label: "Intermedia cerrada estricta",
+  frequency_min_hz: 2300,
+  frequency_max_hz: 3100,
+  threshold_dbfs: -50,
+  min_band_energy_ratio: 0.3,
+  min_band_ratio: 0.3,
+  purpose: "Probar filtros mas estrictos si la configuracion mas selectiva sigue demasiado amplia.",
+};
+const CALIBRATION_STEP_DEFINITIONS = [
+  ["profile", "Perfil acustico"],
+  ["compare", "Comparar configuraciones"],
+  ["wide", "Exploratoria amplia"],
+  ["intermediate", "Configuracion intermedia"],
+  ["narrow", "Configuracion mas cerrada"],
+  ["safe", "Aplicar configuracion segura"],
+];
+const RECOMMENDATION_LABELS = {
+  too_few_candidates: "Muy pocos candidatos",
+  too_many_candidates: "Demasiado amplia",
+  possible_damage: "Posible dano",
+  requires_review: "Requiere revision",
+  safe_candidate: "Candidata segura",
+  candidate_for_review: "Requiere revision",
+  safe_for_review: "Candidata segura",
+  not_applicable_detection_only: "No aplica limpieza",
+  requires_manual_review: "Requiere revision manual",
+  candidate_for_small_batch_review: "Candidata para muestra pequena",
 };
 
 function Spinner() {
@@ -320,6 +448,127 @@ function shortPath(value, maxLength = 86) {
   if (text.length <= maxLength) return text;
   const tail = text.slice(-(maxLength - 4));
   return `...${tail}`;
+}
+
+function formatBytes(value) {
+  const bytes = Number(value || 0);
+  if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
+  if (bytes < 1024) return `${bytes} B`;
+  const units = ["KB", "MB", "GB", "TB"];
+  let size = bytes / 1024;
+  let index = 0;
+  while (size >= 1024 && index < units.length - 1) {
+    size /= 1024;
+    index += 1;
+  }
+  return `${size.toFixed(size >= 10 ? 1 : 2)} ${units[index]}`;
+}
+
+function formatDateTime(value) {
+  if (!value) return "";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return String(value);
+  return date.toLocaleString();
+}
+
+function normalizeFolderPathForCompare(value) {
+  return String(value || "")
+    .trim()
+    .replace(/[\\/]+$/g, "")
+    .replace(/\\/g, "/")
+    .toLowerCase();
+}
+
+function sameFolderPath(left, right) {
+  const normalizedLeft = normalizeFolderPathForCompare(left);
+  const normalizedRight = normalizeFolderPathForCompare(right);
+  return Boolean(normalizedLeft && normalizedRight && normalizedLeft === normalizedRight);
+}
+
+function folderBatchJobFolderPath(job) {
+  return job?.folder_path_resolved || job?.folder_path_original || job?.folder_path || "";
+}
+
+function calibrationReportFolderPath(report) {
+  return report?.folder_path_resolved || report?.folder_path || "";
+}
+
+function isFolderBatchJobForPath(job, folderPath) {
+  const jobPath = folderBatchJobFolderPath(job);
+  if (!jobPath || !folderPath) return false;
+  return sameFolderPath(jobPath, folderPath);
+}
+
+function pickCalibrationFolderBatchParams(params = {}) {
+  const picked = {};
+  for (const key of FOLDER_BATCH_CALIBRATION_PARAM_KEYS) {
+    if (params[key] !== undefined && params[key] !== null) picked[key] = params[key];
+  }
+  return picked;
+}
+
+function isExploratoryConfigName(name) {
+  return ["exploratory_wide", "exploratory_intermediate", "intermedia_exploratoria", "intermedia_cerrada"].includes(String(name || ""));
+}
+
+function isUnsafeExploratoryConfigName(name, recommendation = "") {
+  const configName = String(name || "");
+  return (
+    configName === "exploratory_wide" ||
+    (configName === "intermedia_exploratoria" && recommendation === "too_many_candidates")
+  );
+}
+
+function recommendationLabel(value) {
+  return RECOMMENDATION_LABELS[value] || value || "Requiere revision";
+}
+
+function calibrationRowHasImprovedContrast(item) {
+  const before = item?.contrast_before_after?.before_db;
+  const after = item?.contrast_before_after?.after_db;
+  return before !== null && before !== undefined && after !== null && after !== undefined && Number(after) > Number(before);
+}
+
+function calibrationRowIsSmallBatchCandidate(item) {
+  const configName = String(item?.config || item?.parameters?.name || "");
+  return Boolean(
+    item &&
+      (
+        item.review_status === "candidate_for_small_batch_review" ||
+        ["intermedia_cerrada_mas_selectiva", "intermedia_cerrada_mas_selectiva_ratio025"].includes(configName)
+      ) &&
+      Number(item.total_candidates || 0) > 0 &&
+      Number(item.possible_damage_count || 0) === 0 &&
+      Number(item.clipping_count || 0) === 0
+  );
+}
+
+function smallBatchCandidateBlockedReason(item, previewReviewStarted = true) {
+  if (!item) return "No hay configuracion candidata para muestra pequena.";
+  if (Number(item.total_candidates || 0) <= 0) return "No hay candidatos para usar.";
+  if (Number(item.possible_damage_count || 0) > 0) return "No se puede usar porque hay posible dano.";
+  if (Number(item.clipping_count || 0) > 0) return "No se puede usar porque hay clipping.";
+  if (calibrationRowIsSmallBatchCandidate(item) && !previewReviewStarted) return "Primero abre los previews para revisar.";
+  return "";
+}
+
+function calibrationConfigIsSafe(item) {
+  const cleaning = item?.cleaning_metrics || {};
+  return Boolean(
+    item &&
+      !isUnsafeExploratoryConfigName(item.config, item.recommendation) &&
+      Number(item.total_candidates || 0) > 0 &&
+      Number(item.possible_damage_count || 0) === 0 &&
+      Number(item.clipping_count || 0) === 0 &&
+      item.recommendation !== "too_many_candidates" &&
+      cleaning.cleaning_safe !== false &&
+      cleaning.cleaning_safe
+  );
+}
+
+function calibrationReportTitle(report) {
+  if (!report) return "";
+  return report.report_id || report.report_path || report.report_paths?.json || report.output_dir || "reporte de calibracion";
 }
 
 function traceDisplayName(trace) {
@@ -511,45 +760,6 @@ function formatTime(value) {
 function formatNumber(value, digits = 3) {
   if (value === undefined || value === null || Number.isNaN(Number(value))) return "-";
   return Number(value).toFixed(digits);
-}
-
-function formatBytes(value) {
-  const bytes = Number(value || 0);
-  if (!bytes) return "0 B";
-  const units = ["B", "KB", "MB", "GB", "TB"];
-  const index = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
-  return `${(bytes / (1024 ** index)).toFixed(index === 0 ? 0 : 1)} ${units[index]}`;
-}
-
-function formatDateTime(value) {
-  if (!value) return "-";
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return String(value);
-  return date.toLocaleString();
-}
-
-function pathFromApiPath(value) {
-  if (!value) return "";
-  if (typeof value === "string") return value;
-  return value.path || "";
-}
-
-function normalizeFolderPathForCompare(value) {
-  return String(value || "")
-    .trim()
-    .replace(/[\\/]+$/g, "")
-    .replace(/\\/g, "/")
-    .toLowerCase();
-}
-
-function sameFolderPath(left, right) {
-  const normalizedLeft = normalizeFolderPathForCompare(left);
-  const normalizedRight = normalizeFolderPathForCompare(right);
-  return Boolean(normalizedLeft && normalizedRight && normalizedLeft === normalizedRight);
-}
-
-function jobFolderPath(job) {
-  return job?.folder_path_resolved || job?.folder_path || "";
 }
 
 function qualityLabelText(label) {
@@ -841,6 +1051,8 @@ function WaveformCanvas({
 export default function AudioLabPage() {
   const audioRef = useRef(null);
   const uploadInputRef = useRef(null);
+  const scanAbortControllerRef = useRef(null);
+  const previousFolderBatchPathRef = useRef("");
   const [labels, setLabels] = useState([]);
   const [segments, setSegments] = useState({ items: [], total: 0 });
   const [labelFilter, setLabelFilter] = useState("");
@@ -903,6 +1115,7 @@ export default function AudioLabPage() {
   const [batchProcessingSteps, setBatchProcessingSteps] = useState(BATCH_PROCESSING_DEFAULT_STEPS.clean_existing);
   const [batchProcessingAdvancedOpen, setBatchProcessingAdvancedOpen] = useState(false);
   const [batchProcessingJobName, setBatchProcessingJobName] = useState("");
+  const [batchProcessingTemporary, setBatchProcessingTemporary] = useState(false);
   const [batchProcessingParams, setBatchProcessingParams] = useState({
     threshold_db: -45,
     min_activity_seconds: 0.4,
@@ -921,24 +1134,34 @@ export default function AudioLabPage() {
   const [batchProcessingQueue, setBatchProcessingQueue] = useState([]);
   const [batchProcessingHelp, setBatchProcessingHelp] = useState("");
   const [batchProcessingJobAllowedRoots, setBatchProcessingJobAllowedRoots] = useState([]);
+  const [maintenance, setMaintenance] = useState(null);
+  const [maintenanceLoading, setMaintenanceLoading] = useState(false);
   const [batchJobSearch, setBatchJobSearch] = useState("");
   const [batchJobStatusFilter, setBatchJobStatusFilter] = useState("");
   const [batchJobModeFilter, setBatchJobModeFilter] = useState("");
   const [batchJobDateFilter, setBatchJobDateFilter] = useState("");
   const [batchJobFlagFilter, setBatchJobFlagFilter] = useState("");
+  const [calibrationForm, setCalibrationForm] = useState(CALIBRATION_DEFAULT_FORM);
+  const [calibrationProfile, setCalibrationProfile] = useState(null);
+  const [calibrationTest, setCalibrationTest] = useState(null);
+  const [calibrationLoading, setCalibrationLoading] = useState("");
+  const [calibrationReport, setCalibrationReport] = useState(null);
+  const [calibrationRouteMeta, setCalibrationRouteMeta] = useState({ source: "empty" });
+  const [calibrationReportHistorical, setCalibrationReportHistorical] = useState(false);
+  const [previewReviewStarted, setPreviewReviewStarted] = useState(false);
   const [folderBatchForm, setFolderBatchForm] = useState(FOLDER_BATCH_DEFAULT_FORM);
   const [folderBatchScan, setFolderBatchScan] = useState(null);
+  const [folderBatchScanState, setFolderBatchScanState] = useState({ status: "idle", message: "" });
   const [folderBatchJobs, setFolderBatchJobs] = useState([]);
   const [activeFolderBatchJob, setActiveFolderBatchJob] = useState(null);
   const [folderBatchLogs, setFolderBatchLogs] = useState("");
   const [folderBatchOutputs, setFolderBatchOutputs] = useState([]);
   const [folderBatchSummary, setFolderBatchSummary] = useState(null);
-  const [folderBatchPaths, setFolderBatchPaths] = useState(null);
-  const [folderBatchOutputDialog, setFolderBatchOutputDialog] = useState(null);
   const [folderBatchScanning, setFolderBatchScanning] = useState(false);
   const [folderBatchSubmitting, setFolderBatchSubmitting] = useState(false);
   const [folderBatchSearch, setFolderBatchSearch] = useState("");
   const [folderBatchStatusFilter, setFolderBatchStatusFilter] = useState("");
+  const [folderBatchHistoryFilter, setFolderBatchHistoryFilter] = useState("all");
   const [folderBatchOutputFilter, setFolderBatchOutputFilter] = useState("candidates");
   const [folderBatchMinScore, setFolderBatchMinScore] = useState("");
   const [folderBatchMinRatio, setFolderBatchMinRatio] = useState("");
@@ -951,47 +1174,24 @@ export default function AudioLabPage() {
   const [batchAutoIdentifyRunning, setBatchAutoIdentifyRunning] = useState(false);
   const [batchAutoIdentifyResults, setBatchAutoIdentifyResults] = useState([]);
 
-  const folderBatchIsExploratory = folderBatchConfigIsExploratory(folderBatchForm);
-  const folderBatchCurrentRecommendation = folderBatchRecommendationFor(folderBatchForm);
-  const folderBatchCandidateCount = Number(activeFolderBatchJob?.candidates_count || folderBatchSummary?.summary?.candidates || 0);
-  const folderBatchTooManyCandidates = folderBatchIsExploratory || folderBatchCurrentRecommendation === "too_many_candidates";
-  const folderBatchHasSafeRecommendation = !folderBatchTooManyCandidates;
-  const folderBatchBestNextStep = folderBatchIsExploratory && folderBatchCandidateCount > 0 ? "try_intermediate_config" : null;
-  const currentFolderPath = folderBatchForm.folder_path.trim();
-  const activeFolderBatchSourcePath = jobFolderPath(activeFolderBatchJob);
-  const activeFolderBatchOutputDir = pathFromApiPath(folderBatchPaths?.output_dir) || activeFolderBatchJob?.output_dir || "";
-  const activeFolderBatchManifestPath = pathFromApiPath(folderBatchPaths?.manifest_path) || activeFolderBatchJob?.manifest_path || "";
-  const activeFolderBatchLogsDir = pathFromApiPath(folderBatchPaths?.logs_dir) || activeFolderBatchJob?.logs_dir || "";
-  const activeFolderBatchIsHistorical = Boolean(
-    activeFolderBatchJob &&
-      currentFolderPath &&
-      activeFolderBatchSourcePath &&
-      !sameFolderPath(currentFolderPath, activeFolderBatchSourcePath)
-  );
-  const folderBatchCanStart = Boolean(folderBatchScan && sameFolderPath(folderBatchScan.folder_path_resolved || folderBatchScan.folder_path, currentFolderPath));
-  const folderBatchComparisonRows = [
-    {
-      ...FOLDER_BATCH_SAFE_RECOMMENDED_CONFIG,
-      label: "Segura estricta",
-      badge: "Segura",
-      tone: "success",
-      recommendationText: "Apta para procesar carpeta cuando la muestra revisada es consistente.",
-    },
-    {
-      ...FOLDER_BATCH_INTERMEDIATE_CONFIG,
-      label: "Intermedia exploratoria",
-      badge: "Intermedia",
-      tone: "info",
-      recommendationText: "Siguiente paso si la amplia encuentra actividad pero abre demasiado el filtro.",
-    },
-    {
-      ...FOLDER_BATCH_EXPLORATORY_WIDE_CONFIG,
-      label: "Exploratoria amplia",
-      badge: "Exploratoria",
-      tone: "warning",
-      recommendationText: "Demasiado amplia; puede incluir lluvia/viento/ruido.",
-    },
-  ];
+  useEffect(() => {
+    return () => {
+      scanAbortControllerRef.current?.abort();
+      scanAbortControllerRef.current = null;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    for (const key of CALIBRATION_LAST_PATH_STORAGE_KEYS) {
+      const storedPath = window.localStorage.getItem(key);
+      if (storedPath?.trim()) {
+        setCalibrationForm((current) => ({ ...current, folder_path: storedPath.trim() }));
+        setCalibrationRouteMeta({ source: "localStorage", storageKey: key });
+        break;
+      }
+    }
+  }, []);
 
   const labelOptions = useMemo(() => labels.map((item) => item.label).filter(Boolean), [labels]);
   const selectableModels = useMemo(() => {
@@ -1133,6 +1333,10 @@ export default function AudioLabPage() {
     }, 2000);
     return () => window.clearInterval(timer);
   }, [activeFolderBatchJob?.id, activeFolderBatchJob?.status]);
+
+  useEffect(() => {
+    previousFolderBatchPathRef.current = folderBatchForm.folder_path.trim();
+  }, [folderBatchForm.folder_path]);
 
   async function loadAudioChoices() {
     try {
@@ -2147,6 +2351,7 @@ export default function AudioLabPage() {
         recommended_training_use: "requires_review",
       },
       job_allowed_roots: batchProcessingJobAllowedRoots,
+      temporary: batchProcessingTemporary,
     };
   }
 
@@ -2227,60 +2432,519 @@ export default function AudioLabPage() {
     }
   }
 
-  function updateFolderBatchField(key, value) {
-    if (key === "folder_path") {
-      setFolderBatchForm((current) => {
-        if (current.folder_path === value) return current;
-        return { ...current, [key]: value };
-      });
-      setFolderBatchScan(null);
-      setMessage("Ruta cambiada. Escanea la carpeta actual para iniciar un nuevo procesamiento.");
-      return;
+  async function loadMaintenance() {
+    try {
+      setMaintenanceLoading(true);
+      const data = await fetchAudioLabMaintenance();
+      setMaintenance(data);
+    } catch (err) {
+      setError(err.message || "No fue posible consultar mantenimiento de laboratorio.");
+    } finally {
+      setMaintenanceLoading(false);
     }
-    setFolderBatchForm((current) => ({ ...current, [key]: value }));
   }
 
-  function normalizeFolderBatchConfig(config) {
+  async function markActiveBatchJobAsTest() {
+    if (!activeBatchProcessingJob?.id) return;
+    const confirmed = window.confirm("Marcar este job como prueba temporal? Los outputs seguiran guardados, pero podras limpiarlos facilmente despues.");
+    if (!confirmed) return;
+    try {
+      const updated = await markAudioLabBatchJobAsTest(activeBatchProcessingJob.id);
+      setActiveBatchProcessingJob(updated);
+      await loadBatchProcessingJobs();
+      await loadMaintenance();
+      setMessage("Job marcado como prueba temporal.");
+    } catch (err) {
+      setError(err.message || "No fue posible marcar el job como prueba.");
+    }
+  }
+
+  async function deleteActiveBatchJobOutputs() {
+    if (!activeBatchProcessingJob?.id) return;
+    const confirmed = window.confirm("Esto eliminara derivados generados por la app, no los audios originales. Deseas continuar?");
+    if (!confirmed) return;
+    try {
+      await deleteAudioLabBatchJobOutputs(activeBatchProcessingJob.id);
+      await refreshBatchProcessingJob(activeBatchProcessingJob.id);
+      await loadMaintenance();
+      setMessage("Outputs derivados del job eliminados. Los originales no fueron tocados.");
+    } catch (err) {
+      setError(err.message || "No fue posible eliminar outputs del job.");
+    }
+  }
+
+  async function deleteActiveBatchJobUploads() {
+    if (!activeBatchProcessingJob?.id) return;
+    const confirmed = window.confirm("Esto eliminara uploads temporales usados solo por este job. No se tocaran audios originales. Deseas continuar?");
+    if (!confirmed) return;
+    try {
+      const result = await deleteAudioLabBatchJobUploads(activeBatchProcessingJob.id);
+      await loadMaintenance();
+      setMessage(`Uploads temporales eliminados: ${result.deleted_uploads || 0}.`);
+    } catch (err) {
+      setError(err.message || "No fue posible eliminar uploads temporales del job.");
+    }
+  }
+
+  async function deleteQualityReportForOutput(output) {
+    if (!output?.id) return;
+    const confirmed = window.confirm("Esto eliminara el reporte de calidad derivado, no los audios originales. Deseas continuar?");
+    if (!confirmed) return;
+    try {
+      await deleteAudioLabOutputQualityReport(output.id);
+      if (activeBatchProcessingJob?.id) await refreshBatchProcessingJob(activeBatchProcessingJob.id);
+      await loadMaintenance();
+      setQualityReport(null);
+      setMessage("Reporte de calidad eliminado.");
+    } catch (err) {
+      setError(err.message || "No fue posible eliminar el reporte de calidad.");
+    }
+  }
+
+  async function cleanupTestDerivatives() {
+    const confirmed = window.confirm("Esto eliminara derivados generados por la app en jobs marcados como prueba. No se borraran audios originales. Deseas continuar?");
+    if (!confirmed) return;
+    try {
+      const result = await cleanupAudioLabTestDerivatives();
+      await loadBatchProcessingJobs();
+      if (activeBatchProcessingJob?.id) await refreshBatchProcessingJob(activeBatchProcessingJob.id);
+      await loadMaintenance();
+      setMessage(`Limpieza de pruebas completada. Jobs limpiados: ${result.jobs_cleaned || 0}.`);
+    } catch (err) {
+      setError(err.message || "No fue posible limpiar pruebas antiguas.");
+    }
+  }
+
+  function markCalibrationReportHistorical(message = "Ruta cambiada. Ejecuta de nuevo Analizar perfil acustico o Probar configuraciones.") {
+    if (calibrationProfile || calibrationTest || calibrationReport) {
+      setCalibrationReportHistorical(true);
+      setMessage(message);
+    }
+  }
+
+  function updateCalibrationField(key, value) {
+    if (key === "folder_path") {
+      setCalibrationForm((current) => {
+        if (current.folder_path === value) return current;
+        return { ...current, folder_path: value };
+      });
+      setCalibrationRouteMeta(value?.trim() ? { source: "manual" } : { source: "empty" });
+      markCalibrationReportHistorical();
+      if (value?.trim() && !calibrationProfile && !calibrationTest && !calibrationReport) {
+        setMessage("Ruta cambiada. Ejecuta Analizar perfil acustico o Probar configuraciones.");
+      }
+      if (!value?.trim()) setMessage("Ruta limpiada. No se borraron archivos ni reportes fisicos.");
+      return;
+    }
+    setCalibrationForm((current) => ({ ...current, [key]: value }));
+  }
+
+  function clearCalibrationPath() {
+    setCalibrationForm((current) => ({ ...current, folder_path: "" }));
+    setCalibrationRouteMeta({ source: "empty" });
+    if (typeof window !== "undefined") {
+      CALIBRATION_LAST_PATH_STORAGE_KEYS.forEach((key) => window.localStorage.removeItem(key));
+    }
+    markCalibrationReportHistorical("Ruta limpiada. El reporte visible queda como historico hasta ejecutar una nueva calibracion.");
+    setError("");
+  }
+
+  function useFolderBatchPathInCalibration(force = false) {
+    const folderBatchPath = folderBatchForm.folder_path.trim();
+    if (!folderBatchPath) {
+      setError("No hay ruta escrita en Procesamiento masivo por carpeta local.");
+      return;
+    }
+    const currentPath = calibrationForm.folder_path.trim();
+    if (!force && currentPath && !sameFolderPath(currentPath, folderBatchPath)) {
+      const confirmed = window.confirm("La ruta del asistente ya tiene un valor distinto. Deseas reemplazarla con la ruta de procesamiento masivo?");
+      if (!confirmed) return;
+    }
+    setCalibrationForm((current) => ({ ...current, folder_path: folderBatchPath }));
+    setCalibrationRouteMeta({ source: "folderBatch" });
+    markCalibrationReportHistorical("Ruta sincronizada desde procesamiento masivo. Ejecuta de nuevo Analizar perfil acustico o Probar configuraciones.");
+    if (!calibrationProfile && !calibrationTest && !calibrationReport) {
+      setMessage("Ruta sincronizada desde procesamiento masivo. No se ejecuto analisis automaticamente.");
+    }
+  }
+
+  function useCalibrationPathInFolderBatch() {
+    const calibrationPath = calibrationForm.folder_path.trim();
+    if (!calibrationPath) {
+      setError("No hay ruta escrita en el Asistente de calibracion.");
+      return;
+    }
+    updateFolderBatchField("folder_path", calibrationPath);
+    setMessage("Ruta del asistente copiada al procesamiento masivo. Escanea la carpeta antes de iniciar.");
+  }
+
+  function buildCalibrationPayload(sampleSize = calibrationForm.sample_size) {
+    const folderPath = calibrationForm.folder_path.trim();
     return {
-      ...config,
-      config_name: config.config_name || config.name || config.preset || "personalizado",
+      folder_path: folderPath,
+      label: calibrationForm.label.trim() || "Pristimantis_simoterus",
+      sample_size: Number(sampleSize),
+      noise_type: calibrationForm.noise_type,
+      calibration_mode: calibrationForm.calibration_mode,
+      detection_only: calibrationForm.calibration_mode === "detect",
+      job_allowed_roots: folderPath ? [folderPath] : [],
     };
   }
 
-  function applyFolderBatchConfig(config) {
-    const values = normalizeFolderBatchConfig(config);
+  async function runCalibrationProfile() {
+    if (!calibrationForm.folder_path.trim()) {
+      setError("Escribe la ruta local de la carpeta antes de calibrar.");
+      return;
+    }
+    try {
+      setCalibrationLoading("profile");
+      setError("");
+      setMessage("Analizando perfil acustico de una muestra...");
+      const result = await profileAudioLabCalibrationFolder(buildCalibrationPayload());
+      setCalibrationProfile(result);
+      setCalibrationReport(result);
+      setCalibrationReportHistorical(false);
+      setCalibrationRouteMeta({ source: "report", reportName: calibrationReportTitle(result), reportDate: result.created_at });
+      setMessage(`Perfil acustico listo: ${result.sample_size_used || 0} audio(s) analizados.`);
+    } catch (err) {
+      setError(err.detail?.message || err.message || "No fue posible analizar el perfil acustico.");
+    } finally {
+      setCalibrationLoading("");
+    }
+  }
+
+  async function runCalibrationConfigTest() {
+    if (!calibrationForm.folder_path.trim()) {
+      setError("Escribe la ruta local de la carpeta antes de probar configuraciones.");
+      return;
+    }
+    try {
+      setCalibrationLoading("test");
+      setError("");
+      setMessage("Probando configuraciones en una muestra pequena...");
+      const result = await testAudioLabCalibrationConfigs({
+        ...buildCalibrationPayload(Math.min(Number(calibrationForm.sample_size) || 10, 10)),
+        configs: CALIBRATION_CONFIGS,
+        detection_only: calibrationForm.calibration_mode === "detect",
+      });
+      setCalibrationTest(result);
+      setPreviewReviewStarted(false);
+      setCalibrationReport(result);
+      setCalibrationReportHistorical(false);
+      setCalibrationRouteMeta({ source: "report", reportName: calibrationReportTitle(result), reportDate: result.created_at });
+      setMessage(`Prueba de configuraciones lista. Recomendada: ${result.recommended_config || "revisar tabla"}.`);
+    } catch (err) {
+      setError(err.detail?.message || err.message || "No fue posible probar configuraciones.");
+    } finally {
+      setCalibrationLoading("");
+    }
+  }
+
+  async function runMoreSensitiveCalibrationTest() {
+    if (!calibrationForm.folder_path.trim()) {
+      setError("Escribe la ruta local de la carpeta antes de crear una prueba mas sensible.");
+      return;
+    }
+    try {
+      setCalibrationLoading("sensitive");
+      setError("");
+      setMessage("Probando variante mas sensible sin normalizacion...");
+      const result = await testAudioLabCalibrationConfigs({
+        ...buildCalibrationPayload(Number(calibrationForm.sample_size) || 10),
+        config_definitions: [MORE_SENSITIVE_CALIBRATION_CONFIG],
+        detection_only: false,
+      });
+      setCalibrationTest(result);
+      setPreviewReviewStarted(false);
+      setCalibrationReport(result);
+      setCalibrationReportHistorical(false);
+      setCalibrationRouteMeta({ source: "report", reportName: calibrationReportTitle(result), reportDate: result.created_at });
+      setMessage(`Prueba mas sensible lista. Recomendada: ${result.recommended_config || "revisar reporte"}.`);
+    } catch (err) {
+      setError(err.detail?.message || err.message || "No fue posible crear la prueba mas sensible.");
+    } finally {
+      setCalibrationLoading("");
+    }
+  }
+
+  async function runExploratoryCalibrationTest(config = EXPLORATORY_WIDE_CALIBRATION_CONFIG) {
+    if (!calibrationForm.folder_path.trim()) {
+      setError("Escribe la ruta local de la carpeta antes de crear una prueba exploratoria.");
+      return;
+    }
+    try {
+      setCalibrationLoading(config.name);
+      setError("");
+      setMessage(`${config.label}: solo para encontrar actividad posible; no usar automaticamente para entrenamiento.`);
+      const result = await testAudioLabCalibrationConfigs({
+        ...buildCalibrationPayload(Number(calibrationForm.sample_size) || 10),
+        config_definitions: [config],
+        detection_only: true,
+      });
+      setCalibrationTest(result);
+      setPreviewReviewStarted(false);
+      setCalibrationReport(result);
+      setCalibrationReportHistorical(false);
+      setCalibrationRouteMeta({ source: "report", reportName: calibrationReportTitle(result), reportDate: result.created_at });
+      const found = result.configs?.reduce((total, item) => total + Number(item.total_candidates || 0), 0) || 0;
+      setMessage(
+        config.name === "intermedia_cerrada_estricta" && found === 0
+          ? "La configuracion estricta puede estar perdiendo llamados. Vuelve a intermedia_cerrada_mas_selectiva y revisa manualmente."
+          : `${config.label} lista: ${found} candidato(s). Revisa manualmente antes de entrenar.`
+      );
+    } catch (err) {
+      setError(err.detail?.message || err.message || "No fue posible crear la prueba exploratoria.");
+    } finally {
+      setCalibrationLoading("");
+    }
+  }
+
+  function openCalibrationPreviewsForReview() {
+    const activeConfig = calibrationTest?.recommended_config || recommendedConfigName;
+    const preview = (calibrationTest?.previews || []).find((item) => item.config === activeConfig) || calibrationTest?.previews?.[0];
+    const path = preview?.processed_preview_path || preview?.raw_preview_path;
+    if (!path) {
+      setError("Este reporte no tiene previews disponibles para abrir.");
+      return;
+    }
+    setPreviewReviewStarted(true);
+    window.open(getMediaFileUrl(path), "_blank", "noopener,noreferrer");
+  }
+
+  async function runSelectiveNarrowCalibrationTest() {
+    if (!calibrationForm.folder_path.trim()) {
+      setError("Escribe la ruta local de la carpeta antes de probar variantes mas selectivas.");
+      return;
+    }
+    const baselineDuration = Number(recommendedConfigRow?.total_duration_candidates || 0);
+    try {
+      setCalibrationLoading("selective_narrow");
+      setError("");
+      setMessage("Probando dos variantes mas selectivas en la muestra...");
+      const result = await testAudioLabCalibrationConfigs({
+        ...buildCalibrationPayload(Number(calibrationForm.sample_size) || 10),
+        config_definitions: [
+          EXPLORATORY_NARROW_SELECTIVE_CALIBRATION_CONFIG,
+          EXPLORATORY_NARROW_SELECTIVE_RATIO025_CALIBRATION_CONFIG,
+        ],
+        detection_only: true,
+      });
+      setCalibrationTest(result);
+      setPreviewReviewStarted(false);
+      setCalibrationReport(result);
+      setCalibrationReportHistorical(false);
+      setCalibrationRouteMeta({ source: "report", reportName: calibrationReportTitle(result), reportDate: result.created_at });
+      const candidates = result.configs?.map((item) => Number(item.total_candidates || 0)) || [];
+      const total = candidates.reduce((sum, count) => sum + count, 0);
+      const allZero = candidates.length > 0 && candidates.every((count) => count === 0);
+      const smallSampleCandidate = (result.configs || []).find((item) =>
+        Number(item.total_candidates || 0) > 0 &&
+        Number(item.possible_damage_count || 0) === 0 &&
+        (!baselineDuration || Number(item.total_duration_candidates || 0) < baselineDuration)
+      );
+      setMessage(
+        allZero
+          ? "Las variantes mas selectivas dieron 0 candidatos. Vuelve a intermedia_cerrada y revisa manualmente."
+          : smallSampleCandidate
+            ? `${smallSampleCandidate.label || smallSampleCandidate.config} redujo la duracion candidata y no marco dano. Candidata para muestra pequena, no entrenamiento automatico.`
+            : `Variantes mas selectivas listas: ${total} candidato(s) entre ambas. Revisa clips antes de ampliar el lote.`
+      );
+    } catch (err) {
+      setError(err.detail?.message || err.message || "No fue posible probar variantes mas selectivas.");
+    } finally {
+      setCalibrationLoading("");
+    }
+  }
+
+  function recommendedCalibrationParameters() {
+    return calibrationTest?.recommended_parameters || calibrationProfile?.suggested_parameters || null;
+  }
+
+  function hasCalibrationBaseConfig() {
+    return Boolean(recommendedCalibrationParameters() || calibrationTest?.best_detection_parameters || calibrationTest?.best_cleaning_parameters);
+  }
+
+  function safeCalibrationParameters() {
+    if (!calibrationTest?.safe_recommended_config) return null;
+    const safeItem = calibrationTest.configs?.find((item) => item.config === calibrationTest.safe_recommended_config);
+    if (!calibrationConfigIsSafe(safeItem)) return null;
+    return (
+      calibrationTest?.safe_recommended_parameters ||
+      null
+    );
+  }
+
+  function applyCalibrationToFolderBatch(params = recommendedCalibrationParameters(), options = {}) {
+    if (!params) {
+      setError("Primero analiza o prueba configuraciones para obtener una recomendacion.");
+      return;
+    }
+    const appliedConfigName = params.name || calibrationTest?.recommended_config || "";
+    const isExploratoryApply = options.exploratory === true || isExploratoryConfigName(appliedConfigName);
+    if (isExploratoryApply && !options.skipExploratoryConfirm) {
+      const confirmed = window.confirm("Esta configuración es exploratoria y puede generar falsos candidatos. Úsala solo para una muestra pequeña.");
+      if (!confirmed) return;
+    }
+    const copyFolderPath = options.copyFolderPath === true;
+    const targetFolderPath = copyFolderPath ? calibrationForm.folder_path.trim() : folderBatchForm.folder_path.trim();
+    if (!targetFolderPath) {
+      setError("Escribe la ruta local de la carpeta actual en Procesamiento masivo antes de aplicar parametros.");
+      return;
+    }
+    const picked = pickCalibrationFolderBatchParams(params);
+    const preserveProcessingFlags = Boolean(options.preserveProcessingFlags);
     setFolderBatchForm((current) => ({
       ...current,
-      ...values,
-      preset: values.preset || current.preset || "personalizado",
+      folder_path: copyFolderPath ? calibrationForm.folder_path : current.folder_path,
+      target_label: options.copyLabel ? calibrationForm.label || current.target_label : current.target_label,
+      preset: options.preset || "personalizado",
+      frequency_min_hz: Number(picked.frequency_min_hz ?? current.frequency_min_hz),
+      frequency_max_hz: Number(picked.frequency_max_hz ?? current.frequency_max_hz),
+      threshold_dbfs: Number(picked.threshold_dbfs ?? current.threshold_dbfs),
+      min_band_ratio: Number(picked.min_band_ratio ?? picked.min_band_energy_ratio ?? current.min_band_ratio),
+      min_activity_seconds: Number(picked.min_activity_seconds ?? current.min_activity_seconds),
+      min_silence_seconds: Number(picked.min_silence_seconds ?? current.min_silence_seconds),
+      padding_seconds: Number(picked.padding_seconds ?? current.padding_seconds),
+      clip_duration_seconds: Number(picked.clip_duration_seconds ?? current.clip_duration_seconds),
+      max_segment_seconds: Number(picked.max_segment_seconds ?? current.max_segment_seconds),
+      bandpass: picked.bandpass ?? current.bandpass,
+      noise_reduce: preserveProcessingFlags ? picked.noise_reduce ?? current.noise_reduce : calibrationForm.calibration_mode === "detect" ? false : picked.noise_reduce ?? current.noise_reduce,
+      normalize: picked.normalize ?? current.normalize,
+      discard_empty: picked.discard_empty ?? current.discard_empty,
+      create_clips: picked.create_clips ?? current.create_clips,
+      create_manifest: picked.create_manifest ?? current.create_manifest,
+      exploratory_mode: isExploratoryApply,
+      calibration_mode_tag: isExploratoryApply ? appliedConfigName : "",
     }));
+    setFolderBatchScan(null);
+    setFolderBatchScanState({
+      status: "pending",
+      message: "Parametros aplicados. Escanea la carpeta actual para iniciar un nuevo procesamiento.",
+    });
+    const modeMessage =
+      appliedConfigName === "intermedia_exploratoria"
+        ? "Parametros intermedios aplicados. Revisa clips antes de ampliar el lote."
+        : appliedConfigName === "intermedia_cerrada"
+          ? "Parametros de prueba cerrada aplicados. Revisa clips antes de usarla en lote grande."
+          : isExploratoryApply
+            ? "Parametros exploratorios aplicados. Recomendado: procesar primero una muestra pequena."
+            : "Parametros aplicados. Escanea la carpeta actual para iniciar un nuevo procesamiento.";
+    setMessage(options.messageOverride || modeMessage);
+  }
+
+  function applySafeCalibrationToFolderBatch() {
+    const params = safeCalibrationParameters();
+    if (!params) {
+      setError("Primero prueba configuraciones para obtener una configuracion segura.");
+      return;
+    }
+    if (calibrationReportHistorical || calibrationReportIsFromAnotherFolder) {
+      const confirmed = window.confirm("Este reporte pertenece a otra carpeta. Quieres aplicar solo los parametros a la carpeta actual?");
+      if (!confirmed) return;
+    }
+    applyCalibrationToFolderBatch(params, { preserveProcessingFlags: true, copyFolderPath: false });
+  }
+
+  function applyExploratoryToSmallSample(params = recommendedCalibrationParameters()) {
+    applyCalibrationToFolderBatch(params, { preserveProcessingFlags: true, copyFolderPath: false, exploratory: true });
+  }
+
+  function applySmallBatchReviewToFolderBatch(params = recommendedCalibrationParameters(), row = recommendedConfigRow) {
+    const blockedReason = smallBatchCandidateBlockedReason(row, previewReviewStarted);
+    if (blockedReason) {
+      setError(blockedReason);
+      return;
+    }
+    if (!folderBatchForm.folder_path.trim()) {
+      setError("Escribe primero la ruta actual en Procesamiento masivo.");
+      return;
+    }
+    const confirmed = window.confirm(
+      "Esta configuracion no es segura para todo el lote ni para entrenamiento automatico. Se usara solo para una muestra pequena de revision humana. Continuar?"
+    );
+    if (!confirmed) return;
+    applyCalibrationToFolderBatch(params, {
+      preserveProcessingFlags: true,
+      copyFolderPath: false,
+      exploratory: true,
+      skipExploratoryConfirm: true,
+      messageOverride: "Parametros aplicados para muestra pequena. Escanea la carpeta actual y procesa solo 10-20 audios.",
+    });
+  }
+
+  function applyOnlyCalibrationParametersToCurrentFolder(params = safeCalibrationParameters() || recommendedCalibrationParameters()) {
+    if (!params) {
+      setError("No hay parametros de calibracion para aplicar.");
+      return;
+    }
+    if (!folderBatchForm.folder_path.trim()) {
+      setError("Escribe primero la ruta actual en Procesamiento masivo.");
+      return;
+    }
+    applyCalibrationToFolderBatch(params, { preserveProcessingFlags: true, copyFolderPath: false });
+  }
+
+  function openCalibrationReport() {
+    setCalibrationReport(calibrationTest || calibrationProfile);
+  }
+
+  function openCalibrationDownload(kind) {
+    const paths = calibrationTest?.report_paths || {};
+    const path =
+      kind === "json"
+        ? calibrationProfile?.report_path || paths.json
+        : kind === "csv"
+          ? paths.csv
+          : paths.markdown;
+    if (!path) {
+      setError(kind === "json" ? "Aun no hay reporte JSON para descargar." : "Primero prueba configuraciones para generar CSV/Markdown.");
+      return;
+    }
+    window.open(getMediaFileUrl(path), "_blank", "noopener,noreferrer");
+  }
+
+  function clearSelectedFolderBatchJob(messageText = "Job seleccionado limpiado. No se borraron archivos ni registros.") {
+    setActiveFolderBatchJob(null);
+    setFolderBatchOutputs([]);
+    setFolderBatchSummary(null);
+    setFolderBatchLogs("");
+    setSelectedAudio((current) => current?.kind === "folder_batch_output" ? null : current);
+    setMessage(messageText);
+  }
+
+  function updateFolderBatchField(key, value) {
+    if (key === "folder_path") {
+      const nextPath = String(value || "").trim();
+      const currentPath = folderBatchForm.folder_path.trim();
+      const pathChanged = normalizeFolderPathForCompare(nextPath) !== normalizeFolderPathForCompare(currentPath);
+      if (pathChanged) {
+        if (activeFolderBatchJob && !isFolderBatchJobForPath(activeFolderBatchJob, nextPath)) {
+          setActiveFolderBatchJob(null);
+        }
+        setFolderBatchOutputs([]);
+        setFolderBatchSummary(null);
+        setFolderBatchLogs("");
+        setSelectedAudio((current) => current?.kind === "folder_batch_output" ? null : current);
+      }
+    }
+    setFolderBatchForm((current) => ({ ...current, [key]: value }));
+    if (key === "folder_path" || key === "recursive") {
+      setFolderBatchScan(null);
+      setFolderBatchScanState({
+        status: "pending",
+        message: key === "folder_path" ? "Ruta cambiada. Escanea esta carpeta para crear un nuevo job." : "Cambiaron la carpeta o el modo de búsqueda. Escanea la carpeta actual antes de iniciar.",
+      });
+      if (key === "folder_path") setMessage("Ruta cambiada. Escanea esta carpeta para crear un nuevo job.");
+    }
   }
 
   function applyFolderBatchPreset(preset) {
     const values = FOLDER_BATCH_PRESETS[preset] || {};
-    applyFolderBatchConfig({ ...values, preset });
-  }
-
-  function folderBatchConfigIsExploratory(config = folderBatchForm) {
-    return config.config_name === "exploratory_wide" || config.name === "exploratory_wide" || config.preset === "exploratory_wide" || config.calibration_mode === "exploratory";
-  }
-
-  function folderBatchRecommendationFor(config = folderBatchForm) {
-    if (folderBatchConfigIsExploratory(config)) return "too_many_candidates";
-    return config.calibration_mode === "safe" ? "safe_recommended" : "recommended";
-  }
-
-  function useFolderBatchComparisonRow(config) {
-    if (folderBatchConfigIsExploratory(config)) {
-      const confirmed = window.confirm("Esta configuración puede generar muchos falsos candidatos. Úsala solo para una muestra pequeña.");
-      if (!confirmed) return;
-      const filesFound = Number(folderBatchScan?.files_found || 0);
-      if (filesFound > 20) {
-        const sampleConfirmed = window.confirm(`La carpeta escaneada tiene ${filesFound} audios. Esta configuración queda en modo exploratorio; confirma solo si vas a probar una muestra pequeña, no toda la carpeta.`);
-        if (!sampleConfirmed) return;
-      }
-    }
-    applyFolderBatchConfig(config);
+    setFolderBatchForm((current) => ({
+      ...current,
+      preset,
+      ...values,
+    }));
   }
 
   function buildFolderBatchScanPayload() {
@@ -2298,17 +2962,58 @@ export default function AudioLabPage() {
       setError("Escribe la ruta local de la carpeta antes de escanear.");
       return;
     }
+    scanAbortControllerRef.current?.abort();
+    const controller = new AbortController();
+    scanAbortControllerRef.current = controller;
     try {
       setFolderBatchScanning(true);
+      setFolderBatchScan(null);
+      setFolderBatchScanState({ status: "scanning", message: "Escaneando carpeta local..." });
       setError("");
-      const scan = await scanAudioLabFolderBatch(buildFolderBatchScanPayload());
+      setMessage("Escaneando carpeta local...");
+      const scan = await scanAudioLabFolderBatch(buildFolderBatchScanPayload(), { signal: controller.signal });
+      if (controller.signal.aborted || scanAbortControllerRef.current !== controller) return;
       setFolderBatchScan(scan);
+      setFolderBatchScanState({
+        status: Number(scan.files_found || 0) > 0 ? "ready" : "empty",
+        message: Number(scan.files_found || 0) > 0 ? "Escaneo válido para la carpeta actual." : "No se encontraron audios.",
+      });
       setMessage(`Carpeta escaneada: ${scan.files_found || 0} archivo(s), ${formatBytes(scan.total_size_bytes)}.`);
     } catch (err) {
+      if (controller.signal.aborted || err.name === "AbortError") {
+        if (scanAbortControllerRef.current === controller) {
+          setFolderBatchScan(null);
+          setFolderBatchScanState({ status: "cancelled", message: "El escaneo fue cancelado." });
+          setError("");
+          setMessage("Escaneo cancelado por el usuario.");
+        }
+        return;
+      }
+      if (scanAbortControllerRef.current !== controller) return;
+      setFolderBatchScan(null);
+      setFolderBatchScanState({
+        status: "failed",
+        message: err.message || "No fue posible escanear la carpeta local.",
+      });
       setError(err.message || "No fue posible escanear la carpeta local.");
     } finally {
-      setFolderBatchScanning(false);
+      if (scanAbortControllerRef.current === controller) {
+        scanAbortControllerRef.current = null;
+        setFolderBatchScanning(false);
+      }
     }
+  }
+
+  function cancelFolderBatchScan() {
+    const controller = scanAbortControllerRef.current;
+    if (!controller) return;
+    controller.abort();
+    scanAbortControllerRef.current = null;
+    setFolderBatchScanning(false);
+    setFolderBatchScan(null);
+    setFolderBatchScanState({ status: "cancelled", message: "El escaneo fue cancelado." });
+    setError("");
+    setMessage("Escaneo cancelado por el usuario.");
   }
 
   function buildFolderBatchPayload() {
@@ -2319,8 +3024,6 @@ export default function AudioLabPage() {
       target_label: folderBatchForm.target_label.trim() || "target_species",
       mode: "species_folder_cleanup",
       preset: folderBatchForm.preset,
-      config_name: folderBatchForm.config_name,
-      calibration_mode: folderBatchForm.calibration_mode,
       frequency_min_hz: Number(folderBatchForm.frequency_min_hz),
       frequency_max_hz: Number(folderBatchForm.frequency_max_hz),
       threshold_dbfs: Number(folderBatchForm.threshold_dbfs),
@@ -2343,6 +3046,14 @@ export default function AudioLabPage() {
   }
 
   async function startFolderBatchJob() {
+    if (folderBatchStartDisabledReason) {
+      setError(folderBatchStartDisabledReason);
+      return;
+    }
+    if (folderBatchScanning) {
+      setError("Espera a que termine el escaneo o cancélalo.");
+      return;
+    }
     if (!folderBatchForm.folder_path.trim()) {
       setError("Escribe la ruta local de la carpeta antes de iniciar.");
       return;
@@ -2351,21 +3062,11 @@ export default function AudioLabPage() {
       setError("Escanea la carpeta antes de iniciar el procesamiento.");
       return;
     }
-    if (!folderBatchCanStart) {
-      setError("Ruta cambiada. Escanea la carpeta actual para iniciar un nuevo procesamiento.");
-      return;
-    }
-    if (folderBatchConfigIsExploratory()) {
-      const filesFound = Number(folderBatchScan.files_found || 0);
-      if (filesFound > 20) {
-        const confirmedExploratory = window.confirm(
-          `Esta configuración puede generar muchos falsos candidatos. Úsala solo para una muestra pequeña.\n\nLa carpeta tiene ${filesFound} audios. No se recomienda procesar toda la carpeta con exploratory_wide.`
-        );
-        if (!confirmedExploratory) return;
-      } else {
-        const confirmedSample = window.confirm("Esta configuración es exploratoria. Sirve para encontrar actividad posible, no para procesar toda la carpeta.");
-        if (!confirmedSample) return;
-      }
+    if (folderBatchForm.exploratory_mode && Number(folderBatchScan.files_found || 0) > 20) {
+      const exploratoryConfirmed = window.confirm(
+        "Modo exploratorio activo: esta configuración puede generar falsos candidatos. Hay más de 20 audios. Recomendación: procesa primero una muestra pequeña. ¿Quieres continuar de todos modos?"
+      );
+      if (!exploratoryConfirmed) return;
     }
     const confirmed = window.confirm(
       `Iniciar procesamiento masivo por carpeta?\n\nCarpeta: ${folderBatchForm.folder_path}\nArchivos: ${folderBatchScan.files_found || 0}\nBanda: ${folderBatchForm.frequency_min_hz}-${folderBatchForm.frequency_max_hz} Hz\nDestino: backend/storage/audio_lab/folder_batch_jobs/{job_id}\n\nNo se modificaran ni borraran audios originales.`
@@ -2387,18 +3088,16 @@ export default function AudioLabPage() {
 
   async function refreshFolderBatchJob(jobId, options = {}) {
     try {
-      const [detail, logs, outputs, summary, paths] = await Promise.all([
+      const [detail, logs, outputs, summary] = await Promise.all([
         fetchAudioLabFolderBatchJob(jobId),
         fetchAudioLabFolderBatchLogs(jobId),
         fetchAudioLabFolderBatchOutputs(jobId),
         fetchAudioLabFolderBatchSummary(jobId),
-        fetchAudioLabFolderBatchPaths(jobId),
       ]);
       setActiveFolderBatchJob(detail);
       setFolderBatchLogs(logs.logs || "");
       setFolderBatchOutputs(outputs.items || []);
       setFolderBatchSummary(summary);
-      setFolderBatchPaths(paths);
       setFolderBatchJobs((current) => {
         const exists = current.some((item) => item.id === detail.id);
         return exists ? current.map((item) => (item.id === detail.id ? detail : item)) : [detail, ...current];
@@ -2446,6 +3145,9 @@ export default function AudioLabPage() {
   function openFolderBatchOutputInLab(output) {
     const path = output.output_audio_path || output.audio_path;
     if (!path) return;
+    const jobPath = output.source_folder || folderBatchJobFolderPath(activeFolderBatchJob);
+    const currentFolderPath = folderBatchForm.folder_path.trim();
+    const isHistoricalOutput = Boolean(jobPath && currentFolderPath && !sameFolderPath(jobPath, currentFolderPath));
     resetAnalysisState();
     setUploadedFile(null);
     setSelectedAudio({
@@ -2456,8 +3158,14 @@ export default function AudioLabPage() {
       originalAudioPath: output.original_audio_path || path,
       processingPath: path,
       originLabel: "output procesado",
+      jobId: output.job_id || activeFolderBatchJob?.id,
+      jobName: output.job_name || output.batch_job_name || activeFolderBatchJob?.job_name,
+      jobSourceFolder: jobPath,
+      currentFolderPath,
+      historicalJobOutput: isHistoricalOutput,
       isValid: true,
     });
+    if (isHistoricalOutput) setMessage("Este audio pertenece a un job histórico.");
   }
 
   function feedbackRowFromFolderBatchOutput(output) {
@@ -2503,30 +3211,6 @@ export default function AudioLabPage() {
   function openFolderBatchManifest() {
     if (!activeFolderBatchJob?.id) return;
     window.open(getAudioLabFolderBatchManifestUrl(activeFolderBatchJob.id), "_blank", "noopener,noreferrer");
-  }
-
-  async function openFolderBatchOutputFolder() {
-    if (!activeFolderBatchJob?.id) return;
-    const outputDir = activeFolderBatchOutputDir || activeFolderBatchJob.output_dir;
-    try {
-      const response = await openAudioLabFolderBatchOutputFolder(activeFolderBatchJob.id);
-      const resolvedDir = response.output_dir || outputDir;
-      if (response.opened) {
-        setMessage("Carpeta de outputs abierta desde el backend.");
-        setFolderBatchOutputDialog(null);
-        return;
-      }
-      setFolderBatchOutputDialog({
-        outputDir: resolvedDir,
-        message: response.message || "No se pudo abrir automaticamente. Copia esta ruta y abrela en el Explorador.",
-      });
-    } catch (err) {
-      setFolderBatchOutputDialog({
-        outputDir,
-        message: "No se pudo abrir automaticamente. Copia esta ruta y abrela en el Explorador.",
-      });
-      setError(err.message || "No fue posible abrir la carpeta de outputs.");
-    }
   }
 
   async function copyTextToClipboard(text, successMessage = "Copiado.") {
@@ -3167,6 +3851,7 @@ export default function AudioLabPage() {
     return matchesSearch && matchesStatus && matchesMode && matchesDate && matchesFlag;
   });
   const normalizedFolderBatchSearch = folderBatchSearch.trim().toLowerCase();
+  const folderBatchPath = folderBatchForm.folder_path.trim();
   const filteredFolderBatchJobs = folderBatchJobs.filter((job) => {
     const matchesSearch = !normalizedFolderBatchSearch || [
       job.job_name,
@@ -3176,16 +3861,18 @@ export default function AudioLabPage() {
       job.target_label,
       job.status,
       job.output_dir,
-      job.created_at,
     ].some((value) => String(value || "").toLowerCase().includes(normalizedFolderBatchSearch));
     const matchesStatus = !folderBatchStatusFilter || job.status === folderBatchStatusFilter;
-    return matchesSearch && matchesStatus;
+    const isCurrentFolder = isFolderBatchJobForPath(job, folderBatchPath);
+    const matchesHistory =
+      folderBatchHistoryFilter === "all" ||
+      (folderBatchHistoryFilter === "current" && isCurrentFolder) ||
+      (folderBatchHistoryFilter === "historical" && folderBatchPath && !isCurrentFolder);
+    return matchesSearch && matchesStatus && matchesHistory;
+  }).sort((left, right) => {
+    if (!folderBatchPath || folderBatchHistoryFilter !== "all") return 0;
+    return Number(isFolderBatchJobForPath(right, folderBatchPath)) - Number(isFolderBatchJobForPath(left, folderBatchPath));
   });
-  const folderBatchJobIsHistorical = (job) => Boolean(
-    currentFolderPath &&
-      jobFolderPath(job) &&
-      !sameFolderPath(currentFolderPath, jobFolderPath(job))
-  );
   const folderBatchProgress = activeFolderBatchJob?.total_files
     ? Math.round((Number(activeFolderBatchJob.processed_files || 0) / Number(activeFolderBatchJob.total_files || 1)) * 100)
     : 0;
@@ -3196,9 +3883,11 @@ export default function AudioLabPage() {
     const ratio = Number(output.band_energy_ratio || 0);
     const score = Number(output.activity_score || 0);
     const durationValue = Number(output.duration_seconds || 0);
+    const matchesSelectedJob = !activeFolderBatchJob?.id || output.job_id === activeFolderBatchJob.id;
     const matchesSearch = !searchTerm || [
       output.original_audio_path,
       output.output_audio_path,
+      output.source_folder,
       recommendation,
       flags,
     ].some((value) => String(value || "").toLowerCase().includes(searchTerm));
@@ -3211,8 +3900,266 @@ export default function AudioLabPage() {
       (folderBatchOutputFilter === "review" && recommendation.includes("review"));
     const matchesScore = folderBatchMinScore === "" || score >= Number(folderBatchMinScore);
     const matchesRatio = folderBatchMinRatio === "" || ratio >= Number(folderBatchMinRatio);
-    return matchesSearch && matchesMode && matchesScore && matchesRatio && durationValue >= 0;
+    return matchesSelectedJob && matchesSearch && matchesMode && matchesScore && matchesRatio && durationValue >= 0;
   });
+  const calibrationFolderPath = calibrationForm.folder_path.trim();
+  const calibrationAndFolderBatchDiffer = Boolean(
+    calibrationFolderPath &&
+      folderBatchPath &&
+      !sameFolderPath(calibrationFolderPath, folderBatchPath)
+  );
+  const activeFolderBatchJobFolderPath = folderBatchJobFolderPath(activeFolderBatchJob);
+  const activeFolderBatchJobIsHistorical = Boolean(
+    activeFolderBatchJob &&
+      folderBatchPath &&
+      activeFolderBatchJobFolderPath &&
+      !sameFolderPath(activeFolderBatchJobFolderPath, folderBatchPath)
+  );
+  const calibrationReportPath = calibrationReportFolderPath(calibrationReport || calibrationTest || calibrationProfile);
+  const calibrationReportIsFromAnotherFolder = Boolean(
+    folderBatchPath &&
+      calibrationReportPath &&
+      !sameFolderPath(calibrationReportPath, folderBatchPath)
+  );
+  const calibrationReportVisibleAsHistorical = calibrationReportHistorical || calibrationReportIsFromAnotherFolder || Boolean((calibrationReport || calibrationTest || calibrationProfile)?.legacy_report);
+  const calibrationRouteBadge =
+    calibrationRouteMeta.source === "localStorage"
+      ? "Última ruta usada"
+      : calibrationRouteMeta.source === "report"
+        ? "Ruta desde reporte"
+        : calibrationRouteMeta.source === "folderBatch"
+          ? "Ruta sincronizada desde procesamiento masivo"
+          : calibrationRouteMeta.source === "manual"
+            ? "Ruta escrita manualmente"
+            : "";
+  const calibrationReportInfo = calibrationRouteMeta.source === "report"
+    ? [calibrationRouteMeta.reportName, formatDateTime(calibrationRouteMeta.reportDate)].filter(Boolean).join(" · ")
+    : "";
+  const hasCalibrationBase = hasCalibrationBaseConfig();
+  const calibrationConfigsAllZero = Boolean(calibrationTest?.configs?.length) && calibrationTest.configs.every((item) => Number(item.total_candidates || 0) === 0);
+  const recommendedConfigName = calibrationTest?.recommended_config || recommendedCalibrationParameters()?.name || "";
+  const recommendedConfigRow = calibrationTest?.configs?.find((item) => item.config === recommendedConfigName) || null;
+  const recommendedIsExploratoryWide = recommendedConfigName === "exploratory_wide";
+  const recommendedIsIntermediate = recommendedConfigName === "intermedia_exploratoria";
+  const recommendedIsNarrow = recommendedConfigName === "intermedia_cerrada";
+  const recommendedIsSelectiveNarrow = ["intermedia_cerrada_mas_selectiva", "intermedia_cerrada_mas_selectiva_ratio025"].includes(recommendedConfigName);
+  const recommendedIsStrictNarrow = recommendedConfigName === "intermedia_cerrada_estricta";
+  const recommendedIsExploratory = isExploratoryConfigName(recommendedConfigName);
+  const recommendedTooManyCandidates = recommendedConfigRow?.recommendation === "too_many_candidates";
+  const recommendedUnsafeProbe = isUnsafeExploratoryConfigName(recommendedConfigName, recommendedConfigRow?.recommendation);
+  const recommendedSmallBatchCandidate = calibrationRowIsSmallBatchCandidate(recommendedConfigRow);
+  const smallBatchUseBlockedReason = recommendedSmallBatchCandidate
+    ? smallBatchCandidateBlockedReason(recommendedConfigRow, previewReviewStarted)
+    : "No hay configuracion candidata para muestra pequena.";
+  const smallBatchUseDisabled = Boolean(smallBatchUseBlockedReason);
+  const suggestedIntermediateConfig = calibrationTest?.suggested_intermediate_config || EXPLORATORY_INTERMEDIATE_CALIBRATION_CONFIG;
+  const suggestedNarrowerConfig = calibrationTest?.suggested_narrower_config || EXPLORATORY_NARROW_CALIBRATION_CONFIG;
+  const suggestedNarrowerVariants = calibrationTest?.suggested_narrower_variants || {
+    if_too_many_candidates: {
+      frequency_min_hz: 2200,
+      frequency_max_hz: 3300,
+      threshold_dbfs: -51,
+      min_band_energy_ratio: 0.23,
+      alternative_min_band_energy_ratio: 0.25,
+    },
+    if_zero_candidates: {
+      frequency_min_hz: 1800,
+      frequency_max_hz: 3500,
+      threshold_dbfs: -53,
+      min_band_energy_ratio: 0.18,
+    },
+  };
+  const isExploratoryCalibration =
+    calibrationTest?.configs?.length === 1 && isExploratoryConfigName(calibrationTest.configs[0]?.config);
+  const exploratoryCandidates = isExploratoryCalibration
+    ? Number(calibrationTest.configs[0]?.total_candidates || 0)
+    : 0;
+  const calibrationBestNextStep = calibrationTest?.best_next_step || "";
+  const shouldCreateIntermediate = calibrationBestNextStep === "try_intermediate_config" || (recommendedIsExploratoryWide && recommendedTooManyCandidates);
+  const shouldCreateNarrower = calibrationBestNextStep === "try_narrower_config" || (recommendedIsIntermediate && recommendedTooManyCandidates);
+  const shouldTrySelectiveNarrow = recommendedIsNarrow && recommendedTooManyCandidates;
+  const shouldManualReviewOrTighten = (calibrationBestNextStep === "manual_review_or_tighten" || recommendedIsSelectiveNarrow) && recommendedTooManyCandidates;
+  const selectiveNarrowRows = calibrationTest?.configs?.filter((item) => String(item.config || "").startsWith("intermedia_cerrada_mas_selectiva")) || [];
+  const selectiveNarrowAllZero = Boolean(selectiveNarrowRows.length) && selectiveNarrowRows.every((item) => Number(item.total_candidates || 0) === 0);
+  const strictNarrowAllZero = recommendedIsStrictNarrow && Number(recommendedConfigRow?.total_candidates || 0) === 0;
+  const calibrationStepKey = safeCalibrationParameters()
+    ? "safe"
+    : shouldManualReviewOrTighten || shouldCreateNarrower || recommendedIsNarrow
+      ? "narrow"
+      : shouldCreateIntermediate || recommendedIsIntermediate
+        ? "intermediate"
+        : recommendedIsExploratoryWide || isExploratoryCalibration
+          ? "wide"
+          : calibrationTest?.configs?.length
+            ? "compare"
+            : "profile";
+  const calibrationStepIndex = Math.max(0, CALIBRATION_STEP_DEFINITIONS.findIndex(([key]) => key === calibrationStepKey));
+  const calibrationStateTitle = calibrationConfigsAllZero
+    ? "No se detectaron candidatos con las configuraciones iniciales."
+    : shouldCreateIntermediate
+      ? "Actividad encontrada, pero filtros demasiado amplios."
+    : shouldCreateNarrower
+      ? "La configuracion intermedia encontro actividad y no marco dano, pero todavia es demasiado amplia."
+      : shouldManualReviewOrTighten
+        ? "La configuracion detecta actividad sin dano, pero todavia puede incluir ruido."
+        : recommendedIsNarrow
+          ? "Configuracion mas cerrada actual."
+          : safeCalibrationParameters()
+            ? "Configuracion segura candidata."
+            : "Asistente listo para calibrar.";
+  const calibrationStateExplanation = calibrationConfigsAllZero
+    ? "Esto no significa que no haya rana. Puede indicar que la banda, threshold o ratio son demasiado estrictos."
+    : shouldCreateIntermediate
+      ? "La configuracion exploratoria sirve para encontrar actividad posible, pero puede incluir lluvia, viento o falsos candidatos."
+    : shouldCreateNarrower
+      ? "Buena senal, pero falta cerrar filtros antes de procesar toda la carpeta."
+      : shouldManualReviewOrTighten
+        ? "Revisa manualmente el preview o prueba una configuracion mas estricta. No es segura para lote grande ni entrenamiento automatico."
+        : recommendedIsNarrow
+          ? "Configuracion mas especifica. Revisa los clips antes de usarla en mas audios."
+          : safeCalibrationParameters()
+            ? "Puedes aplicarla a la carpeta actual, pero requiere revision humana antes de entrenamiento."
+            : "Primero analiza el perfil y compara configuraciones en una muestra pequena.";
+  const safeUnavailableReasons = [];
+  if (!safeCalibrationParameters()) {
+    if (calibrationConfigsAllZero) safeUnavailableReasons.push("No hay configuracion segura porque no hubo candidatos.");
+    if (recommendedUnsafeProbe || recommendedIsExploratoryWide) safeUnavailableReasons.push("No hay configuracion segura porque la configuracion es exploratoria.");
+    if (recommendedTooManyCandidates || shouldCreateIntermediate || shouldCreateNarrower) safeUnavailableReasons.push("No hay configuracion segura porque todavia hay demasiados candidatos.");
+    if (Number(recommendedConfigRow?.possible_damage_count || 0) > 0) safeUnavailableReasons.push("No hay configuracion segura porque hay possible_damage.");
+    if (!safeUnavailableReasons.length) safeUnavailableReasons.push("Primero ejecuta Probar configuraciones. Este boton se activa cuando existe una configuracion segura confirmada.");
+  }
+  const safeCalibrationDisabledReason = safeCalibrationParameters()
+    ? ""
+    : recommendedIsExploratoryWide
+      ? "exploratory_wide es exploratoria: no es una configuración segura."
+      : recommendedTooManyCandidates
+        ? "La configuración encontró actividad, pero es demasiado amplia. Puede incluir lluvia, viento o falsos candidatos."
+        : calibrationConfigsAllZero
+          ? "No hay configuración segura porque ninguna produjo candidatos evaluables."
+          : "Primero ejecuta Probar configuraciones. Este botón se activa cuando existe una configuración segura confirmada.";
+  const moreSensitiveDisabledReason = hasCalibrationBase ? "" : "Primero analiza o prueba configuraciones.";
+  const guidedSafeCalibrationDisabledReason = safeCalibrationParameters() ? "" : safeUnavailableReasons[0] || safeCalibrationDisabledReason;
+  const recommendedActionLabel = safeCalibrationParameters()
+    ? "Usar configuracion segura en carpeta"
+    : shouldManualReviewOrTighten
+      ? "Abrir previews para revisar"
+      : shouldTrySelectiveNarrow
+      ? "Probar mas selectiva"
+      : shouldCreateNarrower
+      ? "Crear configuracion mas cerrada"
+      : shouldCreateIntermediate
+        ? "Crear configuracion intermedia"
+        : "Crear prueba exploratoria amplia";
+  const runRecommendedCalibrationAction = () => {
+    if (safeCalibrationParameters()) {
+      applySafeCalibrationToFolderBatch();
+      return;
+    }
+    if (shouldManualReviewOrTighten) {
+      openCalibrationPreviewsForReview();
+      return;
+    }
+    if (shouldCreateNarrower) {
+      runExploratoryCalibrationTest(suggestedNarrowerConfig);
+      return;
+    }
+    if (shouldTrySelectiveNarrow) {
+      runSelectiveNarrowCalibrationTest();
+      return;
+    }
+    if (shouldCreateIntermediate) {
+      runExploratoryCalibrationTest(suggestedIntermediateConfig);
+      return;
+    }
+    runExploratoryCalibrationTest();
+  };
+  const recommendationPanelTitle = safeCalibrationParameters()
+    ? "Configuracion segura candidata"
+    : recommendedIsExploratoryWide
+      ? "Configuracion exploratoria actual"
+      : recommendedIsIntermediate
+        ? "Configuracion intermedia actual"
+        : recommendedIsNarrow
+          ? "Configuracion mas cerrada actual"
+          : recommendedIsSelectiveNarrow
+            ? "Configuracion mas selectiva actual"
+            : recommendedIsStrictNarrow
+              ? "Configuracion estricta actual"
+          : "Recomendacion actual";
+  const recommendationPanelBadge = safeCalibrationParameters()
+    ? "Segura para prueba"
+    : recommendedIsExploratoryWide
+      ? "Exploratoria"
+      : recommendedIsIntermediate
+        ? "Intermedia"
+        : recommendedIsNarrow
+          ? "Prueba cerrada"
+          : recommendedIsSelectiveNarrow
+            ? "Muestra pequena"
+            : recommendedIsStrictNarrow
+              ? "Prueba estricta"
+          : calibrationTest?.recommended_config || recommendedCalibrationParameters()?.name || "balanceada";
+  const recommendationPanelMessage = safeCalibrationParameters()
+    ? "Puedes aplicarla a la carpeta actual, pero requiere revision humana antes de entrenamiento."
+    : recommendedIsExploratoryWide
+      ? "No usar para procesamiento masivo ni entrenamiento sin revisar."
+      : recommendedIsIntermediate
+        ? "Encontro actividad, pero todavia puede incluir ruido."
+        : recommendedIsNarrow
+          ? "Revisa los clips antes de usarla en mas audios."
+          : recommendedIsSelectiveNarrow
+            ? "Detecta actividad sin dano, pero todavia puede incluir ruido. Revisa manualmente el preview."
+            : recommendedIsStrictNarrow
+              ? "Si da 0 candidatos, puede estar perdiendo llamados."
+          : "";
+  const reportKindLabel =
+    calibrationReport?.report_type === "audio_folder_profile"
+      ? "Perfil acústico: sugiere parámetros."
+      : calibrationReport?.report_type === "audio_processing_config_test" && calibrationReport?.configs?.length === 1 && calibrationReport?.configs?.[0]?.config === "variante_mas_sensible"
+        ? "Prueba más sensible: busca más candidatos."
+        : calibrationReport?.report_type === "audio_processing_config_test"
+          ? "Comparación de configuraciones: valida seguridad."
+          : "";
+  const calibrationNextStep =
+    calibrationReport?.report_type === "audio_folder_profile"
+      ? "Siguiente paso recomendado: Probar configuraciones."
+      : calibrationReport?.configs?.length && calibrationReport.configs.every((item) => Number(item.total_candidates || 0) === 0)
+        ? "Siguiente paso recomendado: Crear prueba exploratoria amplia."
+      : calibrationReport?.best_next_step === "try_intermediate_config" || recommendedTooManyCandidates
+        ? "Siguiente paso recomendado: Crear configuración intermedia."
+      : calibrationReport?.incremental_recommendation?.triggered
+        ? "Siguiente paso recomendado: Crear prueba más sensible."
+        : safeCalibrationParameters()
+          ? "Siguiente paso recomendado: Usar configuración segura en carpeta."
+          : "";
+  const guidedCalibrationNextStep = `Siguiente paso recomendado: ${recommendedActionLabel}.`;
+  const folderBatchJobInProgress = ["pending", "running", "paused"].includes(activeFolderBatchJob?.status || "");
+  const activeFolderBatchJobFinished = ["completed", "failed", "cancelled", "canceled"].includes(activeFolderBatchJob?.status || "");
+  const folderBatchStartDisabledReason = (() => {
+    if (activeFolderBatchJobIsHistorical) return "Hay un job histórico seleccionado. Escanea la carpeta actual para iniciar uno nuevo.";
+    if (folderBatchJobInProgress || folderBatchSubmitting) return "Hay un procesamiento en curso.";
+    if (folderBatchScanning) return "Hay un escaneo en curso. Espera a que termine o cancélalo.";
+    if (!folderBatchForm.folder_path.trim()) return "Primero escanea la carpeta.";
+    if (folderBatchScanState.status === "failed") {
+      return /no existe|not exist|not found|no encontrada|does not exist/i.test(folderBatchScanState.message || "")
+        ? "La carpeta no existe."
+        : folderBatchScanState.message || "No fue posible escanear la carpeta.";
+    }
+    if (folderBatchScanState.status === "cancelled") return "El escaneo fue cancelado.";
+    if (!folderBatchScan) return "Primero escanea la carpeta.";
+    if (Number(folderBatchScan.files_found || 0) <= 0) return "No se encontraron audios.";
+    return "";
+  })();
+  const folderBatchStartDisabled = Boolean(folderBatchStartDisabledReason);
+  const folderBatchCalibrationModeTag = folderBatchForm.calibration_mode_tag || "";
+  const folderBatchCalibrationModeInfo =
+    folderBatchCalibrationModeTag === "exploratory_wide"
+      ? { badge: "Modo exploratorio", message: "Esta configuracion puede generar falsos candidatos. Usala solo en una muestra pequena.", tone: "warning" }
+      : folderBatchCalibrationModeTag === "intermedia_exploratoria"
+        ? { badge: "Modo intermedio", message: "Encontro actividad, pero puede seguir siendo amplia. Revisa clips.", tone: "info" }
+        : folderBatchCalibrationModeTag === "intermedia_cerrada"
+          ? { badge: "Prueba cerrada", message: "Configuracion mas especifica. Revisa clips antes de usarla en lote grande.", tone: "info" }
+          : null;
 
   return (
     <div className="space-y-6 p-6 text-slate-800 dark:text-slate-100">
@@ -3822,11 +4769,466 @@ python -m uvicorn ml_api.main:app --host 127.0.0.1 --port 8010 --reload`}
         </div>
       </SectionCard>
 
+      <SectionCard title="Asistente de calibración acústica" subtitle="Antes de procesar una carpeta grande, analiza una muestra para encontrar parámetros adecuados. Recomendado para audios con lluvia, viento, río o ruido constante.">
+        <div className="space-y-5">
+          <div className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-950">
+            <p className="font-semibold">Flujo recomendado para Pristimantis_simoterus: muestra pequeña, comparación de configuraciones y revisión de calidad antes de procesar toda la carpeta.</p>
+            <p className="mt-1">Para lluvia/río, empieza con bandpass, reducción de ruido suave, sin normalización agresiva antes de detectar y revisa el reporte de calidad.</p>
+          </div>
+
+          <div className="grid gap-4 xl:grid-cols-[minmax(0,0.95fr)_minmax(0,1.05fr)]">
+            <div className="space-y-4">
+              <label className="block text-sm">
+                <span className="mb-1 flex flex-wrap items-center gap-2 font-semibold text-slate-700">
+                  Ruta de carpeta local
+                  {calibrationRouteBadge ? <Badge tone={calibrationRouteMeta.source === "localStorage" ? "warning" : calibrationRouteMeta.source === "report" ? "info" : calibrationRouteMeta.source === "folderBatch" ? "success" : "default"}>{calibrationRouteBadge}</Badge> : null}
+                  {calibrationReportVisibleAsHistorical ? <Badge tone="warning">Reporte histórico</Badge> : null}
+                </span>
+                <div className="flex flex-wrap gap-2">
+                  <input value={calibrationForm.folder_path} onChange={(event) => updateCalibrationField("folder_path", event.target.value)} placeholder="C:\\Datos\\Ranas\\lote_01" className="min-w-0 flex-1 rounded-lg border border-slate-300 px-3 py-2" />
+                  <button type="button" onClick={clearCalibrationPath} disabled={!calibrationForm.folder_path} className="rounded-lg border border-slate-300 px-3 py-2 text-xs font-semibold disabled:opacity-50">Limpiar ruta</button>
+                  <button type="button" onClick={() => useFolderBatchPathInCalibration()} disabled={!folderBatchForm.folder_path.trim()} className="rounded-lg border border-blue-300 bg-blue-50 px-3 py-2 text-xs font-semibold text-blue-800 disabled:opacity-50">Usar ruta de procesamiento masivo</button>
+                </div>
+                {calibrationRouteMeta.source === "localStorage" ? (
+                  <p className="mt-2 text-xs text-amber-700">Esta ruta viene de la ultima ruta usada guardada en este navegador. No se ejecutara analisis automaticamente.</p>
+                ) : null}
+                {calibrationRouteMeta.source === "report" && calibrationReportInfo ? (
+                  <p className="mt-2 text-xs text-blue-700">{calibrationReportInfo}</p>
+                ) : null}
+                {calibrationRouteMeta.source === "folderBatch" ? (
+                  <p className="mt-2 text-xs text-emerald-700">Copiada desde el formulario de Procesamiento masivo por carpeta local. No se ejecutara analisis automaticamente.</p>
+                ) : null}
+              </label>
+              {calibrationAndFolderBatchDiffer ? (
+                <div className="rounded-lg border border-amber-300 bg-amber-50 p-3 text-sm text-amber-950">
+                  <p className="font-bold">La ruta del asistente es diferente a la ruta del procesamiento masivo.</p>
+                  <p className="mt-1"><strong>Ruta del asistente:</strong> <span className="break-all font-mono">{calibrationFolderPath}</span></p>
+                  <p className="mt-1"><strong>Ruta del procesamiento masivo:</strong> <span className="break-all font-mono">{folderBatchPath}</span></p>
+                  <div className="mt-3 flex flex-wrap gap-2">
+                    <button type="button" onClick={useCalibrationPathInFolderBatch} className="rounded-lg border border-amber-300 bg-white px-3 py-2 text-xs font-semibold">Usar ruta del asistente en procesamiento</button>
+                    <button type="button" onClick={() => useFolderBatchPathInCalibration(true)} className="rounded-lg border border-amber-300 bg-white px-3 py-2 text-xs font-semibold">Usar ruta del procesamiento en asistente</button>
+                  </div>
+                </div>
+              ) : null}
+              {calibrationReportVisibleAsHistorical ? (
+                <p className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-xs font-semibold text-amber-900">
+                  Este reporte pertenece a otra carpeta o a una ejecución anterior. Puedes verlo como histórico y copiar solo parámetros sin copiar la ruta.
+                </p>
+              ) : null}
+              <div className="grid gap-3 md:grid-cols-4">
+                <label className="text-sm md:col-span-1">
+                  <span className="mb-1 block font-semibold text-slate-700">Especie objetivo</span>
+                  <input value={calibrationForm.label} onChange={(event) => updateCalibrationField("label", event.target.value)} className="w-full rounded-lg border border-slate-300 px-3 py-2" />
+                </label>
+                <label className="text-sm">
+                  <span className="mb-1 block font-semibold text-slate-700">Tamaño de muestra</span>
+                  <select value={calibrationForm.sample_size} onChange={(event) => updateCalibrationField("sample_size", Number(event.target.value))} className="w-full rounded-lg border border-slate-300 px-3 py-2">
+                    {[5, 10, 20, 50].map((size) => <option key={size} value={size}>{size}</option>)}
+                  </select>
+                </label>
+                <label className="text-sm">
+                  <span className="mb-1 block font-semibold text-slate-700">Ruido predominante</span>
+                  <select value={calibrationForm.noise_type} onChange={(event) => updateCalibrationField("noise_type", event.target.value)} className="w-full rounded-lg border border-slate-300 px-3 py-2">
+                    {["lluvia", "río", "viento", "insectos", "tráfico", "mezcla"].map((noise) => <option key={noise} value={noise}>{noise}</option>)}
+                  </select>
+                </label>
+                <label className="text-sm">
+                  <span className="mb-1 block font-semibold text-slate-700">Modo de calibración</span>
+                  <select value={calibrationForm.calibration_mode} onChange={(event) => updateCalibrationField("calibration_mode", event.target.value)} className="w-full rounded-lg border border-slate-300 px-3 py-2">
+                    <option value="detect">Detectar y cortar candidatos</option>
+                    <option value="clean">Limpiar audio</option>
+                    <option value="compare">Comparar ambos</option>
+                  </select>
+                </label>
+              </div>
+
+              <div className="grid gap-3 text-sm md:grid-cols-2">
+                <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
+                  <p className="font-semibold text-slate-800">Threshold dBFS</p>
+                  <p className="mt-1 text-xs text-slate-600">Threshold dBFS controla qué tan fuerte debe ser una señal para considerarse actividad. Valores más bajos detectan cantos suaves pero pueden incluir más lluvia/río. Valores más altos filtran ruido pero pueden perder cantos lejanos.</p>
+                </div>
+                <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
+                  <p className="font-semibold text-slate-800">Ratio energía banda</p>
+                  <p className="mt-1 text-xs text-slate-600">Exige que una parte importante de la energía esté dentro de la banda donde canta la especie. Es clave cuando hay lluvia o río.</p>
+                </div>
+              </div>
+
+              <div className="rounded-lg border border-blue-200 bg-blue-50 p-3 text-sm text-blue-950">
+                <div className="flex flex-wrap gap-2">
+                  {CALIBRATION_STEP_DEFINITIONS.map(([key, label], index) => (
+                    <span
+                      key={key}
+                      className={`rounded-full border px-3 py-1 text-xs font-semibold ${
+                        index === calibrationStepIndex
+                          ? "border-blue-700 bg-blue-700 text-white"
+                          : index < calibrationStepIndex
+                            ? "border-emerald-300 bg-emerald-50 text-emerald-900"
+                            : "border-slate-300 bg-white text-slate-600"
+                      }`}
+                    >
+                      {index + 1}. {label}
+                    </span>
+                  ))}
+                </div>
+                <div className="mt-3 grid gap-2 md:grid-cols-[minmax(0,1fr)_auto] md:items-center">
+                  <div>
+                    <p className="font-bold">{calibrationStateTitle}</p>
+                    <p className="mt-1 text-xs">{calibrationStateExplanation}</p>
+                    {!safeCalibrationParameters() ? (
+                      <ul className="mt-2 list-disc space-y-1 pl-5 text-xs">
+                        {safeUnavailableReasons.map((reason) => <li key={reason}>{reason}</li>)}
+                      </ul>
+                    ) : null}
+                  </div>
+                  <button
+                    type="button"
+                    onClick={runRecommendedCalibrationAction}
+                    disabled={Boolean(calibrationLoading) || !calibrationFolderPath || (safeCalibrationParameters() && !folderBatchPath)}
+                    className="rounded-lg bg-blue-700 px-4 py-2 text-sm font-semibold text-white disabled:opacity-50"
+                  >
+                    <LoadingText loading={Boolean(calibrationLoading && [suggestedIntermediateConfig.name, suggestedNarrowerConfig.name, "selective_narrow", "exploratory_wide"].includes(calibrationLoading))} loadingText="Probando...">
+                      Siguiente paso recomendado: {recommendedActionLabel}
+                    </LoadingText>
+                  </button>
+                </div>
+              </div>
+
+              <div className="flex flex-wrap gap-2">
+                <button type="button" onClick={runCalibrationProfile} disabled={Boolean(calibrationLoading) || !calibrationFolderPath} className="rounded-lg bg-amber-600 px-4 py-2 text-sm font-semibold text-white disabled:opacity-50">
+                  <LoadingText loading={calibrationLoading === "profile"} loadingText="Analizando...">Analizar perfil acústico</LoadingText>
+                </button>
+                <button type="button" onClick={runCalibrationConfigTest} disabled={Boolean(calibrationLoading) || !calibrationFolderPath} className="rounded-lg bg-emerald-600 px-4 py-2 text-sm font-semibold text-white disabled:opacity-50">
+                  <LoadingText loading={calibrationLoading === "test"} loadingText="Probando...">Probar configuraciones</LoadingText>
+                </button>
+                <button type="button" onClick={runMoreSensitiveCalibrationTest} disabled={Boolean(calibrationLoading) || !calibrationFolderPath || !hasCalibrationBase} title={hasCalibrationBase ? "Crear prueba más sensible: detecta más cantos suaves bajando threshold/ratio." : moreSensitiveDisabledReason} className="rounded-lg bg-teal-700 px-4 py-2 text-sm font-semibold text-white disabled:opacity-50">
+                  <LoadingText loading={calibrationLoading === "sensitive"} loadingText="Probando...">Crear prueba más sensible</LoadingText>
+                </button>
+                <button type="button" onClick={() => recommendedIsExploratory ? applyExploratoryToSmallSample() : applyCalibrationToFolderBatch()} disabled={!recommendedCalibrationParameters() || recommendedUnsafeProbe || shouldCreateNarrower} className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-semibold text-white disabled:opacity-50">
+                  {recommendedIsExploratory ? "Aplicar exploratoria a muestra" : "Aplicar configuración recomendada"}
+                </button>
+                {shouldCreateIntermediate || recommendedIsExploratoryWide ? (
+                  <button type="button" onClick={() => runExploratoryCalibrationTest(suggestedIntermediateConfig)} disabled={Boolean(calibrationLoading) || !calibrationFolderPath || calibrationConfigsAllZero} title={calibrationConfigsAllZero ? "Disponible despues de que la prueba exploratoria encuentre candidatos." : ""} className="rounded-lg bg-blue-700 px-4 py-2 text-sm font-semibold text-white disabled:opacity-50">
+                    <LoadingText loading={calibrationLoading === suggestedIntermediateConfig.name} loadingText="Probando...">Crear configuración intermedia</LoadingText>
+                  </button>
+                ) : null}
+                {shouldCreateNarrower ? (
+                  <button type="button" onClick={() => runExploratoryCalibrationTest(suggestedNarrowerConfig)} disabled={Boolean(calibrationLoading) || !calibrationFolderPath} className="rounded-lg bg-indigo-700 px-4 py-2 text-sm font-semibold text-white disabled:opacity-50">
+                    <LoadingText loading={calibrationLoading === suggestedNarrowerConfig.name} loadingText="Probando...">Crear configuracion mas cerrada</LoadingText>
+                  </button>
+                ) : null}
+                {shouldTrySelectiveNarrow ? (
+                  <button type="button" onClick={runSelectiveNarrowCalibrationTest} disabled={Boolean(calibrationLoading) || !calibrationFolderPath} className="rounded-lg bg-indigo-800 px-4 py-2 text-sm font-semibold text-white disabled:opacity-50">
+                    <LoadingText loading={calibrationLoading === "selective_narrow"} loadingText="Probando...">Probar mas selectiva</LoadingText>
+                  </button>
+                ) : null}
+                {shouldManualReviewOrTighten ? (
+                  <>
+                    <button type="button" onClick={openCalibrationPreviewsForReview} className="rounded-lg border border-indigo-300 bg-indigo-50 px-4 py-2 text-sm font-semibold text-indigo-900">
+                      Abrir previews para revisar
+                    </button>
+                    <button type="button" onClick={() => applySmallBatchReviewToFolderBatch()} disabled={smallBatchUseDisabled} title={smallBatchUseDisabled ? smallBatchUseBlockedReason : "Copiar solo parametros para una muestra pequena de revision humana."} className="rounded-lg border border-amber-300 bg-amber-50 px-4 py-2 text-sm font-semibold text-amber-900 disabled:opacity-50">
+                      Usar en muestra pequena
+                    </button>
+                    <button type="button" onClick={() => runExploratoryCalibrationTest(EXPLORATORY_NARROW_STRICT_CALIBRATION_CONFIG)} disabled={Boolean(calibrationLoading) || !calibrationFolderPath} className="rounded-lg bg-slate-800 px-4 py-2 text-sm font-semibold text-white disabled:opacity-50">
+                      <LoadingText loading={calibrationLoading === "intermedia_cerrada_estricta"} loadingText="Probando...">Probar mas estricta</LoadingText>
+                    </button>
+                  </>
+                ) : null}
+                <button type="button" onClick={applySafeCalibrationToFolderBatch} disabled={!safeCalibrationParameters()} title={safeCalibrationParameters() ? "Aplica la configuración segura confirmada al procesamiento masivo." : guidedSafeCalibrationDisabledReason} className="rounded-lg bg-sky-700 px-4 py-2 text-sm font-semibold text-white disabled:opacity-50">
+                  Usar configuración segura en carpeta
+                </button>
+                <button type="button" onClick={() => applyOnlyCalibrationParametersToCurrentFolder()} disabled={!folderBatchPath || (!safeCalibrationParameters() && !recommendedCalibrationParameters())} className="rounded-lg border border-blue-300 bg-blue-50 px-4 py-2 text-sm font-semibold text-blue-800 disabled:opacity-50">
+                  Aplicar solo parámetros a carpeta actual
+                </button>
+                <button type="button" onClick={openCalibrationReport} disabled={!calibrationProfile && !calibrationTest} className="rounded-lg border border-slate-300 px-4 py-2 text-sm font-semibold disabled:opacity-50">
+                  Ver reporte
+                </button>
+              </div>
+              <div className="space-y-1 text-xs text-slate-600">
+                <p>Crear prueba más sensible: detecta más cantos suaves bajando threshold/ratio.</p>
+                {!hasCalibrationBase ? <p className="font-semibold text-amber-700">{moreSensitiveDisabledReason}</p> : null}
+                {!safeCalibrationParameters() ? <p className="font-semibold text-amber-700">{guidedSafeCalibrationDisabledReason}</p> : null}
+                {calibrationProfile && !calibrationTest ? (
+                  <p className="font-semibold text-blue-700">Este perfil solo sugiere parámetros. Para confirmar seguridad, ejecuta Probar configuraciones.</p>
+                ) : null}
+              </div>
+              {calibrationConfigsAllZero ? (
+                <div className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-xs text-amber-950">
+                  <p className="font-semibold">No se detectaron candidatos en la muestra con estas configuraciones. Esto no significa que no haya rana; puede indicar que la banda, threshold o ratio son demasiado estrictos.</p>
+                  <ul className="mt-2 list-disc space-y-1 pl-5">
+                    <li>La muestra es muy pequeña.</li>
+                    <li>Los audios elegidos no tienen canto.</li>
+                    <li>La especie canta fuera de la banda configurada.</li>
+                    <li>Threshold dBFS demasiado alto.</li>
+                    <li>Ratio de energía en banda demasiado alto.</li>
+                    <li>Ruido de lluvia/viento tapa la señal.</li>
+                  </ul>
+                  <button type="button" onClick={() => runExploratoryCalibrationTest()} disabled={Boolean(calibrationLoading) || !calibrationFolderPath} className="mt-3 rounded-lg bg-amber-700 px-3 py-2 text-xs font-semibold text-white disabled:opacity-50">
+                    <LoadingText loading={calibrationLoading === "exploratory_wide"} loadingText="Probando...">Crear prueba exploratoria amplia</LoadingText>
+                  </button>
+                  <p className="mt-2 font-semibold">Solo para encontrar actividad posible. No usar automáticamente para entrenamiento.</p>
+                </div>
+              ) : null}
+              {isExploratoryCalibration ? (
+                <div className="rounded-lg border border-blue-200 bg-blue-50 p-3 text-xs text-blue-950">
+                  {exploratoryCandidates > 0 ? (
+                    <>
+                      <p className="font-semibold">La prueba exploratoria encontró {exploratoryCandidates} candidato(s). Cierra gradualmente antes de procesar una carpeta grande.</p>
+                      <ul className="mt-2 list-disc space-y-1 pl-5">
+                        <li>A. Subir threshold a -52 dBFS.</li>
+                        <li>B. Subir ratio a 0.20.</li>
+                        <li>C. Ajustar banda según energía dominante.</li>
+                      </ul>
+                      <button type="button" onClick={() => runExploratoryCalibrationTest(EXPLORATORY_INTERMEDIATE_CALIBRATION_CONFIG)} disabled={Boolean(calibrationLoading) || !calibrationFolderPath} className="mt-3 rounded-lg bg-blue-700 px-3 py-2 text-xs font-semibold text-white disabled:opacity-50">
+                        Crear prueba intermedia
+                      </button>
+                    </>
+                  ) : (
+                    <>
+                      <p className="font-semibold">La prueba exploratoria tampoco encontró candidatos. Puede que la muestra no contenga cantos detectables.</p>
+                      <p className="mt-2">Revisa manualmente el espectrograma de 2-3 audios y prueba bandas alternativas: 1000-3000 Hz, 2000-5000 Hz o 3000-7000 Hz.</p>
+                    </>
+                  )}
+                </div>
+              ) : null}
+
+              <div className="flex flex-wrap gap-2">
+                <button type="button" onClick={() => openCalibrationDownload("json")} className="rounded-lg border border-slate-300 px-3 py-2 text-xs font-semibold">Descargar JSON</button>
+                <button type="button" onClick={() => openCalibrationDownload("csv")} className="rounded-lg border border-slate-300 px-3 py-2 text-xs font-semibold">Descargar CSV</button>
+                <button type="button" onClick={() => openCalibrationDownload("markdown")} className="rounded-lg border border-slate-300 px-3 py-2 text-xs font-semibold">Descargar Markdown</button>
+              </div>
+            </div>
+
+            <div className="space-y-4">
+              {recommendedCalibrationParameters() ? (
+                <div className="rounded-lg border border-emerald-200 bg-white p-4">
+                  <div className="flex flex-wrap items-start justify-between gap-3">
+                    <div>
+                      <h3 className="font-bold text-emerald-950">{recommendationPanelTitle}</h3>
+                      <p className="mt-1 text-xs text-slate-500">{recommendedCalibrationParameters().rationale || "Configura una prueba para comparar opciones."}</p>
+                    </div>
+                    <Badge tone={safeCalibrationParameters() ? "success" : recommendedIsExploratory ? "warning" : "info"}>{recommendationPanelBadge}</Badge>
+                  </div>
+                  {recommendationPanelMessage ? (
+                    <p className="mt-3 rounded-lg border border-amber-200 bg-amber-50 p-2 text-xs font-semibold text-amber-900">
+                      {recommendationPanelMessage}
+                    </p>
+                  ) : null}
+                  {recommendedTooManyCandidates ? (
+                    <p className="mt-3 rounded-lg border border-amber-200 bg-amber-50 p-2 text-xs font-semibold text-amber-900">
+                      La configuración encontró actividad, pero es demasiado amplia. Puede incluir lluvia, viento o falsos candidatos.
+                    </p>
+                  ) : null}
+                  {shouldCreateNarrower || recommendedIsNarrow ? (
+                    <div className="mt-3 rounded-lg border border-indigo-200 bg-indigo-50 p-3 text-xs text-indigo-950">
+                      <p className="font-semibold">Variantes sugeridas despues de la prueba cerrada</p>
+                      <p className="mt-1">
+                        Si sigue demasiado amplia: {suggestedNarrowerVariants.if_too_many_candidates.frequency_min_hz}-{suggestedNarrowerVariants.if_too_many_candidates.frequency_max_hz} Hz,
+                        threshold {suggestedNarrowerVariants.if_too_many_candidates.threshold_dbfs} dBFS,
+                        ratio {suggestedNarrowerVariants.if_too_many_candidates.min_band_energy_ratio} o {suggestedNarrowerVariants.if_too_many_candidates.alternative_min_band_energy_ratio || 0.25}.
+                      </p>
+                      <p className="mt-1">
+                        Si da 0 candidatos: {suggestedNarrowerVariants.if_zero_candidates.frequency_min_hz}-{suggestedNarrowerVariants.if_zero_candidates.frequency_max_hz} Hz,
+                        threshold {suggestedNarrowerVariants.if_zero_candidates.threshold_dbfs} dBFS,
+                        ratio {suggestedNarrowerVariants.if_zero_candidates.min_band_energy_ratio}.
+                      </p>
+                      {shouldTrySelectiveNarrow ? (
+                        <button type="button" onClick={runSelectiveNarrowCalibrationTest} disabled={Boolean(calibrationLoading) || !calibrationFolderPath} className="mt-3 rounded-lg bg-indigo-800 px-3 py-2 text-xs font-semibold text-white disabled:opacity-50">
+                          <LoadingText loading={calibrationLoading === "selective_narrow"} loadingText="Probando...">Probar mas selectiva</LoadingText>
+                        </button>
+                      ) : null}
+                    </div>
+                  ) : null}
+                  {selectiveNarrowAllZero ? (
+                    <p className="mt-3 rounded-lg border border-amber-200 bg-amber-50 p-2 text-xs font-semibold text-amber-900">
+                      Ambas variantes mas selectivas dieron 0 candidatos. Vuelve a intermedia_cerrada y revisa manualmente.
+                    </p>
+                  ) : null}
+                  {strictNarrowAllZero ? (
+                    <p className="mt-3 rounded-lg border border-amber-200 bg-amber-50 p-2 text-xs font-semibold text-amber-900">
+                      La configuracion estricta puede estar perdiendo llamados. Vuelve a intermedia_cerrada_mas_selectiva.
+                    </p>
+                  ) : null}
+                  <div className="mt-3 grid gap-2 text-sm sm:grid-cols-2">
+                    <span>Frecuencia: <strong>{recommendedCalibrationParameters().frequency_min_hz}-{recommendedCalibrationParameters().frequency_max_hz} Hz</strong></span>
+                    <span>Threshold: <strong>{recommendedCalibrationParameters().threshold_dbfs} dBFS</strong></span>
+                    <span>Ratio banda: <strong>{recommendedCalibrationParameters().min_band_ratio ?? recommendedCalibrationParameters().min_band_energy_ratio}</strong></span>
+                    <span>Preset: <strong>personalizado</strong></span>
+                  </div>
+                  {calibrationProfile?.config_estimates ? (
+                    <p className="mt-3 text-xs text-slate-600">Clips estimados en muestra: {calibrationProfile.config_estimates.balanceada?.estimated_clips ?? "-"}</p>
+                  ) : null}
+                  {calibrationTest?.final_recommendation?.warning ? (
+                    <p className="mt-3 rounded-lg border border-amber-200 bg-amber-50 p-2 text-xs font-semibold text-amber-900">
+                      {calibrationTest.final_recommendation.warning}
+                    </p>
+                  ) : null}
+                  {calibrationTest?.incremental_recommendation?.triggered && !recommendedIsExploratory ? (
+                    <div className="mt-3 rounded-lg border border-teal-200 bg-teal-50 p-3 text-xs text-teal-950">
+                      <p className="font-semibold">{calibrationTest.incremental_recommendation.summary}</p>
+                      <ul className="mt-2 space-y-1">
+                        {(calibrationTest.incremental_recommendation.variants || []).map((variant) => (
+                          <li key={variant.key}>{variant.key}. {variant.description}</li>
+                        ))}
+                      </ul>
+                      <p className="mt-2 font-semibold">{calibrationTest.incremental_recommendation.normalize_warning}</p>
+                      <div className="mt-3 flex flex-wrap gap-2">
+                        <button type="button" onClick={runMoreSensitiveCalibrationTest} disabled={Boolean(calibrationLoading) || !calibrationFolderPath || calibrationReportHistorical} className="rounded-lg bg-teal-700 px-3 py-2 text-xs font-semibold text-white disabled:opacity-50">
+                          Crear prueba más sensible
+                        </button>
+                        <button type="button" onClick={applySafeCalibrationToFolderBatch} className="rounded-lg border border-sky-300 bg-sky-50 px-3 py-2 text-xs font-semibold text-sky-800">
+                          Usar configuración segura en carpeta
+                        </button>
+                      </div>
+                    </div>
+                  ) : null}
+                  <div className="mt-3 flex flex-wrap gap-2">
+                    {shouldManualReviewOrTighten ? (
+                      <>
+                        <button type="button" onClick={openCalibrationPreviewsForReview} className="rounded-lg border border-indigo-300 bg-indigo-50 px-3 py-2 text-xs font-semibold text-indigo-900">
+                          Abrir previews para revisar
+                        </button>
+                        <button type="button" onClick={() => applySmallBatchReviewToFolderBatch()} disabled={smallBatchUseDisabled} title={smallBatchUseDisabled ? smallBatchUseBlockedReason : "Copiar solo parametros para una muestra pequena de revision humana."} className="rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-xs font-semibold text-amber-900 disabled:opacity-50">
+                          Usar en muestra pequena
+                        </button>
+                        <button type="button" onClick={() => runExploratoryCalibrationTest(EXPLORATORY_NARROW_STRICT_CALIBRATION_CONFIG)} disabled={Boolean(calibrationLoading) || !calibrationFolderPath} className="rounded-lg bg-slate-800 px-3 py-2 text-xs font-semibold text-white disabled:opacity-50">
+                          Probar mas estricta
+                        </button>
+                      </>
+                    ) : shouldCreateNarrower ? (
+                      <>
+                        <button type="button" onClick={() => runExploratoryCalibrationTest(suggestedNarrowerConfig)} disabled={Boolean(calibrationLoading) || !calibrationFolderPath} className="rounded-lg bg-indigo-700 px-3 py-2 text-xs font-semibold text-white disabled:opacity-50">
+                          Crear configuracion mas cerrada
+                        </button>
+                        <button type="button" onClick={() => applyExploratoryToSmallSample()} className="rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-xs font-semibold text-amber-900">
+                          Aplicar intermedia solo a muestra pequena
+                        </button>
+                      </>
+                    ) : recommendedIsExploratoryWide ? (
+                      <>
+                        <button type="button" onClick={() => runExploratoryCalibrationTest(suggestedIntermediateConfig)} disabled={Boolean(calibrationLoading) || !calibrationFolderPath} className="rounded-lg bg-blue-700 px-3 py-2 text-xs font-semibold text-white disabled:opacity-50">
+                          Crear configuración intermedia
+                        </button>
+                        <button type="button" onClick={() => applyExploratoryToSmallSample()} className="rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-xs font-semibold text-amber-900">
+                          Aplicar exploratoria solo a muestra pequeña
+                        </button>
+                      </>
+                    ) : (
+                      <button type="button" onClick={() => applyCalibrationToFolderBatch()} className="rounded-lg border border-blue-300 bg-blue-50 px-3 py-2 text-xs font-semibold text-blue-800">
+                        Usar esta configuración en Procesamiento masivo por carpeta local
+                      </button>
+                    )}
+                  </div>
+                </div>
+              ) : (
+                <p className="rounded-lg border border-slate-200 p-4 text-sm text-slate-500">Analiza el perfil acústico para ver banda sugerida, threshold, ratio y advertencias antes de procesar la carpeta.</p>
+              )}
+
+              {calibrationTest?.configs?.length ? (
+                <div className="overflow-x-auto rounded-lg border border-slate-200">
+                  <table className="min-w-full text-left text-sm">
+                    <thead className="bg-slate-50 text-xs uppercase text-slate-500">
+                      <tr>
+                        <th className="px-3 py-2">Configuración</th>
+                        <th className="px-3 py-2">Candidatos</th>
+                        <th className="px-3 py-2">Duración</th>
+                        <th className="px-3 py-2">Ratio</th>
+                        <th className="px-3 py-2">Ruido</th>
+                        <th className="px-3 py-2">Clipping</th>
+                        <th className="px-3 py-2">Contraste</th>
+                        <th className="px-3 py-2">Posible daño</th>
+                        <th className="px-3 py-2">Recomendación</th>
+                        <th className="px-3 py-2">Usar</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {calibrationTest.configs.map((item) => (
+                        <tr key={item.config} className="border-t border-slate-100">
+                          <td className="px-3 py-2 font-semibold">{item.label}</td>
+                          <td className="px-3 py-2">{Number(item.total_candidates || 0) > 0 ? item.total_candidates : "sin candidatos"}</td>
+                          <td className="px-3 py-2">{formatTime(item.total_duration_candidates || 0)}</td>
+                          <td className="px-3 py-2">{Number(item.total_candidates || 0) > 0 ? formatNumber(item.average_band_energy_ratio, 3) : "no evaluable"}</td>
+                          <td className="px-3 py-2">{Number(item.total_candidates || 0) > 0 ? `${formatNumber(item.noise_floor_before_after?.before_db, 1)} → ${formatNumber(item.noise_floor_before_after?.after_db, 1)} dB` : "no evaluable"}</td>
+                          <td className="px-3 py-2">{item.clipping_count ?? 0}</td>
+                          <td className="px-3 py-2">{Number(item.total_candidates || 0) > 0 ? `${formatNumber(item.contrast_before_after?.before_db, 1)} → ${formatNumber(item.contrast_before_after?.after_db, 1)} dB` : "no evaluable"}</td>
+                          <td className="px-3 py-2">{item.possible_damage_count}</td>
+                          <td className="px-3 py-2">
+                            <div>{recommendationLabel(item.recommendation)}</div>
+                            {item.review_status ? (
+                              <div className="mt-1 max-w-xs text-xs font-semibold text-slate-700">{recommendationLabel(item.review_status)}</div>
+                            ) : null}
+                            {item.recommendation === "too_many_candidates" && Number(item.possible_damage_count || 0) === 0 && calibrationRowHasImprovedContrast(item) ? (
+                              <div className="mt-1 max-w-xs text-xs font-semibold text-blue-700">Buena senal, pero falta cerrar filtros.</div>
+                            ) : null}
+                            {String(item.config || "").startsWith("intermedia_cerrada_mas_selectiva") && Number(item.total_candidates || 0) > 0 && Number(item.possible_damage_count || 0) === 0 ? (
+                              <div className="mt-1 max-w-xs text-xs font-semibold text-emerald-700">Candidata para muestra pequena; no entrenamiento automatico.</div>
+                            ) : null}
+                            {item.possible_damage_count ? (
+                              <div className="mt-1 max-w-xs text-xs text-amber-700">La limpieza puede haber aumentado el ruido o reducido el contraste. Usa detección/corte sin normalización y revisa clips antes de entrenar.</div>
+                            ) : null}
+                          </td>
+                          <td className="px-3 py-2">
+                            <button
+                              type="button"
+                              onClick={() => calibrationRowIsSmallBatchCandidate(item) ? applySmallBatchReviewToFolderBatch(item.parameters, item) : isExploratoryConfigName(item.config) ? applyCalibrationToFolderBatch(item.parameters, { preserveProcessingFlags: true, copyFolderPath: false, exploratory: true }) : applyOnlyCalibrationParametersToCurrentFolder(item.parameters)}
+                              disabled={calibrationRowIsSmallBatchCandidate(item) ? Boolean(smallBatchCandidateBlockedReason(item, previewReviewStarted)) : !folderBatchPath}
+                              title={calibrationRowIsSmallBatchCandidate(item) ? smallBatchCandidateBlockedReason(item, previewReviewStarted) || "Copiar solo parametros para una muestra pequena de revision humana." : !folderBatchPath ? "Escribe primero la ruta actual en Procesamiento masivo." : ""}
+                              className="rounded-lg border border-blue-300 bg-blue-50 px-2 py-1 text-xs font-semibold text-blue-800 disabled:opacity-50"
+                            >
+                              Usar
+                            </button>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              ) : null}
+
+              {calibrationReport ? (
+                <div className="rounded-lg border border-slate-200 bg-slate-50 p-4">
+                  <div className="flex flex-wrap items-start justify-between gap-3">
+                    <div>
+                      <h3 className="font-bold text-slate-900">Reporte de calibración</h3>
+                      <p className="mt-1 text-xs text-slate-500">{calibrationReport.report_type} · {calibrationReport.sample_size_used || calibrationReport.sample_size_requested || 0} audio(s)</p>
+                      {reportKindLabel ? <p className="mt-1 text-xs font-semibold text-slate-700">{reportKindLabel}</p> : null}
+                      {guidedCalibrationNextStep ? <p className="mt-1 text-xs font-semibold text-blue-700">{guidedCalibrationNextStep}</p> : null}
+                    </div>
+                    <div className="flex flex-wrap gap-2">
+                      <button type="button" onClick={() => setCalibrationReport(null)} className="rounded-lg border border-slate-300 px-2 py-1 text-xs font-semibold">Cerrar reporte histórico</button>
+                      <button type="button" onClick={() => { setCalibrationReport(null); setCalibrationProfile(null); setCalibrationTest(null); setCalibrationReportHistorical(false); }} className="rounded-lg border border-amber-300 bg-amber-50 px-2 py-1 text-xs font-semibold text-amber-900">Limpiar reporte actual</button>
+                    </div>
+                  </div>
+                  {calibrationReportVisibleAsHistorical ? (
+                    <p className="mt-3 rounded-lg border border-amber-200 bg-amber-50 p-2 text-xs font-semibold text-amber-900">
+                      Este reporte pertenece a otra carpeta o a una ejecución anterior.
+                    </p>
+                  ) : null}
+                  <pre className="mt-3 max-h-56 overflow-auto rounded-lg bg-slate-950 p-3 text-xs text-slate-100">
+                    {JSON.stringify({
+                      recommended_config: calibrationReport.recommended_config,
+                      suggested_parameters: calibrationReport.suggested_parameters,
+                      recommended_parameters: calibrationReport.recommended_parameters,
+                      folder_path: calibrationReport.folder_path,
+                      folder_path_resolved: calibrationReport.folder_path_resolved,
+                      legacy_report: calibrationReport.legacy_report,
+                      warnings: calibrationReport.warnings,
+                    }, null, 2)}
+                  </pre>
+                </div>
+              ) : null}
+            </div>
+          </div>
+        </div>
+      </SectionCard>
+
       <SectionCard title="Procesamiento masivo por carpeta local" subtitle="Limpia, segmenta y filtra carpetas grandes sin subir archivos uno por uno">
         <div className="space-y-5">
           <div className="rounded-lg border border-emerald-200 bg-emerald-50 p-3 text-sm text-emerald-950">
             <p className="font-semibold">Para carpetas grandes, no subas archivos uno por uno. Escribe o pega la ruta local de la carpeta. El backend procesara los audios desde tu computador.</p>
             <p className="mt-1">Los audios originales no se modifican ni se borran. Los derivados y manifests se guardan en backend/storage/audio_lab/folder_batch_jobs.</p>
+            <p className="mt-1">Para carpetas muy grandes, el escaneo puede tardar. Puedes cancelarlo sin borrar ni modificar archivos.</p>
+            <p className="mt-1">Los jobs históricos pueden aparecer en el historial, pero no son la carpeta actual. Para procesar una nueva carpeta debes escanearla y crear un nuevo job.</p>
             {mlStatus.state !== "connected" ? (
               <p className="mt-2 rounded-lg border border-amber-200 bg-amber-50 p-2 text-xs text-amber-900">
                 ML API no disponible; se omitira detector rana/sapo. El procesamiento DSP puede correr igual.
@@ -3846,15 +5248,15 @@ python -m uvicorn ml_api.main:app --host 127.0.0.1 --port 8010 --reload`}
                 />
                 <span className="mt-1 block text-xs text-slate-500">La ruta debe existir en este computador. Ejemplo: C:\Datos\Ranas\lote_01.</span>
               </label>
-              <div className="rounded-lg border border-slate-200 bg-white p-3 text-xs text-slate-700">
-                <div className="font-semibold text-slate-900">Carpeta actual del formulario</div>
-                <div className="mt-1 break-all font-mono">{currentFolderPath || "Sin ruta escrita."}</div>
-                {currentFolderPath && !folderBatchCanStart ? (
-                  <p className="mt-2 rounded-lg border border-amber-200 bg-amber-50 p-2 font-semibold text-amber-900">
-                    Ruta cambiada. Escanea la carpeta actual para iniciar un nuevo procesamiento.
-                  </p>
-                ) : null}
-              </div>
+              {folderBatchForm.exploratory_mode ? (
+                <div className="rounded-lg border border-amber-300 bg-amber-50 p-3 text-xs text-amber-950">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Badge tone="warning">Modo exploratorio</Badge>
+                    <span className="font-semibold">Recomendado procesar primero una muestra pequeña.</span>
+                  </div>
+                  <p className="mt-1">Esta configuración puede incluir lluvia, viento o falsos candidatos. No usar para entrenamiento sin revisión manual.</p>
+                </div>
+              ) : null}
 
               <div className="grid gap-3 md:grid-cols-2">
                 <label className="text-sm">
@@ -3872,100 +5274,19 @@ python -m uvicorn ml_api.main:app --host 127.0.0.1 --port 8010 --reload`}
                 Buscar en subcarpetas
               </label>
 
-              <div className={`rounded-lg border p-3 text-sm ${folderBatchIsExploratory ? "border-amber-300 bg-amber-50 text-amber-950" : "border-emerald-200 bg-emerald-50 text-emerald-950"}`}>
-                <div className="flex flex-wrap items-start justify-between gap-2">
-                  <div>
-                    <h3 className="font-bold">{folderBatchIsExploratory ? "Configuración exploratoria actual" : "Recomendación actual"}</h3>
-                    <p className="mt-1">
-                      Frecuencia: <strong>{folderBatchForm.frequency_min_hz}-{folderBatchForm.frequency_max_hz} Hz</strong> · Threshold: <strong>{folderBatchForm.threshold_dbfs} dBFS</strong> · Ratio banda: <strong>{folderBatchForm.min_band_ratio}</strong>
-                    </p>
-                  </div>
-                  <Badge tone={folderBatchIsExploratory ? "warning" : "success"}>{folderBatchForm.config_name || folderBatchForm.preset}</Badge>
-                </div>
-                {folderBatchIsExploratory ? (
-                  <div className="mt-3 space-y-2">
-                    <p className="font-semibold">Esta configuración es exploratoria. Sirve para encontrar actividad posible, no para procesar toda la carpeta.</p>
-                    <p>No usar para entrenamiento ni procesamiento masivo sin revisar.</p>
-                    {folderBatchCandidateCount > 0 ? (
-                      <p>Hay actividad, pero la configuración es demasiado abierta. Siguiente paso: probar una configuración intermedia.</p>
-                    ) : null}
-                  </div>
-                ) : null}
-                <div className="mt-3 flex flex-wrap gap-2">
-                  {folderBatchHasSafeRecommendation ? (
-                    <button type="button" onClick={() => applyFolderBatchConfig(FOLDER_BATCH_SAFE_RECOMMENDED_CONFIG)} className="rounded-lg bg-emerald-600 px-3 py-2 text-xs font-semibold text-white">
-                      Usar configuración segura en carpeta
-                    </button>
-                  ) : (
-                    <button type="button" disabled className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs font-semibold text-slate-500 opacity-60">
-                      Usar configuración segura en carpeta
-                    </button>
-                  )}
-                  {folderBatchIsExploratory ? (
-                    <>
-                      <button type="button" onClick={() => applyFolderBatchConfig(FOLDER_BATCH_EXPLORATORY_WIDE_CONFIG)} className="rounded-lg border border-amber-300 bg-white px-3 py-2 text-xs font-semibold text-amber-900">
-                        Usar exploratoria solo en muestra
-                      </button>
-                      <button type="button" onClick={() => applyFolderBatchConfig(FOLDER_BATCH_INTERMEDIATE_CONFIG)} className="rounded-lg border border-blue-300 bg-white px-3 py-2 text-xs font-semibold text-blue-800">
-                        Crear configuración intermedia
-                      </button>
-                    </>
-                  ) : null}
-                </div>
-                {folderBatchBestNextStep === "try_intermediate_config" ? (
-                  <p className="mt-2 text-xs font-semibold">best_next_step: try_intermediate_config</p>
-                ) : null}
-              </div>
-
               <div>
                 <div className="mb-2 text-sm font-semibold text-slate-700">Preset</div>
                 <div className="flex flex-wrap gap-2">
-                  {["conservador", "normal", "agresivo", "intermedia_exploratoria", "exploratory_wide", "personalizado"].map((preset) => (
+                  {FOLDER_BATCH_PRESET_OPTIONS.map(([preset, label]) => (
                     <button
                       key={preset}
                       type="button"
                       onClick={() => applyFolderBatchPreset(preset)}
                       className={`rounded-lg border px-3 py-2 text-sm font-semibold ${folderBatchForm.preset === preset ? "border-emerald-500 bg-emerald-50 text-emerald-900" : "border-slate-300 bg-white text-slate-700"}`}
                     >
-                      {preset}
+                      {label}
                     </button>
                   ))}
-                </div>
-              </div>
-
-              <div className="rounded-lg border border-slate-200 bg-white p-3">
-                <h3 className="text-sm font-bold text-slate-800">Comparación de configuraciones</h3>
-                <div className="mt-3 overflow-x-auto">
-                  <table className="min-w-full text-left text-xs">
-                    <thead className="bg-slate-50 uppercase text-slate-500">
-                      <tr>
-                        <th className="px-2 py-2">Config</th>
-                        <th className="px-2 py-2">Tipo</th>
-                        <th className="px-2 py-2">Frecuencia</th>
-                        <th className="px-2 py-2">Threshold</th>
-                        <th className="px-2 py-2">Ratio</th>
-                        <th className="px-2 py-2">Recomendación</th>
-                        <th className="px-2 py-2">Acción</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {folderBatchComparisonRows.map((row) => (
-                        <tr key={row.name} className="border-t border-slate-100">
-                          <td className="px-2 py-2 font-semibold">{row.label}</td>
-                          <td className="px-2 py-2"><Badge tone={row.tone}>{row.badge}</Badge></td>
-                          <td className="px-2 py-2">{row.frequency_min_hz}-{row.frequency_max_hz} Hz</td>
-                          <td className="px-2 py-2">{row.threshold_dbfs} dBFS</td>
-                          <td className="px-2 py-2">{row.min_band_ratio}</td>
-                          <td className="px-2 py-2">{row.recommendationText}</td>
-                          <td className="px-2 py-2">
-                            <button type="button" onClick={() => useFolderBatchComparisonRow(row)} className="rounded-lg border border-slate-300 px-2 py-1 font-semibold">
-                              Usar
-                            </button>
-                          </td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
                 </div>
               </div>
 
@@ -4022,13 +5343,36 @@ python -m uvicorn ml_api.main:app --host 127.0.0.1 --port 8010 --reload`}
               </div>
 
               <div className="flex flex-wrap gap-2">
+                {folderBatchCalibrationModeInfo ? (
+                  <div className="basis-full rounded-lg border border-amber-200 bg-amber-50 p-2 text-xs font-semibold text-amber-900">
+                    <Badge tone={folderBatchCalibrationModeInfo.tone}>{folderBatchCalibrationModeInfo.badge}</Badge>
+                    <span className="ml-2">{folderBatchCalibrationModeInfo.message}</span>
+                  </div>
+                ) : null}
                 <button type="button" onClick={scanFolderBatch} disabled={folderBatchScanning} className="rounded-lg bg-emerald-600 px-4 py-2 text-sm font-semibold text-white disabled:opacity-50">
-                  <LoadingText loading={folderBatchScanning} loadingText="Escaneando...">Escanear carpeta</LoadingText>
+                  <LoadingText loading={folderBatchScanning} loadingText="Escaneando…">Escanear carpeta</LoadingText>
                 </button>
-                <button type="button" onClick={startFolderBatchJob} disabled={folderBatchSubmitting || !folderBatchCanStart} className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-semibold text-white disabled:opacity-50">
+                {folderBatchScanning ? (
+                  <button type="button" onClick={cancelFolderBatchScan} className="rounded-lg border border-rose-300 bg-rose-50 px-4 py-2 text-sm font-semibold text-rose-800">
+                    Cancelar escaneo
+                  </button>
+                ) : null}
+                <button type="button" onClick={startFolderBatchJob} disabled={folderBatchStartDisabled} title={folderBatchStartDisabledReason || "Crear un job nuevo con la carpeta y parámetros actuales."} className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-semibold text-white disabled:opacity-50">
                   <LoadingText loading={folderBatchSubmitting} loadingText="Creando job...">Iniciar procesamiento</LoadingText>
                 </button>
               </div>
+              {folderBatchScanning ? (
+                <p className="text-xs font-semibold text-amber-800">Espera a que termine el escaneo o cancélalo.</p>
+              ) : null}
+              {folderBatchStartDisabledReason ? (
+                <p className="rounded-lg border border-amber-200 bg-amber-50 p-2 text-xs font-semibold text-amber-900">{folderBatchStartDisabledReason}</p>
+              ) : null}
+              {folderBatchScanState.message ? (
+                <p className="text-xs text-slate-600">{folderBatchScanState.message}</p>
+              ) : null}
+              {activeFolderBatchJobFinished ? (
+                <p className="rounded-lg border border-blue-200 bg-blue-50 p-2 text-xs font-semibold text-blue-800">Este job ya terminó. Para iniciar uno nuevo, escanea la carpeta actual.</p>
+              ) : null}
             </div>
 
             <div className="space-y-4">
@@ -4061,29 +5405,28 @@ python -m uvicorn ml_api.main:app --host 127.0.0.1 --port 8010 --reload`}
               )}
 
               {activeFolderBatchJob ? (
-                <div className={`rounded-lg border p-4 ${activeFolderBatchIsHistorical ? "border-amber-300 bg-amber-50" : "border-blue-200 bg-blue-50"}`}>
+                <div className="rounded-lg border border-blue-200 bg-blue-50 p-4">
                   <div className="flex flex-wrap items-start justify-between gap-3">
                     <div className="min-w-0">
-                      <div className="flex flex-wrap items-center gap-2">
-                        <h3 className="truncate font-bold text-blue-950">{activeFolderBatchJob.job_name || activeFolderBatchJob.id}</h3>
-                        {activeFolderBatchIsHistorical ? <Badge tone="warning">historico</Badge> : <Badge tone="info">carpeta actual</Badge>}
-                      </div>
+                      <h3 className="truncate font-bold text-blue-950">{activeFolderBatchJob.job_name || activeFolderBatchJob.id}</h3>
                       <p className="text-sm text-blue-900">{activeFolderBatchJob.status} - {activeFolderBatchJob.target_label || "-"}</p>
-                      <p className="mt-1 truncate text-xs text-blue-800" title={activeFolderBatchJob.current_file || activeFolderBatchSourcePath}>{activeFolderBatchJob.current_file || activeFolderBatchSourcePath}</p>
+                      <p className="mt-1 truncate text-xs text-blue-800" title={activeFolderBatchJob.current_file || activeFolderBatchJob.folder_path}>{activeFolderBatchJob.current_file || activeFolderBatchJob.folder_path}</p>
                     </div>
                     <div className="flex flex-wrap gap-2">
+                      {activeFolderBatchJobIsHistorical ? <Badge tone="warning">Job histórico</Badge> : null}
                       <button type="button" onClick={() => refreshFolderBatchJob(activeFolderBatchJob.id)} className="rounded-lg border border-blue-300 bg-white px-3 py-2 text-xs font-semibold">Refrescar</button>
+                      <button type="button" onClick={() => clearSelectedFolderBatchJob(activeFolderBatchJobIsHistorical ? "Job histórico deseleccionado. No se borraron archivos ni registros." : undefined)} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs font-semibold">Limpiar job seleccionado</button>
                       <button type="button" onClick={pauseFolderBatchJob} disabled={activeFolderBatchJob.status !== "running"} className="rounded-lg border border-amber-300 bg-white px-3 py-2 text-xs font-semibold text-amber-800 disabled:opacity-50">Pausar</button>
                       <button type="button" onClick={resumeFolderBatchJob} disabled={activeFolderBatchJob.status !== "paused"} className="rounded-lg border border-emerald-300 bg-white px-3 py-2 text-xs font-semibold text-emerald-800 disabled:opacity-50">Reanudar</button>
                       <button type="button" onClick={cancelFolderBatchJob} disabled={!["pending", "running", "paused"].includes(activeFolderBatchJob.status)} className="rounded-lg border border-red-300 bg-white px-3 py-2 text-xs font-semibold text-red-700 disabled:opacity-50">Cancelar</button>
                     </div>
                   </div>
-                  {activeFolderBatchIsHistorical ? (
-                    <div className="mt-3 rounded-lg border border-amber-300 bg-white p-3 text-sm text-amber-950">
-                      <p className="font-bold">Este job pertenece a otra carpeta.</p>
-                      <p className="mt-1"><strong>Carpeta actual:</strong> <span className="break-all font-mono">{currentFolderPath}</span></p>
-                      <p className="mt-1"><strong>Carpeta del job seleccionado:</strong> <span className="break-all font-mono">{activeFolderBatchSourcePath}</span></p>
-                      <p className="mt-1">Para procesar la carpeta actual, escanea la carpeta y crea un nuevo job.</p>
+                  {activeFolderBatchJobIsHistorical ? (
+                    <div className="mt-3 rounded-lg border border-amber-300 bg-amber-50 p-3 text-xs text-amber-950">
+                      <p className="text-base font-bold">Job histórico</p>
+                      <p className="mt-1 font-semibold">Este job pertenece a otra carpeta.</p>
+                      <p className="mt-1"><strong>Carpeta actual:</strong> <span className="break-all font-mono">{folderBatchPath || "-"}</span></p>
+                      <p className="mt-1"><strong>Carpeta del job:</strong> <span className="break-all font-mono">{activeFolderBatchJobFolderPath || "-"}</span></p>
                     </div>
                   ) : null}
                   <div className="mt-3 h-3 overflow-hidden rounded-full bg-white">
@@ -4099,37 +5442,10 @@ python -m uvicorn ml_api.main:app --host 127.0.0.1 --port 8010 --reload`}
                     <span>Duracion proc.: <strong>{formatTime(activeFolderBatchJob.processed_duration_seconds)}</strong></span>
                     <span>Progreso: <strong>{folderBatchProgress}%</strong></span>
                   </div>
-                  <div className="mt-3 grid gap-2 rounded-lg border border-white/70 bg-white p-3 text-xs text-slate-700 md:grid-cols-2">
-                    <div>
-                      <span className="block font-semibold text-slate-900">Carpeta origen del job</span>
-                      <span className="break-all font-mono">{activeFolderBatchSourcePath || "-"}</span>
-                    </div>
-                    <div>
-                      <span className="block font-semibold text-slate-900">Carpeta de outputs</span>
-                      <span className="break-all font-mono">{activeFolderBatchOutputDir || "-"}</span>
-                    </div>
-                    <div>
-                      <span className="block font-semibold text-slate-900">Manifest CSV</span>
-                      <span className="break-all font-mono">{activeFolderBatchManifestPath || "-"}</span>
-                    </div>
-                    <div>
-                      <span className="block font-semibold text-slate-900">Logs</span>
-                      <span className="break-all font-mono">{activeFolderBatchLogsDir || "-"}</span>
-                    </div>
-                    <div>
-                      <span className="block font-semibold text-slate-900">Cantidad de outputs</span>
-                      <span>{folderBatchOutputs.length}</span>
-                    </div>
-                    <div>
-                      <span className="block font-semibold text-slate-900">Estado</span>
-                      <span>{activeFolderBatchJob.status || "-"}</span>
-                    </div>
-                  </div>
                   <div className="mt-3 flex flex-wrap gap-2">
                     <button type="button" onClick={() => setFolderBatchLogs((current) => current || "")} className="rounded-lg border border-blue-300 bg-white px-3 py-2 text-xs font-semibold">Ver logs</button>
-                    <button type="button" onClick={openFolderBatchManifest} disabled={!activeFolderBatchManifestPath} className="rounded-lg border border-blue-300 bg-white px-3 py-2 text-xs font-semibold disabled:opacity-50">Exportar manifest</button>
-                    <button type="button" onClick={openFolderBatchOutputFolder} disabled={!activeFolderBatchOutputDir} className="rounded-lg border border-blue-300 bg-white px-3 py-2 text-xs font-semibold disabled:opacity-50">Abrir carpeta de outputs</button>
-                    <button type="button" onClick={() => copyTextToClipboard(activeFolderBatchOutputDir, "Ruta de outputs copiada.")} disabled={!activeFolderBatchOutputDir} className="rounded-lg border border-blue-300 bg-white px-3 py-2 text-xs font-semibold disabled:opacity-50">Copiar ruta outputs</button>
+                    <button type="button" onClick={openFolderBatchManifest} disabled={!activeFolderBatchJob.manifest_path} className="rounded-lg border border-blue-300 bg-white px-3 py-2 text-xs font-semibold disabled:opacity-50">Exportar manifest</button>
+                    <button type="button" onClick={() => copyTextToClipboard(activeFolderBatchJob.output_dir, "Ruta de outputs copiada.")} disabled={!activeFolderBatchJob.output_dir} className="rounded-lg border border-blue-300 bg-white px-3 py-2 text-xs font-semibold disabled:opacity-50">Abrir carpeta de outputs</button>
                   </div>
                   {folderBatchLogs ? <pre className="mt-3 max-h-32 overflow-auto rounded-lg bg-slate-950 p-3 text-xs text-slate-100">{folderBatchLogs}</pre> : null}
                 </div>
@@ -4138,7 +5454,7 @@ python -m uvicorn ml_api.main:app --host 127.0.0.1 --port 8010 --reload`}
               )}
 
               <div className="rounded-lg border border-slate-200 p-3">
-                <div className="grid gap-2 md:grid-cols-2">
+                <div className="grid gap-2 md:grid-cols-3">
                   <label className="text-xs font-semibold text-slate-600">
                     Buscar job/audio
                     <input type="search" value={folderBatchSearch} onChange={(event) => setFolderBatchSearch(event.target.value)} placeholder="Nombre, ruta, id..." className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm font-normal" />
@@ -4150,36 +5466,29 @@ python -m uvicorn ml_api.main:app --host 127.0.0.1 --port 8010 --reload`}
                       {["pending", "running", "paused", "completed", "failed", "cancelled"].map((status) => <option key={status} value={status}>{status}</option>)}
                     </select>
                   </label>
+                  <label className="text-xs font-semibold text-slate-600">
+                    Historial
+                    <select value={folderBatchHistoryFilter} onChange={(event) => setFolderBatchHistoryFilter(event.target.value)} className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm font-normal">
+                      <option value="all">Todos</option>
+                      <option value="current">Solo carpeta actual</option>
+                      <option value="historical">Históricos</option>
+                    </select>
+                  </label>
                 </div>
                 <div className="mt-3 max-h-44 overflow-auto rounded-lg border border-slate-200">
                   {filteredFolderBatchJobs.length ? (
-                    filteredFolderBatchJobs.map((job) => {
-                      const historical = folderBatchJobIsHistorical(job);
-                      const selected = activeFolderBatchJob?.id === job.id;
-                      return (
-                        <button
-                          key={job.id}
-                          type="button"
-                          onClick={() => refreshFolderBatchJob(job.id)}
-                          className={`block w-full border-b border-slate-100 p-3 text-left text-sm last:border-b-0 hover:bg-slate-50 ${selected && !historical ? "bg-blue-50" : ""} ${selected && historical ? "bg-amber-50" : ""}`}
-                        >
-                          <div className="flex flex-wrap items-center justify-between gap-2">
-                            <strong className="min-w-0 truncate" title={job.job_name || job.id}>{job.job_name || job.id}</strong>
-                            <span className="flex flex-wrap gap-2">
-                              {historical ? <Badge tone="warning">historico</Badge> : null}
-                              <Badge tone={job.status === "completed" ? "success" : job.status === "failed" ? "danger" : job.status === "cancelled" ? "warning" : "info"}>{job.status}</Badge>
-                            </span>
-                          </div>
-                          <div className="mt-2 grid gap-1 text-xs text-slate-600 md:grid-cols-2">
-                            <div><span className="font-semibold">Especie:</span> {job.target_label || "-"}</div>
-                            <div><span className="font-semibold">Fecha:</span> {formatDateTime(job.created_at)}</div>
-                            <div className="md:col-span-2" title={jobFolderPath(job)}>
-                              <span className="font-semibold">Carpeta origen:</span> {shortPath(jobFolderPath(job)) || "-"}
-                            </div>
-                          </div>
-                        </button>
-                      );
-                    })
+                    filteredFolderBatchJobs.map((job) => (
+                      <button key={job.id} type="button" onClick={() => refreshFolderBatchJob(job.id)} className="block w-full border-b border-slate-100 p-3 text-left text-sm last:border-b-0 hover:bg-slate-50">
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <strong>{job.job_name || job.id}</strong>
+                          <span className="flex flex-wrap gap-2">
+                            {folderBatchPath && !isFolderBatchJobForPath(job, folderBatchPath) ? <Badge tone="warning">histórico</Badge> : null}
+                            <Badge tone={job.status === "completed" ? "success" : job.status === "failed" ? "danger" : job.status === "cancelled" ? "warning" : "info"}>{job.status}</Badge>
+                          </span>
+                        </div>
+                        <div className="mt-1 truncate text-xs text-slate-500" title={folderBatchJobFolderPath(job)}>{job.target_label || "-"} - {folderBatchJobFolderPath(job)}</div>
+                      </button>
+                    ))
                   ) : (
                     <p className="p-4 text-sm text-slate-500">{folderBatchJobs.length ? "No hay jobs que coincidan con los filtros." : "Sin jobs de carpeta local."}</p>
                   )}
@@ -4190,6 +5499,17 @@ python -m uvicorn ml_api.main:app --host 127.0.0.1 --port 8010 --reload`}
 
           {activeFolderBatchJob ? (
             <div className="space-y-3">
+              <div className={`rounded-lg border p-3 text-sm ${activeFolderBatchJobIsHistorical ? "border-amber-300 bg-amber-50 text-amber-950" : "border-slate-200 bg-white text-slate-700"}`}>
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div>
+                    <h3 className="font-bold">{activeFolderBatchJobIsHistorical ? "Historial / resultados de otro job" : "Resultados actuales"}</h3>
+                    <p className="mt-1 text-xs">
+                      {activeFolderBatchJobIsHistorical ? "Resultados históricos de otra carpeta" : "Outputs del job seleccionado para la carpeta actual"}
+                    </p>
+                  </div>
+                  {activeFolderBatchJobIsHistorical ? <Badge tone="warning">Job histórico</Badge> : <Badge tone="success">Carpeta actual</Badge>}
+                </div>
+              </div>
               <div className="grid gap-2 rounded-lg border border-slate-200 p-3 md:grid-cols-4">
                 <label className="text-xs font-semibold text-slate-600">
                   Resultados
@@ -4237,6 +5557,7 @@ python -m uvicorn ml_api.main:app --host 127.0.0.1 --port 8010 --reload`}
                           <td className="px-3 py-2">
                             <div className="max-w-56 truncate font-semibold" title={output.original_audio_path}>{getAudioName(output.original_audio_path)}</div>
                             <div className="max-w-56 truncate text-xs text-slate-500" title={output.original_audio_path}>{output.original_audio_path}</div>
+                            {activeFolderBatchJobIsHistorical ? <div className="max-w-56 truncate text-xs font-semibold text-amber-700" title={output.source_folder}>Job: {output.source_folder || activeFolderBatchJobFolderPath}</div> : null}
                           </td>
                           <td className="px-3 py-2">{formatTime(output.start_seconds)} - {formatTime(output.end_seconds)}<div className="text-xs text-slate-500">{formatNumber(output.duration_seconds, 1)} s</div></td>
                           <td className="px-3 py-2">{formatNumber(output.activity_score, 3)}</td>
@@ -4246,7 +5567,7 @@ python -m uvicorn ml_api.main:app --host 127.0.0.1 --port 8010 --reload`}
                           <td className="px-3 py-2"><Badge tone={output.recommendation === "candidate" ? "success" : output.recommendation === "error" ? "danger" : "warning"}>{output.recommendation || "review"}</Badge></td>
                           <td className="px-3 py-2">
                             <div className="flex flex-wrap gap-2">
-                              <button type="button" disabled={!output.output_audio_path} onClick={() => { openFolderBatchOutputInLab(output); window.setTimeout(() => audioRef.current?.play(), 150); }} className="rounded-lg border border-slate-300 px-2 py-1 text-xs font-semibold disabled:opacity-50">Reproducir</button>
+                              <button type="button" disabled={!output.output_audio_path} onClick={() => { openFolderBatchOutputInLab(output); window.setTimeout(() => audioRef.current?.play(), 150); }} className="rounded-lg border border-slate-300 px-2 py-1 text-xs font-semibold disabled:opacity-50">Abrir audio</button>
                               <button type="button" disabled={!output.output_audio_path} onClick={() => generateSpectrogram({ audio_path: output.output_audio_path, start_seconds: 0, end_seconds: undefined })} className="rounded-lg border border-slate-300 px-2 py-1 text-xs font-semibold disabled:opacity-50">Espectrograma</button>
                               <button type="button" disabled={!output.quality_report_path} onClick={() => fetch(getMediaFileUrl(output.quality_report_path)).then((response) => response.json()).then(setQualityReport).catch(() => setError("No se pudo abrir reporte de calidad."))} className="rounded-lg border border-blue-300 bg-blue-50 px-2 py-1 text-xs font-semibold text-blue-800 disabled:opacity-50">Reporte calidad</button>
                               <button type="button" onClick={() => openFolderBatchFeedback(output, "confirmed_positive")} className="rounded-lg border border-emerald-300 px-2 py-1 text-xs font-semibold text-emerald-800">Confirmar</button>
@@ -4266,34 +5587,6 @@ python -m uvicorn ml_api.main:app --host 127.0.0.1 --port 8010 --reload`}
                     )}
                   </tbody>
                 </table>
-              </div>
-            </div>
-          ) : null}
-
-          {folderBatchOutputDialog ? (
-            <div className="rounded-lg border border-amber-300 bg-amber-50 p-4 text-sm text-amber-950">
-              <div className="flex flex-wrap items-start justify-between gap-3">
-                <div>
-                  <h3 className="font-bold">No se pudo abrir automaticamente.</h3>
-                  <p className="mt-1">{folderBatchOutputDialog.message || "Copia esta ruta y abrela en el Explorador."}</p>
-                </div>
-                <button type="button" onClick={() => setFolderBatchOutputDialog(null)} className="rounded-lg border border-amber-300 bg-white px-3 py-2 text-xs font-semibold">
-                  Cerrar
-                </button>
-              </div>
-              <div className="mt-3 rounded-lg border border-amber-200 bg-white p-3 font-mono text-xs text-slate-800 break-all">
-                {folderBatchOutputDialog.outputDir || activeFolderBatchOutputDir || "-"}
-              </div>
-              <div className="mt-3 flex flex-wrap gap-2">
-                <button type="button" onClick={() => copyTextToClipboard(folderBatchOutputDialog.outputDir || activeFolderBatchOutputDir, "Ruta de outputs copiada.")} className="rounded-lg bg-amber-600 px-3 py-2 text-xs font-semibold text-white">
-                  Copiar ruta
-                </button>
-                <button type="button" onClick={() => setMessage(folderBatchOutputDialog.outputDir || activeFolderBatchOutputDir)} className="rounded-lg border border-amber-300 bg-white px-3 py-2 text-xs font-semibold">
-                  Ver ruta
-                </button>
-                <button type="button" onClick={openFolderBatchOutputFolder} className="rounded-lg border border-amber-300 bg-white px-3 py-2 text-xs font-semibold">
-                  Abrir desde backend
-                </button>
               </div>
             </div>
           ) : null}
@@ -4439,6 +5732,13 @@ python -m uvicorn ml_api.main:app --host 127.0.0.1 --port 8010 --reload`}
                 <span className="mb-1 block font-semibold text-slate-700">Nombre del job</span>
                 <input value={batchProcessingJobName} onChange={(event) => setBatchProcessingJobName(event.target.value)} placeholder="lote_raspberry_mayo_2026" className="w-full rounded-lg border border-slate-300 px-3 py-2" />
               </label>
+              <label className="flex items-start gap-2 rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-950">
+                <input type="checkbox" checked={batchProcessingTemporary} onChange={(event) => setBatchProcessingTemporary(event.target.checked)} className="mt-1" />
+                <span>
+                  <strong>Modo prueba temporal</strong>
+                  <span className="block text-xs">Los outputs se guardan igual para trazabilidad, pero el job queda marcado como temporary para limpiarlo facilmente despues.</span>
+                </span>
+              </label>
 
               <div>
                 <div className="mb-2 text-sm font-semibold text-slate-700">Preset</div>
@@ -4525,10 +5825,14 @@ python -m uvicorn ml_api.main:app --host 127.0.0.1 --port 8010 --reload`}
                     <div>
                       <h3 className="font-bold text-blue-950">{activeBatchProcessingJob.job_name || activeBatchProcessingJob.id}</h3>
                       <p className="text-sm text-blue-900">{activeBatchProcessingJob.mode} · {activeBatchProcessingJob.status} · {activeBatchProcessingJob.phase || "-"}</p>
+                      <p className="mt-1 text-xs font-semibold text-blue-900">Este resultado es un derivado. El audio original no fue modificado.</p>
                       <p className="mt-1 truncate text-xs text-blue-800" title={activeBatchProcessingJob.current_file || ""}>{activeBatchProcessingJob.current_file || "Sin archivo activo"}</p>
                     </div>
                     <div className="flex flex-wrap gap-2">
                       <button type="button" onClick={() => refreshBatchProcessingJob(activeBatchProcessingJob.id)} title="Actualiza la lista de jobs, logs y resultados desde el backend." className="rounded-lg border border-blue-300 bg-white px-3 py-2 text-xs font-semibold">Refrescar</button>
+                      <button type="button" onClick={markActiveBatchJobAsTest} className="rounded-lg border border-amber-300 bg-white px-3 py-2 text-xs font-semibold text-amber-900">Marcar como prueba</button>
+                      <button type="button" onClick={deleteActiveBatchJobOutputs} disabled={["queued", "running"].includes(activeBatchProcessingJob.status)} className="rounded-lg border border-red-300 bg-white px-3 py-2 text-xs font-semibold text-red-700 disabled:opacity-50">Eliminar outputs de este job</button>
+                      <button type="button" onClick={deleteActiveBatchJobUploads} disabled={["queued", "running"].includes(activeBatchProcessingJob.status)} className="rounded-lg border border-red-300 bg-white px-3 py-2 text-xs font-semibold text-red-700 disabled:opacity-50">Eliminar uploads temporales</button>
                       <button type="button" onClick={cancelBatchProcessingJob} disabled={!["queued", "running"].includes(activeBatchProcessingJob.status)} className="rounded-lg border border-red-300 bg-white px-3 py-2 text-xs font-semibold text-red-700 disabled:opacity-50">Cancelar</button>
                     </div>
                   </div>
@@ -4658,6 +5962,11 @@ python -m uvicorn ml_api.main:app --host 127.0.0.1 --port 8010 --reload`}
                                 {qualityReportLoading === output.id ? "Abriendo..." : "Ver reporte"}
                               </button>
                             ) : null}
+                            {output.quality_report_path ? (
+                              <button type="button" disabled={Boolean(qualityReportLoading)} onClick={() => deleteQualityReportForOutput(output)} className="rounded-lg border border-red-300 bg-red-50 px-2 py-1 text-xs font-semibold text-red-700 disabled:opacity-50">
+                                Eliminar reporte
+                              </button>
+                            ) : null}
                             <button type="button" disabled={!output.processed_audio_path || Boolean(qualityReportLoading)} onClick={() => generateQualityReportForOutput(output)} className="rounded-lg border border-blue-300 bg-blue-50 px-2 py-1 text-xs font-semibold text-blue-800 disabled:opacity-50">
                               {qualityReportLoading === output.id ? "Generando reporte..." : output.quality_report_path ? "Regenerar reporte" : "Reporte de calidad"}
                             </button>
@@ -4672,6 +5981,39 @@ python -m uvicorn ml_api.main:app --host 127.0.0.1 --port 8010 --reload`}
             </div>
             </div>
           ) : null}
+        </div>
+      </SectionCard>
+
+      <SectionCard title="Mantenimiento de laboratorio" subtitle="Limpia derivados de prueba sin tocar audios originales">
+        <div className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-950">
+          Esto elimina derivados generados por la app, como uploads temporales, outputs de batch y reportes. Nunca borra audios originales ni modifica dataset_curado.
+        </div>
+        <div className="mt-4 grid gap-3 md:grid-cols-3">
+          <div className="rounded-lg border border-slate-200 p-3">
+            <div className="text-xs text-slate-500">Uploads temporales</div>
+            <strong>{formatBytes(maintenance?.uploads?.size_bytes)}</strong>
+            <div className="text-xs text-slate-500">{maintenance?.uploads?.active_count || 0} activo(s)</div>
+          </div>
+          <div className="rounded-lg border border-slate-200 p-3">
+            <div className="text-xs text-slate-500">Batch jobs</div>
+            <strong>{formatBytes(maintenance?.batch_jobs?.size_bytes)}</strong>
+            <div className="text-xs text-slate-500">{maintenance?.batch_jobs?.temporary_or_test_count || 0} prueba(s)</div>
+          </div>
+          <div className="rounded-lg border border-slate-200 p-3">
+            <div className="text-xs text-slate-500">Reportes de calidad</div>
+            <strong>{formatBytes(maintenance?.quality_reports?.size_bytes)}</strong>
+          </div>
+        </div>
+        <div className="mt-4 flex flex-wrap gap-2">
+          <button type="button" onClick={loadMaintenance} className="rounded-lg border border-slate-300 px-3 py-2 text-sm font-semibold">
+            {maintenanceLoading ? "Calculando..." : "Actualizar tamaños"}
+          </button>
+          <button type="button" onClick={cleanupTestDerivatives} className="rounded-lg border border-red-300 bg-red-50 px-3 py-2 text-sm font-semibold text-red-700">
+            Limpiar pruebas antiguas
+          </button>
+          <button type="button" onClick={() => setMessage("Las previews temporales de Dataset Curado se limpian desde Dataset Curado > Mantenimiento > Limpiar previsualizaciones.")} className="rounded-lg border border-slate-300 px-3 py-2 text-sm font-semibold">
+            Limpiar previews temporales
+          </button>
         </div>
       </SectionCard>
 
@@ -4699,12 +6041,25 @@ python -m uvicorn ml_api.main:app --host 127.0.0.1 --port 8010 --reload`}
               <div className="flex flex-wrap gap-2">
                 <Badge tone="info">Origen: {selectedAudio.originLabel || audioOriginLabel(selectedAudio.kind)}</Badge>
                 {selectedAudio.internalCopyPath ? <Badge>copia temporal segura</Badge> : null}
+                {selectedAudio.historicalJobOutput ? <Badge tone="warning">job histórico</Badge> : null}
               </div>
               <div className="mt-2 grid gap-1">
+                {selectedAudio.kind === "folder_batch_output" ? (
+                  <>
+                    <div><strong>Job:</strong> <span className="break-all font-mono">{selectedAudio.jobName || selectedAudio.jobId || "-"}</span></div>
+                    <div><strong>Carpeta origen del job:</strong> <span className="break-all font-mono">{selectedAudio.jobSourceFolder || "-"}</span></div>
+                    <div><strong>Carpeta actual del formulario:</strong> <span className="break-all font-mono">{selectedAudio.currentFolderPath || "-"}</span></div>
+                  </>
+                ) : null}
                 <div><strong>Ruta original:</strong> <span className="break-all font-mono">{selectedAudio.originalAudioPath || selectedAudio.audioPath || selectedAudio.title}</span></div>
                 <div><strong>Ruta usada para reproducir/procesar:</strong> <span className="break-all font-mono">{selectedAudio.processingPath || selectedAudio.audioPath || selectedAudio.audioUrl}</span></div>
                 {selectedAudio.internalCopyPath ? <div><strong>Copia interna:</strong> <span className="break-all font-mono">{selectedAudio.internalCopyPath}</span></div> : null}
               </div>
+              {selectedAudio.historicalJobOutput ? (
+                <p className="mt-2 rounded-lg border border-amber-200 bg-amber-50 p-2 font-semibold text-amber-900">
+                  Este audio pertenece a un job histórico.
+                </p>
+              ) : null}
             </div>
             <div className="flex flex-wrap items-center gap-2">
               <button type="button" onClick={() => audioRef.current?.play()} className="rounded-lg bg-emerald-600 px-4 py-2 text-sm font-semibold text-white">
@@ -5611,6 +6966,11 @@ python -m uvicorn ml_api.main:app --host 127.0.0.1 --port 8010 --reload`}
             <div className="flex flex-wrap items-start justify-between gap-3">
               <div>
                 <h2 className="text-lg font-bold">Reporte de calidad original vs procesado</h2>
+                {["possible_damage", "requires_review"].includes(qualityReport.recommendation?.label) || qualityReport.recommendation?.training_use === "requires_review" ? (
+                  <p className="mt-2 rounded-lg border border-amber-200 bg-amber-50 p-2 text-sm font-semibold text-amber-900">
+                    No usar automaticamente para entrenamiento.
+                  </p>
+                ) : null}
                 <p className="text-sm text-slate-500">Comparacion automatica; no reemplaza revision humana.</p>
                 <div className="mt-2 grid gap-1 text-sm">
                   <div><span className="text-slate-500">Original:</span> <strong>{qualityReport.source_audio_name || getAudioName(qualityReport.source_audio_path)}</strong></div>
