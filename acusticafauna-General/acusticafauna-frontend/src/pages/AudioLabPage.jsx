@@ -2,6 +2,15 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import Badge from "../components/shared/Badge";
 import SectionCard from "../components/shared/SectionCard";
 import {
+  FOLDER_BATCH_APPLIED_MESSAGE,
+  ZERO_CANDIDATE_VARIANTS,
+  buildFolderBatchFormFromCalibration,
+  calibrationFolderBatchPath,
+  folderBatchJobConfig,
+  folderBatchJobFinishedWithoutCandidates,
+  zeroCandidateConfigKey,
+} from "./audioLabFolderBatchCalibration";
+import {
   cancelAudioLabBatchProcessingJob,
   cancelAudioLabFolderBatchJob,
   cleanupAudioLabTestDerivatives,
@@ -125,6 +134,7 @@ const FOLDER_BATCH_DEFAULT_FORM = {
   resource_profile: "auto",
   exploratory_mode: false,
   calibration_mode_tag: "",
+  calibration_trace: null,
 };
 const FOLDER_BATCH_PRESETS = {
   conservador: { threshold_dbfs: -38, min_band_ratio: 0.6, min_activity_seconds: 0.6, noise_reduce: false },
@@ -152,24 +162,6 @@ const FOLDER_BATCH_PRESET_OPTIONS = [
   ["agresivo", "agresivo"],
   ["pristimantis_lluvia_viento", "Pristimantis lluvia/viento - detección suave"],
   ["personalizado", "personalizado"],
-];
-const FOLDER_BATCH_CALIBRATION_PARAM_KEYS = [
-  "frequency_min_hz",
-  "frequency_max_hz",
-  "threshold_dbfs",
-  "min_band_energy_ratio",
-  "min_band_ratio",
-  "min_activity_seconds",
-  "min_silence_seconds",
-  "padding_seconds",
-  "clip_duration_seconds",
-  "max_segment_seconds",
-  "bandpass",
-  "noise_reduce",
-  "normalize",
-  "discard_empty",
-  "create_clips",
-  "create_manifest",
 ];
 const CALIBRATION_DEFAULT_FORM = {
   folder_path: "",
@@ -497,14 +489,6 @@ function isFolderBatchJobForPath(job, folderPath) {
   const jobPath = folderBatchJobFolderPath(job);
   if (!jobPath || !folderPath) return false;
   return sameFolderPath(jobPath, folderPath);
-}
-
-function pickCalibrationFolderBatchParams(params = {}) {
-  const picked = {};
-  for (const key of FOLDER_BATCH_CALIBRATION_PARAM_KEYS) {
-    if (params[key] !== undefined && params[key] !== null) picked[key] = params[key];
-  }
-  return picked;
 }
 
 function isExploratoryConfigName(name) {
@@ -1053,6 +1037,7 @@ export default function AudioLabPage() {
   const uploadInputRef = useRef(null);
   const scanAbortControllerRef = useRef(null);
   const previousFolderBatchPathRef = useRef("");
+  const folderBatchSectionRef = useRef(null);
   const [labels, setLabels] = useState([]);
   const [segments, setSegments] = useState({ items: [], total: 0 });
   const [labelFilter, setLabelFilter] = useState("");
@@ -2774,62 +2759,83 @@ export default function AudioLabPage() {
     );
   }
 
+  function currentCalibrationSource() {
+    return {
+      folder_path_resolved:
+        calibrationTest?.folder_path_resolved ||
+        calibrationProfile?.folder_path_resolved ||
+        calibrationReport?.folder_path_resolved ||
+        "",
+      folder_path:
+        calibrationTest?.folder_path ||
+        calibrationProfile?.folder_path ||
+        calibrationReport?.folder_path ||
+        calibrationForm.folder_path,
+      label:
+        calibrationTest?.label ||
+        calibrationProfile?.label ||
+        calibrationReport?.label ||
+        calibrationForm.label,
+    };
+  }
+
+  function scrollToFolderBatchSection() {
+    if (typeof window === "undefined") return;
+    window.setTimeout(() => {
+      folderBatchSectionRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+    }, 0);
+  }
+
   function applyCalibrationToFolderBatch(params = recommendedCalibrationParameters(), options = {}) {
     if (!params) {
       setError("Primero analiza o prueba configuraciones para obtener una recomendacion.");
       return;
     }
-    const appliedConfigName = params.name || calibrationTest?.recommended_config || "";
+    const calibration = options.calibration || currentCalibrationSource();
+    const appliedConfigName = options.configName || params.name || calibrationTest?.recommended_config || "";
     const isExploratoryApply = options.exploratory === true || isExploratoryConfigName(appliedConfigName);
     if (isExploratoryApply && !options.skipExploratoryConfirm) {
       const confirmed = window.confirm("Esta configuración es exploratoria y puede generar falsos candidatos. Úsala solo para una muestra pequeña.");
       if (!confirmed) return;
     }
-    const copyFolderPath = options.copyFolderPath === true;
-    const targetFolderPath = copyFolderPath ? calibrationForm.folder_path.trim() : folderBatchForm.folder_path.trim();
+    const copyFolderPath = options.copyFolderPath !== false;
+    const targetFolderPath = copyFolderPath ? calibrationFolderBatchPath(calibration, params).trim() : folderBatchForm.folder_path.trim();
     if (!targetFolderPath) {
-      setError("Escribe la ruta local de la carpeta actual en Procesamiento masivo antes de aplicar parametros.");
+      setError(copyFolderPath ? "No hay ruta de calibracion para copiar al procesamiento masivo." : "Escribe la ruta local de la carpeta actual en Procesamiento masivo antes de aplicar parametros.");
       return;
     }
-    const picked = pickCalibrationFolderBatchParams(params);
-    const preserveProcessingFlags = Boolean(options.preserveProcessingFlags);
-    setFolderBatchForm((current) => ({
-      ...current,
-      folder_path: copyFolderPath ? calibrationForm.folder_path : current.folder_path,
-      target_label: options.copyLabel ? calibrationForm.label || current.target_label : current.target_label,
-      preset: options.preset || "personalizado",
-      frequency_min_hz: Number(picked.frequency_min_hz ?? current.frequency_min_hz),
-      frequency_max_hz: Number(picked.frequency_max_hz ?? current.frequency_max_hz),
-      threshold_dbfs: Number(picked.threshold_dbfs ?? current.threshold_dbfs),
-      min_band_ratio: Number(picked.min_band_ratio ?? picked.min_band_energy_ratio ?? current.min_band_ratio),
-      min_activity_seconds: Number(picked.min_activity_seconds ?? current.min_activity_seconds),
-      min_silence_seconds: Number(picked.min_silence_seconds ?? current.min_silence_seconds),
-      padding_seconds: Number(picked.padding_seconds ?? current.padding_seconds),
-      clip_duration_seconds: Number(picked.clip_duration_seconds ?? current.clip_duration_seconds),
-      max_segment_seconds: Number(picked.max_segment_seconds ?? current.max_segment_seconds),
-      bandpass: picked.bandpass ?? current.bandpass,
-      noise_reduce: preserveProcessingFlags ? picked.noise_reduce ?? current.noise_reduce : calibrationForm.calibration_mode === "detect" ? false : picked.noise_reduce ?? current.noise_reduce,
-      normalize: picked.normalize ?? current.normalize,
-      discard_empty: picked.discard_empty ?? current.discard_empty,
-      create_clips: picked.create_clips ?? current.create_clips,
-      create_manifest: picked.create_manifest ?? current.create_manifest,
-      exploratory_mode: isExploratoryApply,
-      calibration_mode_tag: isExploratoryApply ? appliedConfigName : "",
-    }));
+    const currentFolderPath = folderBatchForm.folder_path.trim();
+    if (copyFolderPath && currentFolderPath && !sameFolderPath(currentFolderPath, targetFolderPath)) {
+      const confirmed = window.confirm("Esto reemplazará la ruta y parámetros actuales del procesamiento masivo. ¿Continuar?");
+      if (!confirmed) return;
+    }
+    scanAbortControllerRef.current?.abort();
+    scanAbortControllerRef.current = null;
+    setFolderBatchScanning(false);
+    setFolderBatchForm((current) =>
+      buildFolderBatchFormFromCalibration({
+        currentForm: current,
+        params,
+        calibration,
+        copyFolderPath,
+        copyLabel: options.copyLabel !== false,
+        exploratory: isExploratoryApply,
+        configName: appliedConfigName,
+      })
+    );
     setFolderBatchScan(null);
     setFolderBatchScanState({
       status: "pending",
-      message: "Parametros aplicados. Escanea la carpeta actual para iniciar un nuevo procesamiento.",
+      message: FOLDER_BATCH_APPLIED_MESSAGE,
     });
-    const modeMessage =
-      appliedConfigName === "intermedia_exploratoria"
-        ? "Parametros intermedios aplicados. Revisa clips antes de ampliar el lote."
-        : appliedConfigName === "intermedia_cerrada"
-          ? "Parametros de prueba cerrada aplicados. Revisa clips antes de usarla en lote grande."
-          : isExploratoryApply
-            ? "Parametros exploratorios aplicados. Recomendado: procesar primero una muestra pequena."
-            : "Parametros aplicados. Escanea la carpeta actual para iniciar un nuevo procesamiento.";
-    setMessage(options.messageOverride || modeMessage);
+    setActiveFolderBatchJob((current) => current && !isFolderBatchJobForPath(current, targetFolderPath) ? null : current);
+    setFolderBatchOutputs([]);
+    setFolderBatchSummary(null);
+    setFolderBatchLogs("");
+    setSelectedAudio((current) => current?.kind === "folder_batch_output" ? null : current);
+    setError("");
+    setMessage(options.messageOverride || FOLDER_BATCH_APPLIED_MESSAGE);
+    scrollToFolderBatchSection();
   }
 
   function applySafeCalibrationToFolderBatch() {
@@ -2839,14 +2845,14 @@ export default function AudioLabPage() {
       return;
     }
     if (calibrationReportHistorical || calibrationReportIsFromAnotherFolder) {
-      const confirmed = window.confirm("Este reporte pertenece a otra carpeta. Quieres aplicar solo los parametros a la carpeta actual?");
+      const confirmed = window.confirm("Este reporte pertenece a otra carpeta. Quieres copiar esa ruta y parametros al procesamiento masivo?");
       if (!confirmed) return;
     }
-    applyCalibrationToFolderBatch(params, { preserveProcessingFlags: true, copyFolderPath: false });
+    applyCalibrationToFolderBatch(params, { copyFolderPath: true, configName: calibrationTest?.safe_recommended_config || params.name });
   }
 
   function applyExploratoryToSmallSample(params = recommendedCalibrationParameters()) {
-    applyCalibrationToFolderBatch(params, { preserveProcessingFlags: true, copyFolderPath: false, exploratory: true });
+    applyCalibrationToFolderBatch(params, { copyFolderPath: true, exploratory: true });
   }
 
   function applySmallBatchReviewToFolderBatch(params = recommendedCalibrationParameters(), row = recommendedConfigRow) {
@@ -2855,20 +2861,16 @@ export default function AudioLabPage() {
       setError(blockedReason);
       return;
     }
-    if (!folderBatchForm.folder_path.trim()) {
-      setError("Escribe primero la ruta actual en Procesamiento masivo.");
-      return;
-    }
     const confirmed = window.confirm(
       "Esta configuracion no es segura para todo el lote ni para entrenamiento automatico. Se usara solo para una muestra pequena de revision humana. Continuar?"
     );
     if (!confirmed) return;
     applyCalibrationToFolderBatch(params, {
-      preserveProcessingFlags: true,
-      copyFolderPath: false,
+      copyFolderPath: true,
       exploratory: true,
       skipExploratoryConfirm: true,
-      messageOverride: "Parametros aplicados para muestra pequena. Escanea la carpeta actual y procesa solo 10-20 audios.",
+      configName: row?.config || params?.name,
+      messageOverride: FOLDER_BATCH_APPLIED_MESSAGE,
     });
   }
 
@@ -2881,7 +2883,59 @@ export default function AudioLabPage() {
       setError("Escribe primero la ruta actual en Procesamiento masivo.");
       return;
     }
-    applyCalibrationToFolderBatch(params, { preserveProcessingFlags: true, copyFolderPath: false });
+    applyCalibrationToFolderBatch(params, { copyFolderPath: false, copyLabel: false });
+  }
+
+  function applyZeroCandidateVariant(variant) {
+    if (!activeFolderBatchJob?.id) {
+      setError("Selecciona primero el job que termino sin candidatos.");
+      return;
+    }
+    const previousConfig = folderBatchJobConfig(activeFolderBatchJob);
+    const previousFolderPath = folderBatchJobFolderPath(activeFolderBatchJob) || folderBatchForm.folder_path.trim();
+    if (!previousFolderPath) {
+      setError("No se encontro la ruta del job anterior para copiar la variante.");
+      return;
+    }
+    const currentFolderPath = folderBatchForm.folder_path.trim();
+    if (currentFolderPath && !sameFolderPath(currentFolderPath, previousFolderPath)) {
+      const confirmed = window.confirm("Esto reemplazara la ruta y parametros actuales del procesamiento masivo. Continuar?");
+      if (!confirmed) return;
+    }
+    scanAbortControllerRef.current?.abort();
+    scanAbortControllerRef.current = null;
+    setFolderBatchScanning(false);
+    setFolderBatchForm((current) => ({
+      ...buildFolderBatchFormFromCalibration({
+        currentForm: current,
+        params: variant,
+        calibration: {
+          folder_path: previousFolderPath,
+          label: activeFolderBatchJob.target_label || current.target_label,
+        },
+        copyFolderPath: true,
+        copyLabel: true,
+        exploratory: variant.name === ZERO_CANDIDATE_VARIANTS.widerDetection.name,
+        configName: variant.name,
+      }),
+      calibration_trace: {
+        reason: "zero_candidates_after_batch",
+        previous_job_id: activeFolderBatchJob.id,
+        previous_job_name: activeFolderBatchJob.job_name || "",
+        previous_job_status: activeFolderBatchJob.status,
+        previous_config: previousConfig,
+        applied_variant: variant.name,
+        applied_variant_label: variant.label,
+      },
+    }));
+    setFolderBatchScan(null);
+    setFolderBatchScanState({
+      status: "pending",
+      message: FOLDER_BATCH_APPLIED_MESSAGE,
+    });
+    setError("");
+    setMessage(`${variant.label} copiada al procesamiento masivo. Escanea la carpeta para iniciar un nuevo job.`);
+    scrollToFolderBatchSection();
   }
 
   function openCalibrationReport() {
@@ -3915,6 +3969,12 @@ export default function AudioLabPage() {
       activeFolderBatchJobFolderPath &&
       !sameFolderPath(activeFolderBatchJobFolderPath, folderBatchPath)
   );
+  const activeFolderBatchJobConfig = folderBatchJobConfig(activeFolderBatchJob);
+  const activeFolderBatchJobZeroCandidates = folderBatchJobFinishedWithoutCandidates(activeFolderBatchJob);
+  const activeFolderBatchJobConfigKey = zeroCandidateConfigKey(activeFolderBatchJobConfig);
+  const showWiderZeroCandidateFallback =
+    activeFolderBatchJobZeroCandidates &&
+    activeFolderBatchJobConfigKey === "zero_candidates_no_noise";
   const calibrationReportPath = calibrationReportFolderPath(calibrationReport || calibrationTest || calibrationProfile);
   const calibrationReportIsFromAnotherFolder = Boolean(
     folderBatchPath &&
@@ -5170,7 +5230,7 @@ python -m uvicorn ml_api.main:app --host 127.0.0.1 --port 8010 --reload`}
                           <td className="px-3 py-2">
                             <button
                               type="button"
-                              onClick={() => calibrationRowIsSmallBatchCandidate(item) ? applySmallBatchReviewToFolderBatch(item.parameters, item) : isExploratoryConfigName(item.config) ? applyCalibrationToFolderBatch(item.parameters, { preserveProcessingFlags: true, copyFolderPath: false, exploratory: true }) : applyOnlyCalibrationParametersToCurrentFolder(item.parameters)}
+                              onClick={() => calibrationRowIsSmallBatchCandidate(item) ? applySmallBatchReviewToFolderBatch(item.parameters, item) : isExploratoryConfigName(item.config) ? applyCalibrationToFolderBatch(item.parameters, { copyFolderPath: false, exploratory: true, configName: item.config }) : applyOnlyCalibrationParametersToCurrentFolder(item.parameters)}
                               disabled={calibrationRowIsSmallBatchCandidate(item) ? Boolean(smallBatchCandidateBlockedReason(item, previewReviewStarted)) : !folderBatchPath}
                               title={calibrationRowIsSmallBatchCandidate(item) ? smallBatchCandidateBlockedReason(item, previewReviewStarted) || "Copiar solo parametros para una muestra pequena de revision humana." : !folderBatchPath ? "Escribe primero la ruta actual en Procesamiento masivo." : ""}
                               className="rounded-lg border border-blue-300 bg-blue-50 px-2 py-1 text-xs font-semibold text-blue-800 disabled:opacity-50"
@@ -5222,8 +5282,9 @@ python -m uvicorn ml_api.main:app --host 127.0.0.1 --port 8010 --reload`}
         </div>
       </SectionCard>
 
-      <SectionCard title="Procesamiento masivo por carpeta local" subtitle="Limpia, segmenta y filtra carpetas grandes sin subir archivos uno por uno">
-        <div className="space-y-5">
+      <div ref={folderBatchSectionRef}>
+        <SectionCard title="Procesamiento masivo por carpeta local" subtitle="Limpia, segmenta y filtra carpetas grandes sin subir archivos uno por uno">
+          <div className="space-y-5">
           <div className="rounded-lg border border-emerald-200 bg-emerald-50 p-3 text-sm text-emerald-950">
             <p className="font-semibold">Para carpetas grandes, no subas archivos uno por uno. Escribe o pega la ruta local de la carpeta. El backend procesara los audios desde tu computador.</p>
             <p className="mt-1">Los audios originales no se modifican ni se borran. Los derivados y manifests se guardan en backend/storage/audio_lab/folder_batch_jobs.</p>
@@ -5255,6 +5316,18 @@ python -m uvicorn ml_api.main:app --host 127.0.0.1 --port 8010 --reload`}
                     <span className="font-semibold">Recomendado procesar primero una muestra pequeña.</span>
                   </div>
                   <p className="mt-1">Esta configuración puede incluir lluvia, viento o falsos candidatos. No usar para entrenamiento sin revisión manual.</p>
+                </div>
+              ) : null}
+
+              {folderBatchForm.calibration_trace?.reason === "zero_candidates_after_batch" ? (
+                <div className="rounded-lg border border-blue-200 bg-blue-50 p-3 text-xs text-blue-950">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Badge tone="info">Trazabilidad</Badge>
+                    <span className="font-semibold">Parámetros copiados desde un job terminado sin candidatos.</span>
+                  </div>
+                  <p className="mt-1"><strong>Job anterior:</strong> <span className="font-mono">{folderBatchForm.calibration_trace.previous_job_id}</span></p>
+                  <p className="mt-1"><strong>Configuración aplicada:</strong> {folderBatchForm.calibration_trace.applied_variant_label || folderBatchForm.calibration_trace.applied_variant}</p>
+                  <p className="mt-1"><strong>Razón:</strong> zero_candidates_after_batch</p>
                 </div>
               ) : null}
 
@@ -5442,6 +5515,38 @@ python -m uvicorn ml_api.main:app --host 127.0.0.1 --port 8010 --reload`}
                     <span>Duracion proc.: <strong>{formatTime(activeFolderBatchJob.processed_duration_seconds)}</strong></span>
                     <span>Progreso: <strong>{folderBatchProgress}%</strong></span>
                   </div>
+                  {activeFolderBatchJobZeroCandidates ? (
+                    <div className="mt-3 rounded-lg border border-amber-300 bg-amber-50 p-3 text-sm text-amber-950">
+                      <div className="flex flex-wrap items-start justify-between gap-3">
+                        <div>
+                          <h4 className="font-bold">El procesamiento terminó sin candidatos. La configuración puede ser demasiado estricta.</h4>
+                          <p className="mt-1 text-xs">No hubo error de lectura. Los audios originales no se modificaron. No se generaron clips porque ningún tramo pasó los filtros.</p>
+                        </div>
+                        <Badge tone="warning">zero_candidates_after_batch</Badge>
+                      </div>
+                      <div className="mt-3 grid gap-2 text-xs md:grid-cols-2">
+                        <p><strong>Job anterior:</strong> <span className="font-mono">{activeFolderBatchJob.id}</span></p>
+                        {activeFolderBatchJobConfig.has_saved_config ? (
+                          <p><strong>Configuracion usada:</strong> {activeFolderBatchJobConfig.frequency_min_hz}-{activeFolderBatchJobConfig.frequency_max_hz} Hz, threshold {activeFolderBatchJobConfig.threshold_dbfs} dBFS, ratio {formatNumber(activeFolderBatchJobConfig.min_band_ratio, 2)}, ruido {activeFolderBatchJobConfig.noise_reduce ? "si" : "no"}</p>
+                        ) : (
+                          <p><strong>Configuracion usada:</strong> Este job no tiene configuración guardada; puedes aplicar una variante manualmente.</p>
+                        )}
+                      </div>
+                      <div className="mt-3 flex flex-wrap gap-2">
+                        <button type="button" onClick={() => applyZeroCandidateVariant(ZERO_CANDIDATE_VARIANTS.sensitive)} className="rounded-lg bg-amber-700 px-3 py-2 text-xs font-semibold text-white">
+                          Probar variante más sensible
+                        </button>
+                        <button type="button" onClick={() => applyZeroCandidateVariant(ZERO_CANDIDATE_VARIANTS.noNoise)} className="rounded-lg border border-amber-300 bg-white px-3 py-2 text-xs font-semibold text-amber-900">
+                          Probar sin reducción de ruido
+                        </button>
+                        {showWiderZeroCandidateFallback ? (
+                          <button type="button" onClick={() => applyZeroCandidateVariant(ZERO_CANDIDATE_VARIANTS.widerDetection)} className="rounded-lg border border-blue-300 bg-blue-50 px-3 py-2 text-xs font-semibold text-blue-900">
+                            Volver a detección más amplia
+                          </button>
+                        ) : null}
+                      </div>
+                    </div>
+                  ) : null}
                   <div className="mt-3 flex flex-wrap gap-2">
                     <button type="button" onClick={() => setFolderBatchLogs((current) => current || "")} className="rounded-lg border border-blue-300 bg-white px-3 py-2 text-xs font-semibold">Ver logs</button>
                     <button type="button" onClick={openFolderBatchManifest} disabled={!activeFolderBatchJob.manifest_path} className="rounded-lg border border-blue-300 bg-white px-3 py-2 text-xs font-semibold disabled:opacity-50">Exportar manifest</button>
@@ -5590,8 +5695,9 @@ python -m uvicorn ml_api.main:app --host 127.0.0.1 --port 8010 --reload`}
               </div>
             </div>
           ) : null}
-        </div>
-      </SectionCard>
+          </div>
+        </SectionCard>
+      </div>
 
       <SectionCard title="Procesamiento por lote" subtitle="Limpia clips existentes o prepara audios crudos sin modificar originales">
         <div className="space-y-5">
