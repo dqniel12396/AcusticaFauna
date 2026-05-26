@@ -3,41 +3,43 @@ export const FOLDER_BATCH_APPLIED_MESSAGE =
 
 export const ZERO_CANDIDATE_VARIANTS = {
   sensitive: {
-    name: "zero_candidates_sensitive",
+    name: "more_sensitive_variant",
     label: "Variante mas sensible",
     frequency_min_hz: 2500,
-    frequency_max_hz: 4500,
-    threshold_dbfs: -51,
-    min_band_energy_ratio: 0.25,
-    min_band_ratio: 0.25,
+    frequency_max_hz: 5000,
+    threshold_dbfs: -52,
+    min_band_energy_ratio: 0.22,
+    min_band_ratio: 0.22,
     bandpass: true,
     noise_reduce: true,
     normalize: false,
-    min_activity_seconds: 0.25,
-    min_silence_seconds: 0.35,
-    padding_seconds: 0.12,
-    clip_duration_seconds: 3,
-    max_segment_seconds: 5,
+    min_activity_seconds: 0.2,
+    min_silence_seconds: 0.3,
+    padding_seconds: 0.15,
+    clip_duration_seconds: 5,
+    max_segment_seconds: 10,
+    preset: "personalizado",
   },
   noNoise: {
-    name: "zero_candidates_no_noise",
+    name: "no_noise_reduction_variant",
     label: "Variante sensible sin reduccion de ruido",
     frequency_min_hz: 2500,
-    frequency_max_hz: 4500,
-    threshold_dbfs: -51,
-    min_band_energy_ratio: 0.25,
-    min_band_ratio: 0.25,
+    frequency_max_hz: 5000,
+    threshold_dbfs: -52,
+    min_band_energy_ratio: 0.22,
+    min_band_ratio: 0.22,
     bandpass: true,
     noise_reduce: false,
     normalize: false,
-    min_activity_seconds: 0.25,
-    min_silence_seconds: 0.35,
-    padding_seconds: 0.12,
-    clip_duration_seconds: 3,
-    max_segment_seconds: 5,
+    min_activity_seconds: 0.2,
+    min_silence_seconds: 0.3,
+    padding_seconds: 0.15,
+    clip_duration_seconds: 5,
+    max_segment_seconds: 10,
+    preset: "personalizado",
   },
   widerDetection: {
-    name: "zero_candidates_wider_detection",
+    name: "broader_detection",
     label: "Volver a deteccion mas amplia",
     frequency_min_hz: 2200,
     frequency_max_hz: 3300,
@@ -47,8 +49,24 @@ export const ZERO_CANDIDATE_VARIANTS = {
     bandpass: true,
     noise_reduce: false,
     normalize: false,
+    min_activity_seconds: 0.25,
+    min_silence_seconds: 0.35,
+    padding_seconds: 0.12,
+    clip_duration_seconds: 3,
+    max_segment_seconds: 5,
+    preset: "personalizado",
   },
 };
+
+export const RECOMMENDED_BROADER_DETECTION_CONFIG = {
+  ...ZERO_CANDIDATE_VARIANTS.widerDetection,
+  name: "amplia_2200_3300_m51_r023_no_noise",
+  label: "Amplia 2200-3300 sin reduccion",
+  purpose: "Recomendada cuando 2500-5000 Hz da pocos candidatos. Revisar previews antes de entrenamiento.",
+};
+
+export const ZERO_CANDIDATE_RECOVERY_MESSAGE =
+  "Parámetros aplicados. Escanea la carpeta y ejecuta un nuevo job.";
 
 export const DEFAULT_FOLDER_BATCH_CONFIG = {
   frequency_min_hz: 1800,
@@ -119,6 +137,20 @@ function parseJsonObject(value) {
 
 export function parseFolderBatchJobParams(job = {}) {
   return parseJsonObject(objectOrEmpty(job).params_json);
+}
+
+export function normalizeFolderBatchOutputsResponse(payload = {}) {
+  const source = objectOrEmpty(payload);
+  const outputs = Array.isArray(source.items) ? source.items : Array.isArray(source.outputs) ? source.outputs : [];
+  return {
+    ...source,
+    items: outputs,
+    outputs,
+    count: Number(source.count ?? source.total ?? outputs.length),
+    total: Number(source.total ?? source.count ?? outputs.length),
+    empty: outputs.length === 0,
+    message: source.message || (outputs.length === 0 ? "No hay clips generados para este job. La configuracion no produjo candidatos." : ""),
+  };
 }
 
 function configSources(value = {}) {
@@ -229,9 +261,9 @@ export function zeroCandidateConfigKey(config = {}) {
   }
   if (
     closeEnough(normalized.frequency_min_hz, 2500) &&
-    closeEnough(normalized.frequency_max_hz, 4500) &&
-    closeEnough(normalized.threshold_dbfs, -51) &&
-    closeEnough(ratio, 0.25) &&
+    closeEnough(normalized.frequency_max_hz, 5000) &&
+    closeEnough(normalized.threshold_dbfs, -52) &&
+    closeEnough(ratio, 0.22) &&
     normalized.bandpass === true &&
     normalized.noise_reduce === true &&
     normalized.normalize === false
@@ -240,16 +272,156 @@ export function zeroCandidateConfigKey(config = {}) {
   }
   if (
     closeEnough(normalized.frequency_min_hz, 2500) &&
-    closeEnough(normalized.frequency_max_hz, 4500) &&
-    closeEnough(normalized.threshold_dbfs, -51) &&
-    closeEnough(ratio, 0.25) &&
+    closeEnough(normalized.frequency_max_hz, 5000) &&
+    closeEnough(normalized.threshold_dbfs, -52) &&
+    closeEnough(ratio, 0.22) &&
     normalized.bandpass === true &&
     normalized.noise_reduce === false &&
     normalized.normalize === false
   ) {
     return "zero_candidates_no_noise";
   }
+  if (
+    closeEnough(normalized.frequency_min_hz, 2500) &&
+    closeEnough(normalized.frequency_max_hz, 5000) &&
+    closeEnough(normalized.threshold_dbfs, -51) &&
+    closeEnough(ratio, 0.25) &&
+    normalized.bandpass === true &&
+    normalized.noise_reduce === false &&
+    normalized.normalize === false
+  ) {
+    return "zero_candidates_review_no_noise";
+  }
   return "other";
+}
+
+export function selectZeroCandidateRecovery(job = {}) {
+  if (!folderBatchJobFinishedWithoutCandidates(job)) return null;
+  const key = zeroCandidateConfigKey(folderBatchJobConfig(job));
+  if (key === "zero_candidates_sensitive") {
+    return {
+      key: "no_noise_reduction_variant",
+      actionLabel: "Probar sin reducción de ruido",
+      variant: ZERO_CANDIDATE_VARIANTS.noNoise,
+    };
+  }
+  if (key === "zero_candidates_no_noise" || key === "zero_candidates_review_no_noise") {
+    return {
+      key: "broader_detection",
+      actionLabel: "Volver a detección más amplia recomendada",
+      variant: RECOMMENDED_BROADER_DETECTION_CONFIG,
+    };
+  }
+  return {
+    key: "more_sensitive_variant",
+    actionLabel: "Probar variante más sensible",
+    variant: ZERO_CANDIDATE_VARIANTS.sensitive,
+  };
+}
+
+function normalizedText(value) {
+  return String(value || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .trim()
+    .toLowerCase();
+}
+
+function calibrationRowKeys(item = {}) {
+  return [
+    item.config,
+    item.name,
+    item.label,
+    item.parameters?.name,
+    item.parameters?.label,
+  ].map(normalizedText).filter(Boolean);
+}
+
+function calibrationRowMatches(item, value) {
+  const normalizedValue = normalizedText(value);
+  return Boolean(normalizedValue && calibrationRowKeys(item).includes(normalizedValue));
+}
+
+export function isRecommendedBroaderDetectionConfig(value = {}) {
+  const source = objectOrEmpty(value);
+  const params = objectOrEmpty(source.parameters);
+  const config = { ...source, ...params };
+  const ratio = config.min_band_ratio ?? config.min_band_energy_ratio;
+  return Boolean(
+    config.name === "amplia_2200_3300_m51_r023_no_noise" ||
+      config.config === "amplia_2200_3300_m51_r023_no_noise" ||
+      config.name === "broader_detection" ||
+      config.config === "broader_detection" ||
+      (
+        closeEnough(config.frequency_min_hz, 2200) &&
+        closeEnough(config.frequency_max_hz, 3300) &&
+        closeEnough(config.threshold_dbfs, -51) &&
+        closeEnough(ratio, 0.23) &&
+        config.noise_reduce === false &&
+        config.normalize === false
+      )
+  );
+}
+
+export function calibrationRowIsLowCandidateStrictProbe(item = {}) {
+  const source = objectOrEmpty(item);
+  const params = objectOrEmpty(source.parameters);
+  const config = { ...source, ...params };
+  const ratio = config.min_band_ratio ?? config.min_band_energy_ratio;
+  return Boolean(
+    closeEnough(config.frequency_min_hz, 2500) &&
+      (closeEnough(config.frequency_max_hz, 4500) || closeEnough(config.frequency_max_hz, 5000)) &&
+      Number(ratio || 0) >= 0.22 &&
+      Number(source.total_candidates || source.candidates || 0) <= 1 &&
+      Number(source.possible_damage_count || 0) === 0 &&
+      Number(source.clipping_count || 0) === 0
+  );
+}
+
+export function calibrationReportHasExploratoryWide(report = {}) {
+  return (report.configs || []).some((item) => {
+    const keys = calibrationRowKeys(item);
+    return keys.includes("exploratory_wide") || keys.includes("exploratoria amplia");
+  });
+}
+
+export function recommendedCalibrationNextStep(report = {}) {
+  const rows = report.configs || [];
+  if (report.best_next_step === "try_broader_detection") return "try_broader_detection";
+  const recommendedName = report.recommended_config || report.recommended_parameters?.name || "";
+  const recommendedRow = rows.find((item) => calibrationRowMatches(item, recommendedName));
+  const hasExploratoryWide = calibrationReportHasExploratoryWide(report);
+  const hasRecommendedBroaderCleanCandidates = Boolean(
+    recommendedRow &&
+      isRecommendedBroaderDetectionConfig(recommendedRow) &&
+      Number(recommendedRow.total_candidates || 0) > 0 &&
+      Number(recommendedRow.possible_damage_count || 0) === 0 &&
+      Number(recommendedRow.clipping_count || 0) === 0
+  );
+  const hasCleanCandidates = Boolean(
+    recommendedRow &&
+      Number(recommendedRow.total_candidates || 0) > 0 &&
+      Number(recommendedRow.possible_damage_count || 0) === 0 &&
+      Number(recommendedRow.clipping_count || 0) === 0
+  );
+  if (hasRecommendedBroaderCleanCandidates) return "review_previews";
+  if (!rows.some(isRecommendedBroaderDetectionConfig) && rows.some(calibrationRowIsLowCandidateStrictProbe)) {
+    return "try_broader_detection";
+  }
+  if (
+    hasCleanCandidates &&
+    ["requires_review", "candidate_for_review"].includes(recommendedRow.recommendation)
+  ) {
+    return "review_previews";
+  }
+  if (!hasExploratoryWide && rows.length && rows.every((item) => Number(item.total_candidates || 0) === 0)) {
+    return "try_exploratory_wide";
+  }
+  if (hasExploratoryWide && rows.some((item) => Number(item.total_candidates || 0) > 0)) {
+    return "try_more_sensitive_variant";
+  }
+  if (rows.length) return "review_results";
+  return "run_config_comparison";
 }
 
 export function pickCalibrationFolderBatchParams(params = {}) {

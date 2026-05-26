@@ -74,6 +74,18 @@ Abre:
 http://localhost:5173
 ```
 
+### CORS y hosts locales
+
+Para el navegador, `localhost` y `127.0.0.1` son origins diferentes. En desarrollo, el backend permite por defecto `http://localhost:5173`, `http://127.0.0.1:5173`, `http://localhost:5174` y `http://127.0.0.1:5174`.
+
+Si necesitas otro origin, agrega una lista separada por comas en `.env`:
+
+```env
+CORS_ORIGINS=http://localhost:5175,http://127.0.0.1:5175
+```
+
+Usa la misma forma de host de manera consistente durante la sesión. Por ejemplo, si abres el frontend en `http://localhost:5173`, ese origin debe estar permitido aunque el backend responda en `http://127.0.0.1:8000`.
+
 ## Si no tienes Git instalado
 
 Puedes descargar el ZIP desde GitHub:

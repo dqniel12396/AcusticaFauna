@@ -3,8 +3,15 @@ import {
   DEFAULT_FOLDER_BATCH_CONFIG,
   ZERO_CANDIDATE_VARIANTS,
   buildFolderBatchFormFromCalibration,
+  calibrationReportHasExploratoryWide,
+  calibrationRowIsLowCandidateStrictProbe,
   folderBatchJobConfig,
   folderBatchJobFinishedWithoutCandidates,
+  isRecommendedBroaderDetectionConfig,
+  normalizeFolderBatchOutputsResponse,
+  RECOMMENDED_BROADER_DETECTION_CONFIG,
+  recommendedCalibrationNextStep,
+  selectZeroCandidateRecovery,
   zeroCandidateConfigKey,
 } from "./audioLabFolderBatchCalibration.js";
 
@@ -105,9 +112,9 @@ const zeroCandidateJob = {
 assert.equal(folderBatchJobFinishedWithoutCandidates(zeroCandidateJob), true);
 assert.equal(zeroCandidateConfigKey(folderBatchJobConfig(zeroCandidateJob)), "balanceada_safe");
 assert.equal(ZERO_CANDIDATE_VARIANTS.sensitive.frequency_min_hz, 2500);
-assert.equal(ZERO_CANDIDATE_VARIANTS.sensitive.frequency_max_hz, 4500);
-assert.equal(ZERO_CANDIDATE_VARIANTS.sensitive.threshold_dbfs, -51);
-assert.equal(ZERO_CANDIDATE_VARIANTS.sensitive.min_band_energy_ratio, 0.25);
+assert.equal(ZERO_CANDIDATE_VARIANTS.sensitive.frequency_max_hz, 5000);
+assert.equal(ZERO_CANDIDATE_VARIANTS.sensitive.threshold_dbfs, -52);
+assert.equal(ZERO_CANDIDATE_VARIANTS.sensitive.min_band_energy_ratio, 0.22);
 assert.equal(ZERO_CANDIDATE_VARIANTS.sensitive.noise_reduce, true);
 assert.equal(ZERO_CANDIDATE_VARIANTS.noNoise.noise_reduce, false);
 assert.equal(ZERO_CANDIDATE_VARIANTS.widerDetection.frequency_min_hz, 2200);
@@ -143,5 +150,147 @@ assert.equal(folderBatchJobFinishedWithoutCandidates(oldJobWithoutConfig), true)
 assert.equal(folderBatchJobFinishedWithoutCandidates(null), false);
 assert.equal(zeroCandidateConfigKey(null), "other");
 assert.equal(Boolean(ZERO_CANDIDATE_VARIANTS.sensitive && ZERO_CANDIDATE_VARIANTS.noNoise), true);
+
+const emptyOutputs = normalizeFolderBatchOutputsResponse({
+  job_id: "job_empty_outputs",
+  outputs: [],
+  count: 0,
+  message: "No se generaron clips porque ningun tramo paso los filtros.",
+});
+assert.deepEqual(emptyOutputs.items, []);
+assert.equal(emptyOutputs.empty, true);
+assert.equal(emptyOutputs.count, 0);
+assert.equal(emptyOutputs.message.includes("No se generaron clips"), true);
+
+assert.equal(selectZeroCandidateRecovery(zeroCandidateJob).actionLabel, "Probar variante más sensible");
+
+const sensitiveNoiseJob = {
+  ...zeroCandidateJob,
+  frequency_max_hz: 5000,
+  threshold_dbfs: -52,
+  params_json: JSON.stringify({
+    min_band_ratio: 0.22,
+    bandpass: true,
+    noise_reduce: true,
+    normalize: false,
+  }),
+};
+assert.equal(zeroCandidateConfigKey(folderBatchJobConfig(sensitiveNoiseJob)), "zero_candidates_sensitive");
+assert.equal(selectZeroCandidateRecovery(sensitiveNoiseJob).actionLabel, "Probar sin reducción de ruido");
+
+const sensitiveNoNoiseJob = {
+  ...sensitiveNoiseJob,
+  params_json: JSON.stringify({
+    min_band_ratio: 0.22,
+    bandpass: true,
+    noise_reduce: false,
+    normalize: false,
+  }),
+};
+assert.equal(zeroCandidateConfigKey(folderBatchJobConfig(sensitiveNoNoiseJob)), "zero_candidates_no_noise");
+assert.equal(selectZeroCandidateRecovery(sensitiveNoNoiseJob).actionLabel, "Volver a detección más amplia recomendada");
+assert.equal(selectZeroCandidateRecovery(sensitiveNoNoiseJob).variant.frequency_min_hz, 2200);
+assert.equal(selectZeroCandidateRecovery(sensitiveNoNoiseJob).variant.frequency_max_hz, 3300);
+assert.equal(selectZeroCandidateRecovery(sensitiveNoNoiseJob).variant.threshold_dbfs, -51);
+assert.equal(selectZeroCandidateRecovery(sensitiveNoNoiseJob).variant.min_band_ratio, 0.23);
+assert.equal(selectZeroCandidateRecovery(sensitiveNoNoiseJob).variant.noise_reduce, false);
+assert.equal(selectZeroCandidateRecovery(sensitiveNoNoiseJob).variant.name, "amplia_2200_3300_m51_r023_no_noise");
+
+const reviewNoNoiseZeroJob = {
+  ...zeroCandidateJob,
+  frequency_max_hz: 5000,
+  threshold_dbfs: -51,
+  params_json: JSON.stringify({
+    min_band_ratio: 0.25,
+    bandpass: true,
+    noise_reduce: false,
+    normalize: false,
+  }),
+};
+assert.equal(zeroCandidateConfigKey(folderBatchJobConfig(reviewNoNoiseZeroJob)), "zero_candidates_review_no_noise");
+assert.equal(selectZeroCandidateRecovery(reviewNoNoiseZeroJob).actionLabel, "Volver a detección más amplia recomendada");
+
+const reviewReport = {
+  recommended_config: "intermedia_sin_norm",
+  configs: [{
+    config: "intermedia_sin_norm",
+    total_candidates: 1,
+    possible_damage_count: 0,
+    clipping_count: 0,
+    recommendation: "requires_review",
+  }],
+};
+assert.equal(recommendedCalibrationNextStep(reviewReport), "review_previews");
+
+const exploratoryAlreadyExists = {
+  configs: [
+    { config: "exploratory_wide", label: "Exploratoria amplia", total_candidates: 0 },
+    { config: "balanceada", total_candidates: 0 },
+  ],
+};
+assert.equal(calibrationReportHasExploratoryWide(exploratoryAlreadyExists), true);
+assert.notEqual(recommendedCalibrationNextStep(exploratoryAlreadyExists), "try_exploratory_wide");
+
+const rowExactParams = buildFolderBatchFormFromCalibration({
+  currentForm,
+  calibration: {
+    folder_path: "F:\\PROYECTO de cosa de sonido\\prueba de Pristimantis simoterus",
+    label: "Pristimantis_simoterus",
+  },
+  params: {
+    frequency_min_hz: 2500,
+    frequency_max_hz: 5000,
+    threshold_dbfs: -52,
+    min_band_ratio: 0.22,
+    noise_reduce: true,
+    normalize: false,
+  },
+});
+assert.equal(rowExactParams.frequency_max_hz, 5000);
+assert.equal(rowExactParams.threshold_dbfs, -52);
+assert.equal(rowExactParams.min_band_ratio, 0.22);
+assert.equal(rowExactParams.noise_reduce, true);
+
+const strictFewCandidatesReport = {
+  configs: [
+    {
+      config: "revision_2500_5000_m51_r025_no_noise",
+      parameters: {
+        frequency_min_hz: 2500,
+        frequency_max_hz: 5000,
+        threshold_dbfs: -51,
+        min_band_energy_ratio: 0.25,
+        noise_reduce: false,
+        normalize: false,
+      },
+      total_candidates: 1,
+      possible_damage_count: 0,
+      clipping_count: 0,
+      recommendation: "requires_review",
+    },
+  ],
+};
+assert.equal(calibrationRowIsLowCandidateStrictProbe(strictFewCandidatesReport.configs[0]), true);
+assert.equal(recommendedCalibrationNextStep(strictFewCandidatesReport), "try_broader_detection");
+assert.equal(RECOMMENDED_BROADER_DETECTION_CONFIG.frequency_min_hz, 2200);
+assert.equal(RECOMMENDED_BROADER_DETECTION_CONFIG.frequency_max_hz, 3300);
+assert.equal(RECOMMENDED_BROADER_DETECTION_CONFIG.threshold_dbfs, -51);
+assert.equal(RECOMMENDED_BROADER_DETECTION_CONFIG.min_band_ratio, 0.23);
+assert.equal(RECOMMENDED_BROADER_DETECTION_CONFIG.noise_reduce, false);
+assert.equal(RECOMMENDED_BROADER_DETECTION_CONFIG.normalize, false);
+
+const broaderSafeReport = {
+  recommended_config: "amplia_2200_3300_m51_r023_no_noise",
+  configs: [{
+    config: "amplia_2200_3300_m51_r023_no_noise",
+    parameters: RECOMMENDED_BROADER_DETECTION_CONFIG,
+    total_candidates: 8,
+    possible_damage_count: 0,
+    clipping_count: 0,
+    recommendation: "safe_for_review",
+  }],
+};
+assert.equal(isRecommendedBroaderDetectionConfig(broaderSafeReport.configs[0]), true);
+assert.equal(recommendedCalibrationNextStep(broaderSafeReport), "review_previews");
 
 console.log("audioLabFolderBatchCalibration.test.js passed");

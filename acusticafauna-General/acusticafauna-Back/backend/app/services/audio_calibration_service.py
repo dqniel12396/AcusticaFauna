@@ -254,6 +254,28 @@ SUGGESTED_NARROWER_TOO_MANY_VARIANT = {
     "purpose": "Si intermedia_cerrada sigue demasiado amplia, subir threshold y ratio.",
 }
 
+RECOMMENDED_BROADER_DETECTION_CONFIG = {
+    **SUGGESTED_NARROWER_TOO_MANY_VARIANT,
+    "name": "amplia_2200_3300_m51_r023_no_noise",
+    "label": "Amplia 2200-3300 sin reduccion",
+    "frequency_min_hz": 2200,
+    "frequency_max_hz": 3300,
+    "threshold_dbfs": -51,
+    "min_band_energy_ratio": 0.23,
+    "min_band_ratio": 0.23,
+    "bandpass": True,
+    "noise_reduce": False,
+    "normalize": False,
+    "min_activity_seconds": 0.25,
+    "min_silence_seconds": 0.35,
+    "padding_seconds": 0.12,
+    "clip_duration_seconds": 3,
+    "max_segment_seconds": 5,
+    "preset": "personalizado",
+    "detection_only": False,
+    "purpose": "Recomendada para Pristimantis cuando 2500-5000 Hz da pocos candidatos; revisar previews antes de entrenamiento.",
+}
+
 SUGGESTED_NARROWER_TOO_MANY_RATIO025_VARIANT = {
     **SUGGESTED_NARROWER_TOO_MANY_VARIANT,
     "name": "intermedia_cerrada_mas_selectiva_ratio025",
@@ -985,11 +1007,6 @@ def test_audio_processing_configs(
         duration_ratio = round(total_duration / analyzed_duration, 6) if analyzed_duration else 0.0
         duration_reasonable = total_duration > 0 and duration_ratio <= 0.35
         requires_manual_review = bool(useful_candidates) and not duration_reasonable
-        small_batch_review_candidate = bool(
-            requires_manual_review
-            and possible_damage_count == 0
-            and clipping_count == 0
-        )
         cleaning_safe = (
             bool(qualities)
             and not config.get("detection_only")
@@ -1000,6 +1017,18 @@ def test_audio_processing_configs(
         )
         detection_label = "candidate_for_review" if useful_candidates and duration_reasonable else "too_few_candidates" if not useful_candidates else "too_many_candidates"
         cleaning_label = "not_applicable_detection_only" if config.get("detection_only") else "safe_for_review" if cleaning_safe else "requires_review"
+        review_preview_candidate = bool(
+            len(segments_all) > 0
+            and possible_damage_count == 0
+            and clipping_count == 0
+            and cleaning_label == "requires_review"
+        )
+        small_batch_review_candidate = bool(
+            (requires_manual_review or review_preview_candidate)
+            and len(segments_all) > 0
+            and possible_damage_count == 0
+            and clipping_count == 0
+        )
         summary = {
             "config": config["name"],
             "label": config["label"],
@@ -1029,6 +1058,7 @@ def test_audio_processing_configs(
                 "duration_reasonable": duration_reasonable,
                 "requires_manual_review": requires_manual_review,
                 "candidate_for_small_batch_review": small_batch_review_candidate,
+                "review_preview_candidate": review_preview_candidate,
                 "average_band_energy_ratio": mean_or_none(segment.band_energy_ratio for segment in segments_all),
                 "average_score": mean_or_none(segment.score for segment in segments_all),
                 "recommendation": detection_label,
@@ -1049,10 +1079,11 @@ def test_audio_processing_configs(
     best_detection = choose_best_detection_config(summaries)
     best_cleaning = choose_best_cleaning_config(summaries)
     safe_recommended = choose_safe_recommended_config(summaries)
+    final_recommendation_profiles = build_final_recommendation_profiles(summaries)
     recommended = choose_recommended_config(summaries)
-    final_recommendation = build_final_recommendation(best_detection, best_cleaning)
     incremental_recommendation = build_incremental_recommendation(recommended)
     recommended_summary = next((item for item in summaries if item.get("config") == (recommended or {}).get("config")), None)
+    final_recommendation = build_final_recommendation(best_detection, best_cleaning, review_candidate=recommended_summary)
     recommended_config_name = (recommended or {}).get("config")
     recommended_recommendation = (recommended_summary or {}).get("recommendation")
     no_candidates = bool(summaries) and all(int(item.get("total_candidates") or 0) == 0 for item in summaries)
@@ -1060,9 +1091,17 @@ def test_audio_processing_configs(
     recommended_is_intermediate = recommended_config_name == "intermedia_exploratoria"
     recommended_is_narrower = recommended_config_name == "intermedia_cerrada"
     recommended_is_selective = recommended_config_name in {"intermedia_cerrada_mas_selectiva", "intermedia_cerrada_mas_selectiva_ratio025"}
+    recommended_is_broader_detection = is_recommended_broader_detection_summary(recommended_summary)
     recommended_is_unsafe_probe = bool(
         recommended_is_exploratory_wide
         or (recommended_is_intermediate and recommended_recommendation == "too_many_candidates")
+    )
+    has_exploratory_wide = any(item.get("config") == "exploratory_wide" or item.get("label") == "Exploratoria amplia" for item in summaries)
+    has_broader_detection = any(is_recommended_broader_detection_summary(item) for item in summaries)
+    should_try_broader_detection = bool(
+        not has_broader_detection
+        and summaries
+        and any(is_low_candidate_strict_probe(item) for item in summaries)
     )
     strict_probe_no_candidates = bool(no_candidates and selected and all(config.get("name") == "intermedia_cerrada_estricta" for config in selected))
     should_try_intermediate = bool(
@@ -1071,9 +1110,14 @@ def test_audio_processing_configs(
     should_try_narrower = bool(
         recommended_is_intermediate and recommended_recommendation == "too_many_candidates"
     )
-    if strict_probe_no_candidates:
+    should_review_previews = is_review_preview_candidate(recommended_summary)
+    if recommended_is_broader_detection and recommended_summary and int(recommended_summary.get("total_candidates") or 0) > 0:
+        best_next_step = "review_previews"
+    elif should_try_broader_detection:
+        best_next_step = "try_broader_detection"
+    elif strict_probe_no_candidates:
         best_next_step = "return_to_selective_config"
-    elif no_candidates:
+    elif no_candidates and not has_exploratory_wide:
         best_next_step = "try_exploratory_wide"
     elif should_try_intermediate:
         best_next_step = "try_intermediate_config"
@@ -1081,6 +1125,8 @@ def test_audio_processing_configs(
         best_next_step = "try_narrower_config"
     elif recommended_is_selective and recommended_recommendation == "too_many_candidates":
         best_next_step = "manual_review_or_tighten"
+    elif should_review_previews:
+        best_next_step = "review_previews"
     elif safe_recommended:
         best_next_step = "apply_safe_config"
     elif any(item.get("recommendation") == "too_many_candidates" for item in summaries):
@@ -1106,10 +1152,11 @@ def test_audio_processing_configs(
         "best_detection_parameters": best_detection["parameters"] if best_detection else None,
         "best_cleaning_config": best_cleaning["config"] if best_cleaning else None,
         "best_cleaning_parameters": best_cleaning["parameters"] if best_cleaning else None,
-        "safe_recommended_config": None if recommended_is_unsafe_probe else safe_recommended["config"] if safe_recommended else None,
-        "safe_recommended_parameters": None if recommended_is_unsafe_probe else safe_recommended["parameters"] if safe_recommended else None,
+        "safe_recommended_config": None if recommended_is_unsafe_probe or recommended_is_broader_detection else safe_recommended["config"] if safe_recommended else None,
+        "safe_recommended_parameters": None if recommended_is_unsafe_probe or recommended_is_broader_detection else safe_recommended["parameters"] if safe_recommended else None,
         "cleaning_safe": bool(safe_recommended) and not recommended_is_unsafe_probe,
         "best_next_step": best_next_step,
+        "suggested_broader_detection_config": RECOMMENDED_BROADER_DETECTION_CONFIG if should_try_broader_detection else None,
         "suggested_intermediate_config": SUGGESTED_INTERMEDIATE_CONFIG if should_try_intermediate else None,
         "suggested_narrower_config": SUGGESTED_NARROWER_CONFIG if should_try_narrower else None,
         "suggested_stricter_config": SUGGESTED_STRICT_NARROWER_CONFIG if recommended_is_selective and recommended_recommendation == "too_many_candidates" else None,
@@ -1138,6 +1185,7 @@ def test_audio_processing_configs(
         "legacy_report": False,
         "recommendation_explanation": recommendation_explanation,
         "final_recommendation": final_recommendation,
+        "final_recommendation_profiles": final_recommendation_profiles,
         "incremental_recommendation": incremental_recommendation,
         "configs": summaries,
         "previews": preview_records,
@@ -1157,7 +1205,145 @@ def test_audio_processing_configs(
 
 
 def choose_recommended_config(summaries: list[dict[str, Any]]) -> dict[str, Any] | None:
-    return choose_best_cleaning_config(summaries) or choose_best_detection_config(summaries)
+    profiles = build_final_recommendation_profiles(summaries)
+    return (profiles.get("balanced_config") or {}).get("config_summary") or choose_best_cleaning_config(summaries) or choose_best_detection_config(summaries)
+
+
+def profile_contrast_after(item: dict[str, Any] | None) -> float:
+    contrast = (item or {}).get("contrast_before_after") or {}
+    return float(contrast.get("after_db") or 0)
+
+
+def profile_contrast_delta(item: dict[str, Any] | None) -> float:
+    contrast = (item or {}).get("contrast_before_after") or {}
+    return float(contrast.get("delta_db") or 0)
+
+
+def profile_duration(item: dict[str, Any] | None) -> float:
+    return float((item or {}).get("total_duration_candidates") or 0)
+
+
+def profile_candidates(item: dict[str, Any] | None) -> int:
+    return int((item or {}).get("total_candidates") or 0)
+
+
+def profile_ratio(item: dict[str, Any] | None) -> float:
+    return float((item or {}).get("average_band_energy_ratio") or 0)
+
+
+def profile_width(item: dict[str, Any] | None) -> float:
+    params = summary_parameters(item)
+    return float(params.get("frequency_max_hz") or 0) - float(params.get("frequency_min_hz") or 0)
+
+
+def clean_review_candidates(summaries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        item for item in summaries
+        if profile_candidates(item) > 0
+        and int(item.get("possible_damage_count") or 0) == 0
+        and int(item.get("clipping_count") or 0) == 0
+        and item.get("recommendation") in {"safe_for_review", "requires_review", "candidate_for_review"}
+    ]
+
+
+def profile_payload(item: dict[str, Any] | None, role: str, title: str, warning: str) -> dict[str, Any] | None:
+    if not item:
+        return None
+    return {
+        "role": role,
+        "title": title,
+        "config": item.get("config"),
+        "label": item.get("label"),
+        "parameters": item.get("parameters"),
+        "total_candidates": item.get("total_candidates"),
+        "total_duration_candidates": item.get("total_duration_candidates"),
+        "average_band_energy_ratio": item.get("average_band_energy_ratio"),
+        "possible_damage_count": item.get("possible_damage_count"),
+        "clipping_count": item.get("clipping_count"),
+        "contrast_before_after": item.get("contrast_before_after"),
+        "recommendation": item.get("recommendation"),
+        "review_status": item.get("review_status") or "candidate_for_small_batch_review",
+        "warning": warning,
+        "training_allowed": False,
+        "config_summary": item,
+    }
+
+
+def build_final_recommendation_profiles(summaries: list[dict[str, Any]]) -> dict[str, Any]:
+    clean = clean_review_candidates(summaries)
+    if not clean:
+        exploratory = next((item for item in summaries if item.get("recommendation") == "too_many_candidates"), None)
+        return {
+            "high_confidence_config": None,
+            "balanced_config": None,
+            "high_recall_config": None,
+            "exploratory_config": profile_payload(exploratory, "exploratory", "Exploratoria", "Solo exploracion. No usar para entrenamiento."),
+            "primary_recommended_profile": None,
+            "training_allowed": False,
+        }
+
+    high_confidence = sorted(
+        clean,
+        key=lambda item: (
+            0 if 1 <= profile_candidates(item) <= 8 else 1,
+            -profile_ratio(item),
+            -profile_contrast_after(item),
+            profile_duration(item),
+        ),
+    )[0]
+    balanced_pool = [
+        item for item in clean
+        if 5 <= profile_candidates(item) <= 24
+        and profile_duration(item) <= 14
+        and not is_recommended_broader_detection_summary(item)
+    ] or [item for item in clean if 5 <= profile_candidates(item) <= 24 and profile_duration(item) <= 14] or clean
+    balanced = sorted(
+        balanced_pool,
+        key=lambda item: (
+            abs(profile_candidates(item) - 14),
+            abs(profile_duration(item) - 7.0),
+            -profile_ratio(item),
+            -profile_contrast_after(item),
+        ),
+    )[0]
+    recall_pool = [
+        item for item in clean
+        if item is not balanced
+        and profile_candidates(item) >= profile_candidates(balanced)
+        and profile_candidates(item) <= 30
+    ] or [item for item in clean if item is not balanced] or clean
+    high_recall = sorted(
+        recall_pool,
+        key=lambda item: (
+            -profile_candidates(item),
+            profile_duration(item),
+            -profile_ratio(item),
+        ),
+    )[0]
+    exploratory_pool = [
+        item for item in summaries
+        if item.get("recommendation") == "too_many_candidates"
+        or profile_candidates(item) > 30
+        or profile_duration(item) > 20
+        or profile_width(item) >= 1500
+    ]
+    exploratory = sorted(
+        exploratory_pool,
+        key=lambda item: (
+            0 if item.get("recommendation") == "too_many_candidates" else 1,
+            -profile_candidates(item),
+            -profile_duration(item),
+        ),
+    )[0] if exploratory_pool else None
+    profiles = {
+        "high_confidence_config": profile_payload(high_confidence, "high_confidence", "Alta confianza", "Pocos candidatos y alta senal. Revisar previews antes de entrenamiento."),
+        "balanced_config": profile_payload(balanced, "balanced", "Equilibrada recomendada", "Configuracion principal para muestra mediana. Requiere revision humana."),
+        "high_recall_config": profile_payload(high_recall, "high_recall", "Mayor cobertura", "Mas cobertura con mayor riesgo de falsos positivos. Revisar manualmente."),
+        "exploratory_config": profile_payload(exploratory, "exploratory", "Exploratoria", "Solo exploracion. No usar para entrenamiento."),
+        "primary_recommended_profile": "balanced_config",
+        "training_allowed": False,
+    }
+    return profiles
 
 
 def build_recommendation_explanation(
@@ -1186,10 +1372,16 @@ def build_recommendation_explanation(
         return "La configuracion cerrada encontro actividad; revisa clips antes de usarla en mas audios."
     if config_name in {"intermedia_cerrada_mas_selectiva", "intermedia_cerrada_mas_selectiva_ratio025"} and recommendation == "too_many_candidates":
         return "La configuracion detecta actividad sin dano, pero todavia puede incluir ruido. Revisa manualmente el preview."
+    if is_recommended_broader_detection_summary(recommended_summary):
+        return "Esta configuracion encontro mas candidatos sin dano. Revisa previews antes de entrenamiento."
+    if best_next_step == "try_broader_detection":
+        return "Las configuraciones 2500-5000 Hz dieron pocos candidatos; prueba una deteccion mas amplia hacia 2200-3300 Hz."
     if config_name == "intermedia_cerrada_estricta" and int(recommended_summary.get("total_candidates") or 0) == 0:
         return "La configuracion estricta puede estar perdiendo llamados; vuelve a intermedia_cerrada_mas_selectiva y revisa manualmente."
     if best_next_step == "apply_safe_config":
         return "Existe una configuracion candidata segura para aplicar a la carpeta actual, siempre con revision humana antes de entrenamiento."
+    if best_next_step == "review_previews":
+        return "La configuracion detecto candidatos sin dano, pero requiere revision humana antes de procesar una muestra pequena."
     if recommendation == "too_many_candidates":
         return "La configuracion encontro actividad, pero es demasiado amplia; ajusta banda, threshold o ratio antes del lote grande."
     if recommendation == "possible_damage":
@@ -1227,10 +1419,60 @@ def choose_best_cleaning_config(summaries: list[dict[str, Any]]) -> dict[str, An
     )[0]
 
 
+def close_enough(left: Any, right: Any, tolerance: float = 0.001) -> bool:
+    try:
+        return abs(float(left) - float(right)) <= tolerance
+    except (TypeError, ValueError):
+        return False
+
+
+def summary_parameters(item: dict[str, Any] | None) -> dict[str, Any]:
+    if not item:
+        return {}
+    params = item.get("parameters") or {}
+    return params if isinstance(params, dict) else {}
+
+
+def is_recommended_broader_detection_summary(item: dict[str, Any] | None) -> bool:
+    if not item:
+        return False
+    params = summary_parameters(item)
+    ratio = params.get("min_band_ratio", params.get("min_band_energy_ratio"))
+    return bool(
+        item.get("config") in {"amplia_2200_3300_m51_r023_no_noise", "broader_detection"}
+        or (
+            close_enough(params.get("frequency_min_hz"), 2200)
+            and close_enough(params.get("frequency_max_hz"), 3300)
+            and close_enough(params.get("threshold_dbfs"), -51)
+            and close_enough(ratio, 0.23)
+            and params.get("noise_reduce") is False
+            and params.get("normalize") is False
+        )
+    )
+
+
+def is_low_candidate_strict_probe(item: dict[str, Any] | None) -> bool:
+    if not item:
+        return False
+    params = summary_parameters(item)
+    ratio = params.get("min_band_ratio", params.get("min_band_energy_ratio"))
+    max_hz = float(params.get("frequency_max_hz") or 0)
+    return bool(
+        close_enough(params.get("frequency_min_hz"), 2500)
+        and (close_enough(max_hz, 4500) or close_enough(max_hz, 5000))
+        and float(ratio or 0) >= 0.22
+        and int(item.get("total_candidates") or 0) <= 1
+        and int(item.get("possible_damage_count") or 0) == 0
+        and int(item.get("clipping_count") or 0) == 0
+    )
+
+
 def is_safe_recommended_summary(item: dict[str, Any] | None) -> bool:
     if not item:
         return False
     if item.get("config") in {"exploratory_wide", "intermedia_exploratoria"}:
+        return False
+    if is_recommended_broader_detection_summary(item):
         return False
     cleaning = item.get("cleaning_metrics") or {}
     return (
@@ -1240,6 +1482,16 @@ def is_safe_recommended_summary(item: dict[str, Any] | None) -> bool:
         and item.get("recommendation") != "too_many_candidates"
         and cleaning.get("cleaning_safe") is not False
         and bool(cleaning.get("cleaning_safe"))
+    )
+
+
+def is_review_preview_candidate(item: dict[str, Any] | None) -> bool:
+    return bool(
+        item
+        and int(item.get("total_candidates") or 0) > 0
+        and int(item.get("possible_damage_count") or 0) == 0
+        and int(item.get("clipping_count") or 0) == 0
+        and item.get("recommendation") in {"requires_review", "candidate_for_review"}
     )
 
 
@@ -1257,12 +1509,28 @@ def choose_safe_recommended_config(summaries: list[dict[str, Any]]) -> dict[str,
     )[0]
 
 
-def build_final_recommendation(best_detection: dict[str, Any] | None, best_cleaning: dict[str, Any] | None) -> dict[str, Any]:
+def build_final_recommendation(
+    best_detection: dict[str, Any] | None,
+    best_cleaning: dict[str, Any] | None,
+    review_candidate: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if is_recommended_broader_detection_summary(best_cleaning):
+        return {
+            "mode": "review_previews",
+            "summary": "Esta configuracion encontro mas candidatos sin dano. Revisa previews antes de entrenamiento.",
+            "warning": "No usar automaticamente para entrenamiento.",
+        }
     if best_cleaning:
         return {
             "mode": "cleaning_safe_for_review",
             "summary": f"La mejor limpieza para revision es {best_cleaning['label']}. Aun requiere escucha/espectrograma antes de entrenamiento.",
             "warning": None,
+        }
+    if is_review_preview_candidate(review_candidate):
+        return {
+            "mode": "review_previews",
+            "summary": "Hay candidatos sin dano, pero requieren revision humana.",
+            "warning": "No usar automaticamente para entrenamiento.",
         }
     if best_detection:
         if best_detection.get("config") == "intermedia_exploratoria" and best_detection.get("recommendation") == "too_many_candidates":
@@ -1466,6 +1734,34 @@ def write_test_reports(result: dict[str, Any], report_root: Path) -> None:
     warning = result.get("final_recommendation", {}).get("warning")
     if warning:
         md_lines.extend(["", f"> {warning}"])
+    profiles = result.get("final_recommendation_profiles") or {}
+    profile_rows = [
+        ("Alta confianza", profiles.get("high_confidence_config")),
+        ("Equilibrada recomendada", profiles.get("balanced_config")),
+        ("Mayor cobertura", profiles.get("high_recall_config")),
+        ("Exploratoria", profiles.get("exploratory_config")),
+    ]
+    if any(item for _, item in profile_rows):
+        md_lines.extend(["", "## Perfiles de recomendacion", ""])
+        for title, item in profile_rows:
+            if not item:
+                continue
+            contrast = item.get("contrast_before_after") or {}
+            md_lines.extend(
+                [
+                    f"### {title}",
+                    "",
+                    f"- Configuracion: `{item.get('config')}`",
+                    f"- Candidatos: {item.get('total_candidates')}",
+                    f"- Duracion candidata: {item.get('total_duration_candidates')} s",
+                    f"- Ratio banda: {item.get('average_band_energy_ratio')}",
+                    f"- Contraste: {contrast.get('before_db')} -> {contrast.get('after_db')} dB",
+                    f"- Posible dano: {item.get('possible_damage_count')}",
+                    f"- Recomendacion: {item.get('recommendation')}",
+                    f"- Advertencia: {item.get('warning')}",
+                    "",
+                ]
+            )
     no_candidates = bool(result.get("configs")) and all(int(item.get("total_candidates") or 0) == 0 for item in result["configs"])
     if result.get("best_next_step") == "try_intermediate_config":
         intermediate = result.get("suggested_intermediate_config") or SUGGESTED_INTERMEDIATE_CONFIG
@@ -1544,6 +1840,38 @@ def write_test_reports(result: dict[str, Any], report_root: Path) -> None:
                 f"threshold {strict.get('threshold_dbfs')} dBFS, ratio {strict.get('min_band_energy_ratio')}.",
                 "",
                 "Si la configuracion estricta da 0 candidatos, vuelve a intermedia_cerrada_mas_selectiva: puede estar perdiendo llamados.",
+            ]
+        )
+    if result.get("best_next_step") == "try_broader_detection":
+        broader = result.get("suggested_broader_detection_config") or RECOMMENDED_BROADER_DETECTION_CONFIG
+        md_lines.extend(
+            [
+                "",
+                "## Deteccion mas amplia recomendada",
+                "",
+                "Siguiente paso recomendado: volver a deteccion mas amplia recomendada.",
+                "",
+                "Las configuraciones 2500-5000 Hz dieron pocos candidatos. Prueba una banda mas baja con la senal fuerte observada en 2000-3000 Hz.",
+                "",
+                "Configuracion sugerida: "
+                f"`{broader.get('name')}` {broader.get('frequency_min_hz')}-{broader.get('frequency_max_hz')} Hz, "
+                f"threshold {broader.get('threshold_dbfs')} dBFS, ratio {broader.get('min_band_energy_ratio')}, "
+                f"normalize={str(broader.get('normalize', False)).lower()}, noise_reduce={str(broader.get('noise_reduce', False)).lower()}.",
+                "",
+                "Usar solo para muestra pequena y revisar previews antes de entrenamiento.",
+            ]
+        )
+    if result.get("best_next_step") == "review_previews":
+        md_lines.extend(
+            [
+                "",
+                "## Revision humana requerida",
+                "",
+                "La configuracion detecto candidatos sin dano, pero requiere revision humana.",
+                "",
+                "Siguiente paso recomendado: abrir previews para revisar.",
+                "",
+                "No usar automaticamente para entrenamiento.",
             ]
         )
     if result.get("best_next_step") == "return_to_selective_config":

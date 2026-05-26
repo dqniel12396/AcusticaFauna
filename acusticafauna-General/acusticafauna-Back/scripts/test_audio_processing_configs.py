@@ -38,6 +38,31 @@ def load_configs(path: str | None) -> list[dict] | None:
     return data
 
 
+def print_config_summary(result: dict) -> None:
+    rows = result.get("configs") or []
+    if not rows:
+        return
+    print("config,candidates,duration,ratio,possible_damage,clipping,recommendation")
+    for row in rows:
+        metrics = row.get("detection_metrics") or {}
+        candidates = row.get("total_candidates", 0)
+        duration = row.get("total_duration_candidates", 0)
+        ratio = metrics.get("duration_ratio_of_sample")
+        print(
+            ",".join(
+                [
+                    str(row.get("config") or ""),
+                    str(candidates),
+                    f"{float(duration or 0):.3f}",
+                    "" if ratio is None else f"{float(ratio):.6f}",
+                    str(row.get("possible_damage_count") or 0),
+                    str(row.get("clipping_count") or 0),
+                    str(row.get("recommendation") or ""),
+                ]
+            )
+        )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Prueba configuraciones de deteccion/limpieza en una muestra pequena.",
@@ -93,6 +118,7 @@ def main() -> int:
         if "desconocida" in message.lower():
             print(f"Configuraciones disponibles: {', '.join(available_calibration_config_names())}", file=sys.stderr)
         return 2
+    print_config_summary(result)
     print(json.dumps({"output_dir": str(Path(args.output_dir)), "recommended_config": result["recommended_config"]}, ensure_ascii=False, indent=2))
     return 0
 

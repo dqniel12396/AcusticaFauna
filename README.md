@@ -115,6 +115,23 @@ Opcion recomendada para usuarios normales: PowerShell + HTTPS + Python 3.11.x.
 
    http://localhost:5173
 
+### CORS en desarrollo local
+
+`localhost` y `127.0.0.1` son orígenes distintos para el navegador. El backend permite por defecto:
+
+- `http://localhost:5173`
+- `http://127.0.0.1:5173`
+- `http://localhost:5174`
+- `http://127.0.0.1:5174`
+
+Si usas otro puerto, agrega origins separados por comas en `.env`:
+
+```env
+CORS_ORIGINS=http://localhost:5175,http://127.0.0.1:5175
+```
+
+Recomendación práctica: abre siempre el frontend con la misma forma de host que uses durante la sesión. Si entras a `http://localhost:5173`, el backend debe permitir exactamente ese origin aunque la API esté en `http://127.0.0.1:8000`.
+
 El comando `py -3.11` sirve para cualquier Python 3.11.x instalado. No exige que sea exactamente 3.11.0.
 
 Python 3.13 no es recomendado para AcusticaFauna ML. Dependencias como `torch`, `opensoundscape`, `librosa`, `numba`, `llvmlite` y `soundfile` suelen ser mas estables con Python 3.11.x.
@@ -324,6 +341,22 @@ python scripts/doctor_install.py
 python scripts/check_environment.py
 python scripts/preflight_github.py
 ```
+
+## Barrido CLI de calibracion
+
+Para probar varias configuraciones sin depender de la UI:
+
+```powershell
+cd acusticafauna-General\acusticafauna-Back
+python scripts\test_audio_processing_configs.py `
+  --folder "F:\PROYECTO de cosa de sonido\prueba de Pristimantis simoterus" `
+  --label Pristimantis_simoterus `
+  --sample-size 10 `
+  --configs-json scripts\calibration_configs\pristimantis_debug_sweep.json `
+  --output-dir backend\storage\audio_lab\calibration_reports\pristimantis_debug_sweep
+```
+
+El script genera `summary.json`, `summary.csv` y `report.md`, e imprime por consola config, candidatos, duracion, ratio, posible dano, clipping y recomendacion. Los audios originales no se modifican.
 
 ## Documentacion
 

@@ -1,6 +1,50 @@
 from app.db.database import get_connection
 
 
+def create_empty_folder_batch_job(client, job_id="job_zero_candidates"):
+    client.get("/api/audio-lab/folder-batch/jobs")
+    conn = get_connection()
+    try:
+        conn.execute(
+            """
+            INSERT INTO audio_lab_folder_batch_jobs (
+                id, job_name, folder_path, target_label, status, mode, preset,
+                frequency_min_hz, frequency_max_hz, threshold_dbfs,
+                total_files, processed_files, candidates_count, discarded_count,
+                contaminant_suspect_count, errors_count, params_json, summary_json,
+                created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                job_id,
+                "empty job",
+                "F:\\fake\\folder",
+                "Pristimantis_simoterus",
+                "completed",
+                "species_folder_cleanup",
+                "personalizado",
+                2500,
+                5000,
+                -51,
+                10,
+                10,
+                0,
+                0,
+                0,
+                0,
+                None,
+                None,
+                "2026-05-23T00:00:00",
+                "2026-05-23T00:00:00",
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return job_id
+
+
 def write_test_wav(path):
     import math
     import struct
@@ -15,6 +59,81 @@ def write_test_wav(path):
             value = int(10000 * math.sin(2 * math.pi * 440 * index / 8000))
             wav.writeframes(struct.pack("<h", value))
     return path
+
+
+def test_folder_batch_outputs_empty_job_returns_structured_empty_payload(client):
+    job_id = create_empty_folder_batch_job(client)
+
+    response = client.get(f"/api/audio-lab/folder-batch/jobs/{job_id}/outputs")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["job_id"] == job_id
+    assert payload["outputs"] == []
+    assert payload["items"] == []
+    assert payload["count"] == 0
+    assert "No se generaron clips" in payload["message"]
+
+
+def test_folder_batch_summary_empty_job_returns_zero_candidates_summary(client):
+    job_id = create_empty_folder_batch_job(client, "job_zero_summary")
+
+    response = client.get(f"/api/audio-lab/folder-batch/jobs/{job_id}/summary")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["outputs_count"] == 0
+    assert payload["summary"]["files_processed"] == 10
+    assert payload["summary"]["candidates_count"] == 0
+    assert payload["summary"]["errors_count"] == 0
+    assert payload["summary"]["zero_candidates"] is True
+    assert payload["summary"]["reason"] == "zero_candidates_after_batch"
+
+
+def test_folder_batch_job_old_job_without_config_does_not_crash(client):
+    job_id = create_empty_folder_batch_job(client, "job_without_config")
+
+    response = client.get(f"/api/audio-lab/folder-batch/jobs/{job_id}")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["id"] == job_id
+    assert payload["params"] == {}
+    assert payload["summary"] == {}
+
+
+def test_folder_batch_job_not_found_returns_clear_json(client):
+    response = client.get("/api/audio-lab/folder-batch/jobs/missing-job-id")
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "folder_batch_job_not_found"
+    assert response.json()["job_id"] == "missing-job-id"
+
+
+def test_cors_preflight_allows_localhost_frontend(client):
+    response = client.options(
+        "/api/audio-lab/folder-batch/jobs",
+        headers={
+            "Origin": "http://localhost:5173",
+            "Access-Control-Request-Method": "GET",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == "http://localhost:5173"
+
+
+def test_cors_preflight_allows_127_frontend(client):
+    response = client.options(
+        "/api/audio-lab/folder-batch/jobs",
+        headers={
+            "Origin": "http://127.0.0.1:5173",
+            "Access-Control-Request-Method": "GET",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == "http://127.0.0.1:5173"
 
 
 def test_curated_dataset_endpoints_use_temporary_database(client, sample_curated_dataset, tmp_db_path):

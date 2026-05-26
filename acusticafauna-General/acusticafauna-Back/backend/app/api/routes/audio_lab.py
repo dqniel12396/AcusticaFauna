@@ -5,6 +5,7 @@ import base64
 import csv
 import fnmatch
 import json
+import logging
 import math
 import re
 import shutil
@@ -17,7 +18,7 @@ from typing import Any
 import httpx
 import numpy as np
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Query
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
 from app.core.config import settings
@@ -47,6 +48,7 @@ except ImportError:  # pragma: no cover - exercised when the optional package is
 
 
 router = APIRouter(prefix="/audio-lab", tags=["audio-lab"])
+logger = logging.getLogger(__name__)
 
 VALID_FEEDBACK = {
     "confirmed_positive",
@@ -833,6 +835,12 @@ def folder_batch_job_to_dict(row) -> dict[str, Any]:
     item["job_id"] = item.get("id")
     item["folder_path_original"] = item.get("folder_path")
     item["label"] = item.get("target_label")
+    for key in ["params_json", "summary_json"]:
+        raw = item.get(key)
+        try:
+            item[key.replace("_json", "")] = json.loads(raw) if raw else {}
+        except json.JSONDecodeError:
+            item[key.replace("_json", "")] = {}
     if item.get("total_files"):
         item["progress"] = round(float(item.get("processed_files") or 0) / float(item["total_files"]), 4)
     else:
@@ -840,6 +848,52 @@ def folder_batch_job_to_dict(row) -> dict[str, Any]:
     item["output_dir"] = item.get("output_dir") or str(folder_batch_job_dir(item["id"]))
     item["outputs_count"] = int(item.get("outputs_count") or 0)
     return item
+
+
+def folder_batch_not_found(job_id: str) -> HTTPException:
+    return HTTPException(status_code=404, detail={"detail": "folder_batch_job_not_found", "job_id": job_id})
+
+
+def folder_batch_not_found_response(job_id: str) -> JSONResponse:
+    return JSONResponse(status_code=404, content={"detail": "folder_batch_job_not_found", "job_id": job_id})
+
+
+def folder_batch_zero_candidates_summary(job: dict[str, Any], outputs_count: int = 0) -> dict[str, Any]:
+    files_processed = int(job.get("processed_files") or 0)
+    candidates_count = int(job.get("candidates_count") or 0)
+    errors_count = int(job.get("errors_count") or 0)
+    contaminants_count = int(job.get("contaminant_suspect_count") or 0)
+    zero_candidates = files_processed > 0 and candidates_count == 0 and errors_count == 0 and outputs_count == 0
+    return {
+        "files_processed": files_processed,
+        "candidates_count": candidates_count,
+        "errors_count": errors_count,
+        "contaminants_count": contaminants_count,
+        "zero_candidates": zero_candidates,
+        "reason": "zero_candidates_after_batch" if zero_candidates else None,
+        "message": (
+            "El procesamiento terminó sin candidatos. No hubo error de lectura."
+            if zero_candidates
+            else "Resumen del procesamiento por carpeta."
+        ),
+    }
+
+
+def empty_folder_batch_outputs_response(job: dict[str, Any], exists: bool = False) -> dict[str, Any]:
+    job_id = str(job.get("id") or job.get("job_id") or "")
+    logger.info("No outputs generated for job %s; zero candidates or no manifest.", job_id)
+    output_dir = job.get("output_dir") or str(folder_batch_job_dir(job_id))
+    message = "No se generaron clips porque ningún tramo pasó los filtros."
+    return {
+        "job_id": job_id,
+        "items": [],
+        "outputs": [],
+        "count": 0,
+        "total": 0,
+        "output_dir": output_dir,
+        "exists": bool(exists),
+        "message": message,
+    }
 
 
 def folder_job_status(job_id: str) -> str | None:
@@ -3157,9 +3211,10 @@ def build_folder_batch_summary(job_id: str) -> dict[str, Any]:
         ensure_audio_lab_extra_schema(conn)
         job = conn.execute("SELECT * FROM audio_lab_folder_batch_jobs WHERE id = ?", (job_id,)).fetchone()
         if not job:
-            raise HTTPException(status_code=404, detail="Job no encontrado.")
+            raise folder_batch_not_found(job_id)
         segs = conn.execute("SELECT * FROM audio_lab_folder_batch_segments WHERE job_id = ?", (job_id,)).fetchall()
         files = conn.execute("SELECT * FROM audio_lab_folder_batch_files WHERE job_id = ?", (job_id,)).fetchall()
+        outputs_count = conn.execute("SELECT COUNT(*) AS count FROM audio_lab_folder_batch_outputs WHERE job_id = ?", (job_id,)).fetchone()["count"]
         ratios = [float(row["band_energy_ratio"] or 0) for row in segs]
         rms_values = [float(row["rms_dbfs"] or -120) for row in segs]
         top_files = conn.execute(
@@ -3197,6 +3252,7 @@ def build_folder_batch_summary(job_id: str) -> dict[str, Any]:
             },
             "manifest_path": job["manifest_path"],
         }
+        summary.update(folder_batch_zero_candidates_summary(dict(job), outputs_count=int(outputs_count or 0)))
         return summary
     finally:
         conn.close()
@@ -3741,7 +3797,7 @@ def get_folder_batch_job(job_id: str):
             (job_id,),
         ).fetchone()
         if not row:
-            raise HTTPException(status_code=404, detail="Job no encontrado.")
+            return folder_batch_not_found_response(job_id)
         files = conn.execute("SELECT * FROM audio_lab_folder_batch_files WHERE job_id = ? ORDER BY rowid ASC LIMIT 200", (job_id,)).fetchall()
         return {**folder_batch_job_to_dict(row), "files": [dict(item) for item in files]}
     finally:
@@ -3780,10 +3836,13 @@ def resume_folder_batch_job(job_id: str, background_tasks: BackgroundTasks):
         ensure_audio_lab_extra_schema(conn)
         row = conn.execute("SELECT * FROM audio_lab_folder_batch_jobs WHERE id = ?", (job_id,)).fetchone()
         if not row:
-            raise HTTPException(status_code=404, detail="Job no encontrado.")
+            raise folder_batch_not_found(job_id)
         if row["status"] not in {"paused", "failed", "pending"}:
             return folder_batch_job_to_dict(row)
-        params = json.loads(row["params_json"] or "{}")
+        try:
+            params = json.loads(row["params_json"] or "{}")
+        except json.JSONDecodeError as exc:
+            raise HTTPException(status_code=400, detail={"detail": "folder_batch_job_config_invalid", "job_id": job_id}) from exc
         payload = FolderBatchJobPayload(**params)
     finally:
         conn.close()
@@ -3798,6 +3857,9 @@ def get_folder_batch_outputs(job_id: str, limit: int = Query(500, ge=1, le=5000)
     conn = get_connection()
     try:
         ensure_audio_lab_extra_schema(conn)
+        job = conn.execute("SELECT * FROM audio_lab_folder_batch_jobs WHERE id = ?", (job_id,)).fetchone()
+        if not job:
+            return folder_batch_not_found_response(job_id)
         rows = conn.execute(
             """
             SELECT o.*, s.start_seconds, s.end_seconds, s.duration_seconds, s.activity_score,
@@ -3812,6 +3874,9 @@ def get_folder_batch_outputs(job_id: str, limit: int = Query(500, ge=1, le=5000)
             """,
             (job_id, limit),
         ).fetchall()
+        if not rows:
+            output_dir = dict(job).get("output_dir") or str(folder_batch_job_dir(job_id))
+            return empty_folder_batch_outputs_response(dict(job), exists=Path(output_dir).exists())
         items = []
         for row in rows:
             item = dict(row)
@@ -3826,7 +3891,16 @@ def get_folder_batch_outputs(job_id: str, limit: int = Query(500, ge=1, le=5000)
                 item["playable_url"] = playable_url_for_path(playable_path)
                 item["audio_url"] = item["playable_url"]
             items.append(item)
-        return {"job_id": job_id, "items": items, "total": len(items)}
+        output_dir = dict(job).get("output_dir") or str(folder_batch_job_dir(job_id))
+        return {
+            "job_id": job_id,
+            "items": items,
+            "outputs": items,
+            "count": len(items),
+            "total": len(items),
+            "output_dir": output_dir,
+            "exists": Path(output_dir).exists(),
+        }
     finally:
         conn.close()
 
@@ -3841,7 +3915,29 @@ def get_folder_batch_manifest(job_id: str):
 
 @router.get("/folder-batch/jobs/{job_id}/summary")
 def get_folder_batch_summary(job_id: str):
-    return {"job_id": job_id, "summary": build_folder_batch_summary(job_id)}
+    conn = get_connection()
+    try:
+        ensure_audio_lab_extra_schema(conn)
+        job = conn.execute("SELECT * FROM audio_lab_folder_batch_jobs WHERE id = ?", (job_id,)).fetchone()
+        if not job:
+            return folder_batch_not_found_response(job_id)
+        outputs_count = conn.execute("SELECT COUNT(*) AS count FROM audio_lab_folder_batch_outputs WHERE job_id = ?", (job_id,)).fetchone()["count"]
+    finally:
+        conn.close()
+    exists = False
+    try:
+        summary = build_folder_batch_summary(job_id)
+        exists = bool(summary.get("manifest_path") or dict(job).get("summary_json"))
+    except FileNotFoundError:
+        summary = folder_batch_zero_candidates_summary(dict(job), outputs_count=int(outputs_count or 0))
+    except json.JSONDecodeError:
+        summary = {
+            **folder_batch_zero_candidates_summary(dict(job), outputs_count=int(outputs_count or 0)),
+            "warning": "summary_json_invalid",
+        }
+    if int(outputs_count or 0) == 0:
+        summary.update(folder_batch_zero_candidates_summary(dict(job), outputs_count=0))
+    return {"job_id": job_id, "summary": summary, "outputs_count": int(outputs_count or 0), "exists": exists}
 
 
 @router.get("/batch-processing/jobs")

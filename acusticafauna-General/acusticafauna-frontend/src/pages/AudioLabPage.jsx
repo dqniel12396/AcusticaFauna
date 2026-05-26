@@ -6,9 +6,14 @@ import {
   ZERO_CANDIDATE_VARIANTS,
   buildFolderBatchFormFromCalibration,
   calibrationFolderBatchPath,
+  calibrationRowIsLowCandidateStrictProbe,
   folderBatchJobConfig,
   folderBatchJobFinishedWithoutCandidates,
-  zeroCandidateConfigKey,
+  isRecommendedBroaderDetectionConfig,
+  normalizeFolderBatchOutputsResponse,
+  RECOMMENDED_BROADER_DETECTION_CONFIG,
+  selectZeroCandidateRecovery,
+  ZERO_CANDIDATE_RECOVERY_MESSAGE,
 } from "./audioLabFolderBatchCalibration";
 import {
   cancelAudioLabBatchProcessingJob,
@@ -154,6 +159,48 @@ const FOLDER_BATCH_PRESETS = {
     noise_reduce: false,
     normalize: false,
   },
+  pristimantis_simoterus_lluvia_viento_alta_confianza: {
+    frequency_min_hz: 2300,
+    frequency_max_hz: 3300,
+    threshold_dbfs: -50,
+    min_band_ratio: 0.27,
+    min_activity_seconds: 0.25,
+    min_silence_seconds: 0.35,
+    padding_seconds: 0.12,
+    clip_duration_seconds: 3,
+    max_segment_seconds: 5,
+    bandpass: true,
+    noise_reduce: false,
+    normalize: false,
+  },
+  pristimantis_simoterus_lluvia_viento_equilibrada: {
+    frequency_min_hz: 2200,
+    frequency_max_hz: 3200,
+    threshold_dbfs: -50,
+    min_band_ratio: 0.25,
+    min_activity_seconds: 0.25,
+    min_silence_seconds: 0.35,
+    padding_seconds: 0.12,
+    clip_duration_seconds: 3,
+    max_segment_seconds: 5,
+    bandpass: true,
+    noise_reduce: false,
+    normalize: false,
+  },
+  pristimantis_simoterus_lluvia_viento_mayor_cobertura: {
+    frequency_min_hz: 2200,
+    frequency_max_hz: 3300,
+    threshold_dbfs: -51,
+    min_band_ratio: 0.23,
+    min_activity_seconds: 0.25,
+    min_silence_seconds: 0.35,
+    padding_seconds: 0.12,
+    clip_duration_seconds: 3,
+    max_segment_seconds: 5,
+    bandpass: true,
+    noise_reduce: false,
+    normalize: false,
+  },
   personalizado: {},
 };
 const FOLDER_BATCH_PRESET_OPTIONS = [
@@ -161,6 +208,9 @@ const FOLDER_BATCH_PRESET_OPTIONS = [
   ["normal", "normal"],
   ["agresivo", "agresivo"],
   ["pristimantis_lluvia_viento", "Pristimantis lluvia/viento - detección suave"],
+  ["pristimantis_simoterus_lluvia_viento_alta_confianza", "Pristimantis simoterus lluvia/viento - alta confianza"],
+  ["pristimantis_simoterus_lluvia_viento_equilibrada", "Pristimantis simoterus lluvia/viento - equilibrada"],
+  ["pristimantis_simoterus_lluvia_viento_mayor_cobertura", "Pristimantis simoterus lluvia/viento - mayor cobertura"],
   ["personalizado", "personalizado"],
 ];
 const CALIBRATION_DEFAULT_FORM = {
@@ -198,6 +248,23 @@ const MORE_SENSITIVE_CALIBRATION_CONFIG = {
   prop_decrease: 0.2,
   preset: "personalizado",
   detection_only: false,
+};
+const SMALL_BATCH_REVIEW_MESSAGE = "Parámetros aplicados para muestra pequeña. Escanea la carpeta y procesa solo 10–20 audios.";
+const SMALL_BATCH_REVIEW_OVERRIDES = {
+  frequency_min_hz: 2500,
+  frequency_max_hz: 5000,
+  threshold_dbfs: -51,
+  min_band_energy_ratio: 0.25,
+  min_band_ratio: 0.25,
+  bandpass: true,
+  noise_reduce: false,
+  normalize: false,
+  min_activity_seconds: 0.25,
+  min_silence_seconds: 0.35,
+  padding_seconds: 0.12,
+  clip_duration_seconds: 3,
+  max_segment_seconds: 5,
+  preset: "personalizado",
 };
 const EXPLORATORY_WIDE_CALIBRATION_CONFIG = {
   name: "exploratory_wide",
@@ -294,7 +361,7 @@ const RECOMMENDATION_LABELS = {
   requires_review: "Requiere revision",
   safe_candidate: "Candidata segura",
   candidate_for_review: "Requiere revision",
-  safe_for_review: "Candidata segura",
+  safe_for_review: "Segura para revisión",
   not_applicable_detection_only: "No aplica limpieza",
   requires_manual_review: "Requiere revision manual",
   candidate_for_small_batch_review: "Candidata para muestra pequena",
@@ -495,6 +562,42 @@ function isExploratoryConfigName(name) {
   return ["exploratory_wide", "exploratory_intermediate", "intermedia_exploratoria", "intermedia_cerrada"].includes(String(name || ""));
 }
 
+function normalizeCalibrationKey(value) {
+  return String(value || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .trim()
+    .toLowerCase();
+}
+
+function calibrationRowKeys(item) {
+  return [
+    item?.config,
+    item?.name,
+    item?.label,
+    item?.parameters?.name,
+    item?.parameters?.label,
+  ].map(normalizeCalibrationKey).filter(Boolean);
+}
+
+function calibrationRowMatches(item, value) {
+  const normalizedValue = normalizeCalibrationKey(value);
+  return Boolean(normalizedValue && calibrationRowKeys(item).includes(normalizedValue));
+}
+
+function isExploratoryWideCalibrationRow(item) {
+  const keys = calibrationRowKeys(item);
+  return keys.includes("exploratory_wide") || keys.includes("exploratoria amplia");
+}
+
+function isBalanceadaCalibrationName(value) {
+  return normalizeCalibrationKey(value).includes("balanceada");
+}
+
+function isBalanceadaOrSensibleCalibrationRow(item) {
+  return calibrationRowKeys(item).some((key) => key.includes("balanceada") || key.includes("sensible"));
+}
+
 function isUnsafeExploratoryConfigName(name, recommendation = "") {
   const configName = String(name || "");
   return (
@@ -519,6 +622,9 @@ function calibrationRowIsSmallBatchCandidate(item) {
     item &&
       (
         item.review_status === "candidate_for_small_batch_review" ||
+        item.recommendation === "requires_review" ||
+        item.recommendation === "candidate_for_review" ||
+        (item.recommendation === "safe_for_review" && isRecommendedBroaderDetectionConfig(item)) ||
         ["intermedia_cerrada_mas_selectiva", "intermedia_cerrada_mas_selectiva_ratio025"].includes(configName)
       ) &&
       Number(item.total_candidates || 0) > 0 &&
@@ -532,14 +638,14 @@ function smallBatchCandidateBlockedReason(item, previewReviewStarted = true) {
   if (Number(item.total_candidates || 0) <= 0) return "No hay candidatos para usar.";
   if (Number(item.possible_damage_count || 0) > 0) return "No se puede usar porque hay posible dano.";
   if (Number(item.clipping_count || 0) > 0) return "No se puede usar porque hay clipping.";
-  if (calibrationRowIsSmallBatchCandidate(item) && !previewReviewStarted) return "Primero abre los previews para revisar.";
   return "";
 }
 
 function calibrationConfigIsSafe(item) {
   const cleaning = item?.cleaning_metrics || {};
   return Boolean(
-    item &&
+      item &&
+      !isRecommendedBroaderDetectionConfig(item) &&
       !isUnsafeExploratoryConfigName(item.config, item.recommendation) &&
       Number(item.total_candidates || 0) > 0 &&
       Number(item.possible_damage_count || 0) === 0 &&
@@ -1036,6 +1142,7 @@ export default function AudioLabPage() {
   const audioRef = useRef(null);
   const uploadInputRef = useRef(null);
   const scanAbortControllerRef = useRef(null);
+  const folderBatchEditResumeTimerRef = useRef(null);
   const previousFolderBatchPathRef = useRef("");
   const folderBatchSectionRef = useRef(null);
   const [labels, setLabels] = useState([]);
@@ -1142,6 +1249,11 @@ export default function AudioLabPage() {
   const [folderBatchLogs, setFolderBatchLogs] = useState("");
   const [folderBatchOutputs, setFolderBatchOutputs] = useState([]);
   const [folderBatchSummary, setFolderBatchSummary] = useState(null);
+  const [folderBatchOutputsLoading, setFolderBatchOutputsLoading] = useState(false);
+  const [folderBatchOutputsError, setFolderBatchOutputsError] = useState("");
+  const [folderBatchSummaryLoading, setFolderBatchSummaryLoading] = useState(false);
+  const [folderBatchSummaryError, setFolderBatchSummaryError] = useState("");
+  const [folderBatchEditing, setFolderBatchEditing] = useState(false);
   const [folderBatchScanning, setFolderBatchScanning] = useState(false);
   const [folderBatchSubmitting, setFolderBatchSubmitting] = useState(false);
   const [folderBatchSearch, setFolderBatchSearch] = useState("");
@@ -1163,6 +1275,7 @@ export default function AudioLabPage() {
     return () => {
       scanAbortControllerRef.current?.abort();
       scanAbortControllerRef.current = null;
+      if (folderBatchEditResumeTimerRef.current) window.clearTimeout(folderBatchEditResumeTimerRef.current);
     };
   }, []);
 
@@ -1317,7 +1430,7 @@ export default function AudioLabPage() {
       refreshFolderBatchJob(activeFolderBatchJob.id, { quiet: true });
     }, 2000);
     return () => window.clearInterval(timer);
-  }, [activeFolderBatchJob?.id, activeFolderBatchJob?.status]);
+  }, [activeFolderBatchJob?.id, activeFolderBatchJob?.status, folderBatchEditing]);
 
   useEffect(() => {
     previousFolderBatchPathRef.current = folderBatchForm.folder_path.trim();
@@ -2688,8 +2801,19 @@ export default function AudioLabPage() {
     const activeConfig = calibrationTest?.recommended_config || recommendedConfigName;
     const preview = (calibrationTest?.previews || []).find((item) => item.config === activeConfig) || calibrationTest?.previews?.[0];
     const path = preview?.processed_preview_path || preview?.raw_preview_path;
+    if (!path && folderBatchOutputs.length) {
+      setPreviewReviewStarted(true);
+      scrollToFolderBatchSection();
+      setMessage("Revisa los outputs de la muestra pequeña en Procesamiento masivo.");
+      return;
+    }
+    if (!path && activeFolderBatchJob?.output_dir) {
+      copyTextToClipboard(activeFolderBatchJob.output_dir, "Ruta de outputs copiada.");
+      setPreviewReviewStarted(true);
+      return;
+    }
     if (!path) {
-      setError("Este reporte no tiene previews disponibles para abrir.");
+      setError("Este reporte tiene candidatos de calibración, pero no hay previews generados todavía. Aplica la configuración a muestra pequeña y procesa para generar clips revisables.");
       return;
     }
     setPreviewReviewStarted(true);
@@ -2831,6 +2955,8 @@ export default function AudioLabPage() {
     setActiveFolderBatchJob((current) => current && !isFolderBatchJobForPath(current, targetFolderPath) ? null : current);
     setFolderBatchOutputs([]);
     setFolderBatchSummary(null);
+    setFolderBatchOutputsError("");
+    setFolderBatchSummaryError("");
     setFolderBatchLogs("");
     setSelectedAudio((current) => current?.kind === "folder_batch_output" ? null : current);
     setError("");
@@ -2855,6 +2981,16 @@ export default function AudioLabPage() {
     applyCalibrationToFolderBatch(params, { copyFolderPath: true, exploratory: true });
   }
 
+  function applyBroaderDetectionToFolderBatch() {
+    applyCalibrationToFolderBatch(calibrationTest?.suggested_broader_detection_config || RECOMMENDED_BROADER_DETECTION_CONFIG, {
+      copyFolderPath: true,
+      exploratory: true,
+      skipExploratoryConfirm: true,
+      configName: "amplia_2200_3300_m51_r023_no_noise",
+      messageOverride: "Parámetros de detección más amplia recomendada aplicados. Escanea la carpeta y ejecuta un nuevo job.",
+    });
+  }
+
   function applySmallBatchReviewToFolderBatch(params = recommendedCalibrationParameters(), row = recommendedConfigRow) {
     const blockedReason = smallBatchCandidateBlockedReason(row, previewReviewStarted);
     if (blockedReason) {
@@ -2865,12 +3001,52 @@ export default function AudioLabPage() {
       "Esta configuracion no es segura para todo el lote ni para entrenamiento automatico. Se usara solo para una muestra pequena de revision humana. Continuar?"
     );
     if (!confirmed) return;
-    applyCalibrationToFolderBatch(params, {
+    const broaderDetectionReview = isRecommendedBroaderDetectionConfig(row) || isRecommendedBroaderDetectionConfig(params);
+    const reviewParams = {
+      ...(broaderDetectionReview ? RECOMMENDED_BROADER_DETECTION_CONFIG : SMALL_BATCH_REVIEW_OVERRIDES),
+      ...(params || {}),
+      name: row?.config || params?.name || "small_batch_review",
+      label: row?.label || params?.label || "Muestra pequeña para revisión",
+    };
+    applyCalibrationToFolderBatch(reviewParams, {
       copyFolderPath: true,
       exploratory: true,
       skipExploratoryConfirm: true,
-      configName: row?.config || params?.name,
-      messageOverride: FOLDER_BATCH_APPLIED_MESSAGE,
+      configName: row?.config || params?.name || "small_batch_review",
+      messageOverride: SMALL_BATCH_REVIEW_MESSAGE,
+    });
+  }
+
+  function applyCalibrationRowToFolderBatch(row) {
+    const params = row?.parameters;
+    if (!params) {
+      setError("Esta fila no tiene parametros para copiar.");
+      return;
+    }
+    const rowNeedsReview = calibrationRowIsSmallBatchCandidate(row);
+    if (rowNeedsReview) {
+      const blockedReason = smallBatchCandidateBlockedReason(row, true);
+      if (blockedReason) {
+        setError(blockedReason);
+        return;
+      }
+      const confirmed = window.confirm("Esta configuración requiere revisión humana. Se aplicará solo para muestra pequeña. ¿Continuar?");
+      if (!confirmed) return;
+    }
+    applyCalibrationToFolderBatch(params, {
+      copyFolderPath: true,
+      copyLabel: true,
+      exploratory: rowNeedsReview || isExploratoryConfigName(row?.config),
+      skipExploratoryConfirm: rowNeedsReview,
+      configName: row?.config || params.name,
+      calibration: {
+        folder_path: calibrationForm.folder_path,
+        folder_path_resolved: calibrationForm.folder_path,
+        label: calibrationForm.label,
+      },
+      messageOverride: rowNeedsReview
+        ? "Parámetros de la fila aplicados para muestra pequeña. Escanea la carpeta y procesa solo 10–20 audios."
+        : FOLDER_BATCH_APPLIED_MESSAGE,
     });
   }
 
@@ -2891,6 +3067,9 @@ export default function AudioLabPage() {
       setError("Selecciona primero el job que termino sin candidatos.");
       return;
     }
+    const recoveryMessage = isRecommendedBroaderDetectionConfig(variant)
+      ? "Parámetros de detección más amplia recomendada aplicados. Escanea la carpeta y ejecuta un nuevo job."
+      : ZERO_CANDIDATE_RECOVERY_MESSAGE;
     const previousConfig = folderBatchJobConfig(activeFolderBatchJob);
     const previousFolderPath = folderBatchJobFolderPath(activeFolderBatchJob) || folderBatchForm.folder_path.trim();
     if (!previousFolderPath) {
@@ -2915,7 +3094,7 @@ export default function AudioLabPage() {
         },
         copyFolderPath: true,
         copyLabel: true,
-        exploratory: variant.name === ZERO_CANDIDATE_VARIANTS.widerDetection.name,
+        exploratory: isRecommendedBroaderDetectionConfig(variant),
         configName: variant.name,
       }),
       calibration_trace: {
@@ -2924,6 +3103,7 @@ export default function AudioLabPage() {
         previous_job_name: activeFolderBatchJob.job_name || "",
         previous_job_status: activeFolderBatchJob.status,
         previous_config: previousConfig,
+        applied_config: variant.name,
         applied_variant: variant.name,
         applied_variant_label: variant.label,
       },
@@ -2931,10 +3111,17 @@ export default function AudioLabPage() {
     setFolderBatchScan(null);
     setFolderBatchScanState({
       status: "pending",
-      message: FOLDER_BATCH_APPLIED_MESSAGE,
+      message: recoveryMessage,
     });
+    setActiveFolderBatchJob(null);
+    setFolderBatchOutputs([]);
+    setFolderBatchSummary(null);
+    setFolderBatchOutputsError("");
+    setFolderBatchSummaryError("");
+    setFolderBatchLogs("");
+    setSelectedAudio((current) => current?.kind === "folder_batch_output" ? null : current);
     setError("");
-    setMessage(`${variant.label} copiada al procesamiento masivo. Escanea la carpeta para iniciar un nuevo job.`);
+    setMessage(recoveryMessage);
     scrollToFolderBatchSection();
   }
 
@@ -2961,12 +3148,24 @@ export default function AudioLabPage() {
     setActiveFolderBatchJob(null);
     setFolderBatchOutputs([]);
     setFolderBatchSummary(null);
+    setFolderBatchOutputsError("");
+    setFolderBatchSummaryError("");
     setFolderBatchLogs("");
     setSelectedAudio((current) => current?.kind === "folder_batch_output" ? null : current);
     setMessage(messageText);
   }
 
+  function markFolderBatchEditing() {
+    setFolderBatchEditing(true);
+    if (folderBatchEditResumeTimerRef.current) window.clearTimeout(folderBatchEditResumeTimerRef.current);
+    folderBatchEditResumeTimerRef.current = window.setTimeout(() => {
+      setFolderBatchEditing(false);
+      folderBatchEditResumeTimerRef.current = null;
+    }, 1500);
+  }
+
   function updateFolderBatchField(key, value) {
+    markFolderBatchEditing();
     if (key === "folder_path") {
       const nextPath = String(value || "").trim();
       const currentPath = folderBatchForm.folder_path.trim();
@@ -2977,6 +3176,8 @@ export default function AudioLabPage() {
         }
         setFolderBatchOutputs([]);
         setFolderBatchSummary(null);
+        setFolderBatchOutputsError("");
+        setFolderBatchSummaryError("");
         setFolderBatchLogs("");
         setSelectedAudio((current) => current?.kind === "folder_batch_output" ? null : current);
       }
@@ -3087,6 +3288,7 @@ export default function AudioLabPage() {
       clip_duration_seconds: Number(folderBatchForm.clip_duration_seconds),
       max_segment_seconds: Number(folderBatchForm.max_segment_seconds),
       min_band_ratio: Number(folderBatchForm.min_band_ratio),
+      min_band_energy_ratio: Number(folderBatchForm.min_band_ratio),
       bandpass: Boolean(folderBatchForm.bandpass),
       noise_reduce: Boolean(folderBatchForm.noise_reduce),
       normalize: Boolean(folderBatchForm.normalize),
@@ -3141,21 +3343,44 @@ export default function AudioLabPage() {
   }
 
   async function refreshFolderBatchJob(jobId, options = {}) {
+    const skipHeavyRefresh = Boolean(options.quiet && folderBatchEditing && !options.forceHeavy);
     try {
-      const [detail, logs, outputs, summary] = await Promise.all([
-        fetchAudioLabFolderBatchJob(jobId),
-        fetchAudioLabFolderBatchLogs(jobId),
-        fetchAudioLabFolderBatchOutputs(jobId),
-        fetchAudioLabFolderBatchSummary(jobId),
-      ]);
+      const detail = await fetchAudioLabFolderBatchJob(jobId);
       setActiveFolderBatchJob(detail);
-      setFolderBatchLogs(logs.logs || "");
-      setFolderBatchOutputs(outputs.items || []);
-      setFolderBatchSummary(summary);
       setFolderBatchJobs((current) => {
         const exists = current.some((item) => item.id === detail.id);
         return exists ? current.map((item) => (item.id === detail.id ? detail : item)) : [detail, ...current];
       });
+      if (skipHeavyRefresh) return;
+      fetchAudioLabFolderBatchLogs(jobId)
+        .then((logs) => setFolderBatchLogs(logs.logs || ""))
+        .catch(() => {
+          if (!options.quiet) setError("No se pudieron cargar los logs del job.");
+        });
+      setFolderBatchOutputsLoading(true);
+      setFolderBatchOutputsError("");
+      fetchAudioLabFolderBatchOutputs(jobId)
+        .then((outputs) => {
+          const normalized = normalizeFolderBatchOutputsResponse(outputs);
+          setFolderBatchOutputs(normalized.items);
+          if (normalized.empty && normalized.message) {
+            setMessage(normalized.message);
+          }
+        })
+        .catch((err) => {
+          setFolderBatchOutputsError(err.message || "No se pudo cargar outputs del job. Revisa logs backend.");
+          if (!options.quiet) setError("No se pudo cargar outputs/summary del job. Revisa logs backend.");
+        })
+        .finally(() => setFolderBatchOutputsLoading(false));
+      setFolderBatchSummaryLoading(true);
+      setFolderBatchSummaryError("");
+      fetchAudioLabFolderBatchSummary(jobId)
+        .then((summary) => setFolderBatchSummary(summary))
+        .catch((err) => {
+          setFolderBatchSummaryError(err.message || "No se pudo cargar summary del job. Revisa logs backend.");
+          if (!options.quiet) setError("No se pudo cargar outputs/summary del job. Revisa logs backend.");
+        })
+        .finally(() => setFolderBatchSummaryLoading(false));
     } catch (err) {
       if (!options.quiet) setError(err.message || "No fue posible refrescar el job de carpeta local.");
     }
@@ -3971,10 +4196,7 @@ export default function AudioLabPage() {
   );
   const activeFolderBatchJobConfig = folderBatchJobConfig(activeFolderBatchJob);
   const activeFolderBatchJobZeroCandidates = folderBatchJobFinishedWithoutCandidates(activeFolderBatchJob);
-  const activeFolderBatchJobConfigKey = zeroCandidateConfigKey(activeFolderBatchJobConfig);
-  const showWiderZeroCandidateFallback =
-    activeFolderBatchJobZeroCandidates &&
-    activeFolderBatchJobConfigKey === "zero_candidates_no_noise";
+  const zeroCandidateRecovery = selectZeroCandidateRecovery(activeFolderBatchJob);
   const calibrationReportPath = calibrationReportFolderPath(calibrationReport || calibrationTest || calibrationProfile);
   const calibrationReportIsFromAnotherFolder = Boolean(
     folderBatchPath &&
@@ -3996,18 +4218,45 @@ export default function AudioLabPage() {
     ? [calibrationRouteMeta.reportName, formatDateTime(calibrationRouteMeta.reportDate)].filter(Boolean).join(" · ")
     : "";
   const hasCalibrationBase = hasCalibrationBaseConfig();
-  const calibrationConfigsAllZero = Boolean(calibrationTest?.configs?.length) && calibrationTest.configs.every((item) => Number(item.total_candidates || 0) === 0);
+  const calibrationRows = calibrationTest?.configs || [];
+  const finalRecommendationProfiles = calibrationTest?.final_recommendation_profiles || {};
+  const calibrationProfileCards = [
+    finalRecommendationProfiles.high_confidence_config,
+    finalRecommendationProfiles.balanced_config,
+    finalRecommendationProfiles.high_recall_config,
+    finalRecommendationProfiles.exploratory_config,
+  ].filter(Boolean);
+  const calibrationConfigsAllZero = Boolean(calibrationRows.length) && calibrationRows.every((item) => Number(item.total_candidates || 0) === 0);
+  const exploratoryWideRow = calibrationRows.find(isExploratoryWideCalibrationRow) || null;
+  const calibrationHasExploratoryWide = Boolean(exploratoryWideRow);
+  const exploratoryWideTooManyCandidates = exploratoryWideRow?.recommendation === "too_many_candidates";
+  const calibrationBestNextStep = calibrationTest?.best_next_step || "";
   const recommendedConfigName = calibrationTest?.recommended_config || recommendedCalibrationParameters()?.name || "";
-  const recommendedConfigRow = calibrationTest?.configs?.find((item) => item.config === recommendedConfigName) || null;
+  const recommendedConfigRow = calibrationRows.find((item) => calibrationRowMatches(item, recommendedConfigName)) || null;
   const recommendedIsExploratoryWide = recommendedConfigName === "exploratory_wide";
   const recommendedIsIntermediate = recommendedConfigName === "intermedia_exploratoria";
   const recommendedIsNarrow = recommendedConfigName === "intermedia_cerrada";
   const recommendedIsSelectiveNarrow = ["intermedia_cerrada_mas_selectiva", "intermedia_cerrada_mas_selectiva_ratio025"].includes(recommendedConfigName);
   const recommendedIsStrictNarrow = recommendedConfigName === "intermedia_cerrada_estricta";
+  const recommendedIsBroaderDetection = isRecommendedBroaderDetectionConfig(recommendedConfigRow) || isRecommendedBroaderDetectionConfig(recommendedCalibrationParameters());
+  const calibrationHasBroaderDetection = calibrationRows.some(isRecommendedBroaderDetectionConfig);
+  const hasLowCandidateStrictProbe = calibrationRows.some(calibrationRowIsLowCandidateStrictProbe);
   const recommendedIsExploratory = isExploratoryConfigName(recommendedConfigName);
+  const recommendedHasCleanCandidates =
+    Number(recommendedConfigRow?.total_candidates || 0) > 0 &&
+    Number(recommendedConfigRow?.possible_damage_count || 0) === 0 &&
+    Number(recommendedConfigRow?.clipping_count || 0) === 0;
+  const recommendedIsBalanceada = isBalanceadaCalibrationName(recommendedConfigName) || isBalanceadaCalibrationName(recommendedConfigRow?.config);
   const recommendedTooManyCandidates = recommendedConfigRow?.recommendation === "too_many_candidates";
+  const recommendedBroaderSafeForReview = recommendedIsBroaderDetection && recommendedHasCleanCandidates && recommendedConfigRow?.recommendation === "safe_for_review";
+  const recommendedRequiresReviewCandidate = recommendedHasCleanCandidates && ["requires_review", "candidate_for_review"].includes(recommendedConfigRow?.recommendation);
   const recommendedUnsafeProbe = isUnsafeExploratoryConfigName(recommendedConfigName, recommendedConfigRow?.recommendation);
   const recommendedSmallBatchCandidate = calibrationRowIsSmallBatchCandidate(recommendedConfigRow);
+  const shouldReviewPreviews =
+    calibrationBestNextStep === "review_previews" ||
+    recommendedBroaderSafeForReview ||
+    recommendedRequiresReviewCandidate ||
+    recommendedSmallBatchCandidate;
   const smallBatchUseBlockedReason = recommendedSmallBatchCandidate
     ? smallBatchCandidateBlockedReason(recommendedConfigRow, previewReviewStarted)
     : "No hay configuracion candidata para muestra pequena.";
@@ -4034,28 +4283,65 @@ export default function AudioLabPage() {
   const exploratoryCandidates = isExploratoryCalibration
     ? Number(calibrationTest.configs[0]?.total_candidates || 0)
     : 0;
-  const calibrationBestNextStep = calibrationTest?.best_next_step || "";
-  const shouldCreateIntermediate = calibrationBestNextStep === "try_intermediate_config" || (recommendedIsExploratoryWide && recommendedTooManyCandidates);
+  const hasLowCleanBalanceadaOrSensible = calibrationRows.some((item) =>
+    isBalanceadaOrSensibleCalibrationRow(item) &&
+    Number(item.total_candidates || 0) > 0 &&
+    Number(item.total_candidates || 0) <= 2 &&
+    Number(item.possible_damage_count || 0) === 0 &&
+    Number(item.clipping_count || 0) === 0
+  );
+  const shouldTryMoreSensitiveVariant =
+    !shouldReviewPreviews &&
+    (
+      calibrationBestNextStep === "try_more_sensitive_variant" ||
+      (recommendedIsBalanceada && recommendedHasCleanCandidates && calibrationHasExploratoryWide) ||
+      (exploratoryWideTooManyCandidates && hasLowCleanBalanceadaOrSensible)
+    );
+  const shouldTryBroaderDetection =
+    !shouldReviewPreviews &&
+    (
+      calibrationBestNextStep === "try_broader_detection" ||
+      (!calibrationHasBroaderDetection && hasLowCandidateStrictProbe)
+    );
+  const shouldCreateIntermediate =
+    !shouldTryMoreSensitiveVariant &&
+    !shouldTryBroaderDetection &&
+    (
+      calibrationBestNextStep === "try_intermediate_config" ||
+      (recommendedIsExploratoryWide && recommendedTooManyCandidates) ||
+      exploratoryWideTooManyCandidates
+    );
   const shouldCreateNarrower = calibrationBestNextStep === "try_narrower_config" || (recommendedIsIntermediate && recommendedTooManyCandidates);
   const shouldTrySelectiveNarrow = recommendedIsNarrow && recommendedTooManyCandidates;
   const shouldManualReviewOrTighten = (calibrationBestNextStep === "manual_review_or_tighten" || recommendedIsSelectiveNarrow) && recommendedTooManyCandidates;
+  const shouldCreateExploratoryWide = !calibrationHasExploratoryWide && !recommendedHasCleanCandidates && calibrationConfigsAllZero;
   const selectiveNarrowRows = calibrationTest?.configs?.filter((item) => String(item.config || "").startsWith("intermedia_cerrada_mas_selectiva")) || [];
   const selectiveNarrowAllZero = Boolean(selectiveNarrowRows.length) && selectiveNarrowRows.every((item) => Number(item.total_candidates || 0) === 0);
   const strictNarrowAllZero = recommendedIsStrictNarrow && Number(recommendedConfigRow?.total_candidates || 0) === 0;
   const calibrationStepKey = safeCalibrationParameters()
     ? "safe"
-    : shouldManualReviewOrTighten || shouldCreateNarrower || recommendedIsNarrow
+    : shouldReviewPreviews || shouldManualReviewOrTighten || shouldTryBroaderDetection || shouldCreateNarrower || recommendedIsNarrow
       ? "narrow"
-      : shouldCreateIntermediate || recommendedIsIntermediate
-        ? "intermediate"
-        : recommendedIsExploratoryWide || isExploratoryCalibration
-          ? "wide"
-          : calibrationTest?.configs?.length
-            ? "compare"
-            : "profile";
+    : shouldCreateIntermediate || recommendedIsIntermediate
+      ? "intermediate"
+      : shouldCreateExploratoryWide || recommendedIsExploratoryWide || isExploratoryCalibration
+        ? "wide"
+        : calibrationTest?.configs?.length
+          ? "compare"
+          : "profile";
   const calibrationStepIndex = Math.max(0, CALIBRATION_STEP_DEFINITIONS.findIndex(([key]) => key === calibrationStepKey));
   const calibrationStateTitle = calibrationConfigsAllZero
     ? "No se detectaron candidatos con las configuraciones iniciales."
+    : shouldReviewPreviews
+      ? recommendedBroaderSafeForReview
+        ? "Esta configuración encontró más candidatos sin daño. Revisa previews antes de entrenamiento."
+        : "La configuración detectó candidatos sin daño, pero requiere revisión humana."
+    : shouldTryBroaderDetection
+      ? "Volver a detección más amplia recomendada."
+    : shouldTryBroaderDetection
+      ? "Las configuraciones 2500-5000 Hz dieron pocos candidatos. Prueba 2200-3300 Hz, threshold -51 y ratio 0.23 sin reducción de ruido ni normalización."
+    : shouldTryMoreSensitiveVariant
+      ? "La configuración encontró pocos candidatos. Puede estar demasiado estricta."
     : shouldCreateIntermediate
       ? "Actividad encontrada, pero filtros demasiado amplios."
     : shouldCreateNarrower
@@ -4069,6 +4355,12 @@ export default function AudioLabPage() {
             : "Asistente listo para calibrar.";
   const calibrationStateExplanation = calibrationConfigsAllZero
     ? "Esto no significa que no haya rana. Puede indicar que la banda, threshold o ratio son demasiado estrictos."
+    : shouldReviewPreviews
+      ? recommendedBroaderSafeForReview
+        ? "La banda 2200-3300 Hz encontró más actividad útil sin daño. Úsala solo en muestra pequeña y revisa previews antes de entrenamiento."
+        : "Abre los previews para escuchar y revisar espectrogramas antes de usar estos parametros en una muestra pequena."
+    : shouldTryMoreSensitiveVariant
+      ? "Prueba una variante mas sensible antes de decidir si la banda o el threshold estan cerrando demasiado."
     : shouldCreateIntermediate
       ? "La configuracion exploratoria sirve para encontrar actividad posible, pero puede incluir lluvia, viento o falsos candidatos."
     : shouldCreateNarrower
@@ -4084,6 +4376,8 @@ export default function AudioLabPage() {
   if (!safeCalibrationParameters()) {
     if (calibrationConfigsAllZero) safeUnavailableReasons.push("No hay configuracion segura porque no hubo candidatos.");
     if (recommendedUnsafeProbe || recommendedIsExploratoryWide) safeUnavailableReasons.push("No hay configuracion segura porque la configuracion es exploratoria.");
+    if (recommendedBroaderSafeForReview) safeUnavailableReasons.push("La configuracion amplia es segura para revision, no para entrenamiento automatico.");
+    if (recommendedRequiresReviewCandidate) safeUnavailableReasons.push("No hay configuracion segura porque requiere revision humana.");
     if (recommendedTooManyCandidates || shouldCreateIntermediate || shouldCreateNarrower) safeUnavailableReasons.push("No hay configuracion segura porque todavia hay demasiados candidatos.");
     if (Number(recommendedConfigRow?.possible_damage_count || 0) > 0) safeUnavailableReasons.push("No hay configuracion segura porque hay possible_damage.");
     if (!safeUnavailableReasons.length) safeUnavailableReasons.push("Primero ejecuta Probar configuraciones. Este boton se activa cuando existe una configuracion segura confirmada.");
@@ -4092,8 +4386,12 @@ export default function AudioLabPage() {
     ? ""
     : recommendedIsExploratoryWide
       ? "exploratory_wide es exploratoria: no es una configuración segura."
+    : recommendedBroaderSafeForReview
+      ? "La configuración amplia es segura para revisión, no para entrenamiento automático."
       : recommendedTooManyCandidates
         ? "La configuración encontró actividad, pero es demasiado amplia. Puede incluir lluvia, viento o falsos candidatos."
+        : recommendedRequiresReviewCandidate
+          ? "La configuración detectó candidatos sin daño, pero requiere revisión humana."
         : calibrationConfigsAllZero
           ? "No hay configuración segura porque ninguna produjo candidatos evaluables."
           : "Primero ejecuta Probar configuraciones. Este botón se activa cuando existe una configuración segura confirmada.";
@@ -4101,22 +4399,42 @@ export default function AudioLabPage() {
   const guidedSafeCalibrationDisabledReason = safeCalibrationParameters() ? "" : safeUnavailableReasons[0] || safeCalibrationDisabledReason;
   const recommendedActionLabel = safeCalibrationParameters()
     ? "Usar configuracion segura en carpeta"
+    : shouldTryBroaderDetection
+      ? "Volver a detección más amplia recomendada"
     : shouldManualReviewOrTighten
+      ? "Abrir previews para revisar"
+      : shouldReviewPreviews
       ? "Abrir previews para revisar"
       : shouldTrySelectiveNarrow
       ? "Probar mas selectiva"
+      : shouldTryMoreSensitiveVariant
+      ? "Crear prueba más sensible"
       : shouldCreateNarrower
       ? "Crear configuracion mas cerrada"
       : shouldCreateIntermediate
         ? "Crear configuracion intermedia"
-        : "Crear prueba exploratoria amplia";
+        : shouldCreateExploratoryWide
+          ? "Crear prueba exploratoria amplia"
+          : "Probar configuraciones";
   const runRecommendedCalibrationAction = () => {
     if (safeCalibrationParameters()) {
       applySafeCalibrationToFolderBatch();
       return;
     }
+    if (shouldTryBroaderDetection) {
+      applyBroaderDetectionToFolderBatch();
+      return;
+    }
     if (shouldManualReviewOrTighten) {
       openCalibrationPreviewsForReview();
+      return;
+    }
+    if (shouldReviewPreviews) {
+      openCalibrationPreviewsForReview();
+      return;
+    }
+    if (shouldTryMoreSensitiveVariant) {
+      runMoreSensitiveCalibrationTest();
       return;
     }
     if (shouldCreateNarrower) {
@@ -4131,10 +4449,16 @@ export default function AudioLabPage() {
       runExploratoryCalibrationTest(suggestedIntermediateConfig);
       return;
     }
-    runExploratoryCalibrationTest();
+    if (shouldCreateExploratoryWide) {
+      runExploratoryCalibrationTest();
+      return;
+    }
+    runCalibrationConfigTest();
   };
   const recommendationPanelTitle = safeCalibrationParameters()
     ? "Configuracion segura candidata"
+    : shouldReviewPreviews
+      ? "Revision humana requerida"
     : recommendedIsExploratoryWide
       ? "Configuracion exploratoria actual"
       : recommendedIsIntermediate
@@ -4148,6 +4472,8 @@ export default function AudioLabPage() {
           : "Recomendacion actual";
   const recommendationPanelBadge = safeCalibrationParameters()
     ? "Segura para prueba"
+    : shouldReviewPreviews
+      ? "Revisar previews"
     : recommendedIsExploratoryWide
       ? "Exploratoria"
       : recommendedIsIntermediate
@@ -4161,6 +4487,8 @@ export default function AudioLabPage() {
           : calibrationTest?.recommended_config || recommendedCalibrationParameters()?.name || "balanceada";
   const recommendationPanelMessage = safeCalibrationParameters()
     ? "Puedes aplicarla a la carpeta actual, pero requiere revision humana antes de entrenamiento."
+    : shouldReviewPreviews
+      ? "La configuracion detecto candidatos sin dano, pero requiere revision humana."
     : recommendedIsExploratoryWide
       ? "No usar para procesamiento masivo ni entrenamiento sin revisar."
       : recommendedIsIntermediate
@@ -4179,18 +4507,6 @@ export default function AudioLabPage() {
         ? "Prueba más sensible: busca más candidatos."
         : calibrationReport?.report_type === "audio_processing_config_test"
           ? "Comparación de configuraciones: valida seguridad."
-          : "";
-  const calibrationNextStep =
-    calibrationReport?.report_type === "audio_folder_profile"
-      ? "Siguiente paso recomendado: Probar configuraciones."
-      : calibrationReport?.configs?.length && calibrationReport.configs.every((item) => Number(item.total_candidates || 0) === 0)
-        ? "Siguiente paso recomendado: Crear prueba exploratoria amplia."
-      : calibrationReport?.best_next_step === "try_intermediate_config" || recommendedTooManyCandidates
-        ? "Siguiente paso recomendado: Crear configuración intermedia."
-      : calibrationReport?.incremental_recommendation?.triggered
-        ? "Siguiente paso recomendado: Crear prueba más sensible."
-        : safeCalibrationParameters()
-          ? "Siguiente paso recomendado: Usar configuración segura en carpeta."
           : "";
   const guidedCalibrationNextStep = `Siguiente paso recomendado: ${recommendedActionLabel}.`;
   const folderBatchJobInProgress = ["pending", "running", "paused"].includes(activeFolderBatchJob?.status || "");
@@ -4946,7 +5262,7 @@ python -m uvicorn ml_api.main:app --host 127.0.0.1 --port 8010 --reload`}
                     disabled={Boolean(calibrationLoading) || !calibrationFolderPath || (safeCalibrationParameters() && !folderBatchPath)}
                     className="rounded-lg bg-blue-700 px-4 py-2 text-sm font-semibold text-white disabled:opacity-50"
                   >
-                    <LoadingText loading={Boolean(calibrationLoading && [suggestedIntermediateConfig.name, suggestedNarrowerConfig.name, "selective_narrow", "exploratory_wide"].includes(calibrationLoading))} loadingText="Probando...">
+                    <LoadingText loading={Boolean(calibrationLoading && [suggestedIntermediateConfig.name, suggestedNarrowerConfig.name, "selective_narrow", "sensitive", "exploratory_wide", "test"].includes(calibrationLoading))} loadingText="Probando...">
                       Siguiente paso recomendado: {recommendedActionLabel}
                     </LoadingText>
                   </button>
@@ -4963,7 +5279,7 @@ python -m uvicorn ml_api.main:app --host 127.0.0.1 --port 8010 --reload`}
                 <button type="button" onClick={runMoreSensitiveCalibrationTest} disabled={Boolean(calibrationLoading) || !calibrationFolderPath || !hasCalibrationBase} title={hasCalibrationBase ? "Crear prueba más sensible: detecta más cantos suaves bajando threshold/ratio." : moreSensitiveDisabledReason} className="rounded-lg bg-teal-700 px-4 py-2 text-sm font-semibold text-white disabled:opacity-50">
                   <LoadingText loading={calibrationLoading === "sensitive"} loadingText="Probando...">Crear prueba más sensible</LoadingText>
                 </button>
-                <button type="button" onClick={() => recommendedIsExploratory ? applyExploratoryToSmallSample() : applyCalibrationToFolderBatch()} disabled={!recommendedCalibrationParameters() || recommendedUnsafeProbe || shouldCreateNarrower} className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-semibold text-white disabled:opacity-50">
+                <button type="button" onClick={() => recommendedIsExploratory ? applyExploratoryToSmallSample() : applyCalibrationToFolderBatch()} disabled={!recommendedCalibrationParameters() || recommendedUnsafeProbe || recommendedRequiresReviewCandidate || recommendedBroaderSafeForReview || shouldCreateNarrower || shouldTryBroaderDetection} className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-semibold text-white disabled:opacity-50">
                   {recommendedIsExploratory ? "Aplicar exploratoria a muestra" : "Aplicar configuración recomendada"}
                 </button>
                 {shouldCreateIntermediate || recommendedIsExploratoryWide ? (
@@ -5012,7 +5328,7 @@ python -m uvicorn ml_api.main:app --host 127.0.0.1 --port 8010 --reload`}
                   <p className="font-semibold text-blue-700">Este perfil solo sugiere parámetros. Para confirmar seguridad, ejecuta Probar configuraciones.</p>
                 ) : null}
               </div>
-              {calibrationConfigsAllZero ? (
+              {shouldCreateExploratoryWide ? (
                 <div className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-xs text-amber-950">
                   <p className="font-semibold">No se detectaron candidatos en la muestra con estas configuraciones. Esto no significa que no haya rana; puede indicar que la banda, threshold o ratio son demasiado estrictos.</p>
                   <ul className="mt-2 list-disc space-y-1 pl-5">
@@ -5136,14 +5452,19 @@ python -m uvicorn ml_api.main:app --host 127.0.0.1 --port 8010 --reload`}
                         <button type="button" onClick={runMoreSensitiveCalibrationTest} disabled={Boolean(calibrationLoading) || !calibrationFolderPath || calibrationReportHistorical} className="rounded-lg bg-teal-700 px-3 py-2 text-xs font-semibold text-white disabled:opacity-50">
                           Crear prueba más sensible
                         </button>
-                        <button type="button" onClick={applySafeCalibrationToFolderBatch} className="rounded-lg border border-sky-300 bg-sky-50 px-3 py-2 text-xs font-semibold text-sky-800">
+                        <button type="button" onClick={applySafeCalibrationToFolderBatch} disabled={!safeCalibrationParameters()} title={guidedSafeCalibrationDisabledReason} className="rounded-lg border border-sky-300 bg-sky-50 px-3 py-2 text-xs font-semibold text-sky-800 disabled:opacity-50">
                           Usar configuración segura en carpeta
                         </button>
                       </div>
                     </div>
                   ) : null}
                   <div className="mt-3 flex flex-wrap gap-2">
-                    {shouldManualReviewOrTighten ? (
+                    {shouldTryBroaderDetection ? (
+                      <button type="button" onClick={applyBroaderDetectionToFolderBatch} disabled={Boolean(calibrationLoading) || !calibrationFolderPath} className="rounded-lg bg-amber-700 px-3 py-2 text-xs font-semibold text-white disabled:opacity-50">
+                        Volver a detección más amplia recomendada
+                      </button>
+                    ) : null}
+                    {shouldReviewPreviews || shouldManualReviewOrTighten ? (
                       <>
                         <button type="button" onClick={openCalibrationPreviewsForReview} className="rounded-lg border border-indigo-300 bg-indigo-50 px-3 py-2 text-xs font-semibold text-indigo-900">
                           Abrir previews para revisar
@@ -5151,8 +5472,13 @@ python -m uvicorn ml_api.main:app --host 127.0.0.1 --port 8010 --reload`}
                         <button type="button" onClick={() => applySmallBatchReviewToFolderBatch()} disabled={smallBatchUseDisabled} title={smallBatchUseDisabled ? smallBatchUseBlockedReason : "Copiar solo parametros para una muestra pequena de revision humana."} className="rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-xs font-semibold text-amber-900 disabled:opacity-50">
                           Usar en muestra pequena
                         </button>
-                        <button type="button" onClick={() => runExploratoryCalibrationTest(EXPLORATORY_NARROW_STRICT_CALIBRATION_CONFIG)} disabled={Boolean(calibrationLoading) || !calibrationFolderPath} className="rounded-lg bg-slate-800 px-3 py-2 text-xs font-semibold text-white disabled:opacity-50">
-                          Probar mas estricta
+                        {shouldManualReviewOrTighten ? (
+                          <button type="button" onClick={() => runExploratoryCalibrationTest(EXPLORATORY_NARROW_STRICT_CALIBRATION_CONFIG)} disabled={Boolean(calibrationLoading) || !calibrationFolderPath} className="rounded-lg bg-slate-800 px-3 py-2 text-xs font-semibold text-white disabled:opacity-50">
+                            Probar mas estricta
+                          </button>
+                        ) : null}
+                        <button type="button" onClick={runMoreSensitiveCalibrationTest} disabled={Boolean(calibrationLoading) || !calibrationFolderPath || !hasCalibrationBase} className="rounded-lg border border-teal-300 bg-teal-50 px-3 py-2 text-xs font-semibold text-teal-900 disabled:opacity-50">
+                          Probar variante más sensible
                         </button>
                       </>
                     ) : shouldCreateNarrower ? (
@@ -5183,6 +5509,48 @@ python -m uvicorn ml_api.main:app --host 127.0.0.1 --port 8010 --reload`}
               ) : (
                 <p className="rounded-lg border border-slate-200 p-4 text-sm text-slate-500">Analiza el perfil acústico para ver banda sugerida, threshold, ratio y advertencias antes de procesar la carpeta.</p>
               )}
+
+              {calibrationProfileCards.length ? (
+                <div className="grid gap-3 lg:grid-cols-2">
+                  {calibrationProfileCards.map((profile) => {
+                    const contrast = profile.contrast_before_after || {};
+                    const params = profile.parameters || {};
+                    const profileBlockedReason = smallBatchCandidateBlockedReason(profile, true);
+                    return (
+                      <div key={profile.role} className="rounded-lg border border-slate-200 bg-white p-4">
+                        <div className="flex flex-wrap items-start justify-between gap-2">
+                          <div>
+                            <h3 className="text-sm font-bold text-slate-950">{profile.title}</h3>
+                            <p className="mt-1 text-xs font-semibold text-slate-600">{profile.config}</p>
+                          </div>
+                          <Badge tone={profile.role === "exploratory" ? "warning" : profile.role === "balanced" ? "success" : "info"}>
+                            {recommendationLabel(profile.recommendation)}
+                          </Badge>
+                        </div>
+                        <div className="mt-3 grid gap-2 text-xs text-slate-700 sm:grid-cols-2">
+                          <span>Candidatos: <strong>{profile.total_candidates ?? 0}</strong></span>
+                          <span>Duración: <strong>{formatNumber(profile.total_duration_candidates, 3)} s</strong></span>
+                          <span>Ratio: <strong>{formatNumber(profile.average_band_energy_ratio, 6)}</strong></span>
+                          <span>Contraste: <strong>{formatNumber(contrast.before_db, 2)} → {formatNumber(contrast.after_db, 2)} dB</strong></span>
+                          <span>Posible daño: <strong>{profile.possible_damage_count ?? 0}</strong></span>
+                          <span>Banda: <strong>{params.frequency_min_hz}-{params.frequency_max_hz} Hz</strong></span>
+                        </div>
+                        <p className="mt-3 rounded-lg border border-amber-200 bg-amber-50 p-2 text-xs font-semibold text-amber-900">
+                          {profile.warning || "Requiere revisión humana antes de entrenamiento."}
+                        </p>
+                        <div className="mt-3 flex flex-wrap gap-2">
+                          <button type="button" onClick={() => applySmallBatchReviewToFolderBatch(profile.parameters, profile)} disabled={Boolean(profileBlockedReason)} title={profileBlockedReason || "Copiar parametros para muestra pequeña."} className="rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-xs font-semibold text-amber-900 disabled:opacity-50">
+                            Usar en muestra pequeña
+                          </button>
+                          <button type="button" onClick={openCalibrationPreviewsForReview} className="rounded-lg border border-indigo-300 bg-indigo-50 px-3 py-2 text-xs font-semibold text-indigo-900">
+                            Abrir previews
+                          </button>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              ) : null}
 
               {calibrationTest?.configs?.length ? (
                 <div className="overflow-x-auto rounded-lg border border-slate-200">
@@ -5230,9 +5598,9 @@ python -m uvicorn ml_api.main:app --host 127.0.0.1 --port 8010 --reload`}
                           <td className="px-3 py-2">
                             <button
                               type="button"
-                              onClick={() => calibrationRowIsSmallBatchCandidate(item) ? applySmallBatchReviewToFolderBatch(item.parameters, item) : isExploratoryConfigName(item.config) ? applyCalibrationToFolderBatch(item.parameters, { copyFolderPath: false, exploratory: true, configName: item.config }) : applyOnlyCalibrationParametersToCurrentFolder(item.parameters)}
-                              disabled={calibrationRowIsSmallBatchCandidate(item) ? Boolean(smallBatchCandidateBlockedReason(item, previewReviewStarted)) : !folderBatchPath}
-                              title={calibrationRowIsSmallBatchCandidate(item) ? smallBatchCandidateBlockedReason(item, previewReviewStarted) || "Copiar solo parametros para una muestra pequena de revision humana." : !folderBatchPath ? "Escribe primero la ruta actual en Procesamiento masivo." : ""}
+                              onClick={() => applyCalibrationRowToFolderBatch(item)}
+                              disabled={!calibrationFolderPath || (calibrationRowIsSmallBatchCandidate(item) ? Boolean(smallBatchCandidateBlockedReason(item, true)) : false)}
+                              title={!calibrationFolderPath ? "Escribe primero la ruta del asistente." : calibrationRowIsSmallBatchCandidate(item) ? smallBatchCandidateBlockedReason(item, true) || "Copiar parametros exactos de esta fila para una muestra pequena de revision humana." : "Copiar parametros exactos de esta fila."}
                               className="rounded-lg border border-blue-300 bg-blue-50 px-2 py-1 text-xs font-semibold text-blue-800 disabled:opacity-50"
                             >
                               Usar
@@ -5532,19 +5900,13 @@ python -m uvicorn ml_api.main:app --host 127.0.0.1 --port 8010 --reload`}
                           <p><strong>Configuracion usada:</strong> Este job no tiene configuración guardada; puedes aplicar una variante manualmente.</p>
                         )}
                       </div>
-                      <div className="mt-3 flex flex-wrap gap-2">
-                        <button type="button" onClick={() => applyZeroCandidateVariant(ZERO_CANDIDATE_VARIANTS.sensitive)} className="rounded-lg bg-amber-700 px-3 py-2 text-xs font-semibold text-white">
-                          Probar variante más sensible
-                        </button>
-                        <button type="button" onClick={() => applyZeroCandidateVariant(ZERO_CANDIDATE_VARIANTS.noNoise)} className="rounded-lg border border-amber-300 bg-white px-3 py-2 text-xs font-semibold text-amber-900">
-                          Probar sin reducción de ruido
-                        </button>
-                        {showWiderZeroCandidateFallback ? (
-                          <button type="button" onClick={() => applyZeroCandidateVariant(ZERO_CANDIDATE_VARIANTS.widerDetection)} className="rounded-lg border border-blue-300 bg-blue-50 px-3 py-2 text-xs font-semibold text-blue-900">
-                            Volver a detección más amplia
+                      {zeroCandidateRecovery ? (
+                        <div className="mt-3 flex flex-wrap gap-2">
+                          <button type="button" onClick={() => applyZeroCandidateVariant(zeroCandidateRecovery.variant)} className="rounded-lg bg-amber-700 px-3 py-2 text-xs font-semibold text-white">
+                            {zeroCandidateRecovery.actionLabel}
                           </button>
-                        ) : null}
-                      </div>
+                        </div>
+                      ) : null}
                     </div>
                   ) : null}
                   <div className="mt-3 flex flex-wrap gap-2">
@@ -5637,9 +5999,20 @@ python -m uvicorn ml_api.main:app --host 127.0.0.1 --port 8010 --reload`}
                 </label>
                 <div className="text-xs text-slate-600">
                   <span className="block font-semibold">Summary</span>
-                  <span>{folderBatchSummary?.summary?.candidates || activeFolderBatchJob.candidates_count || 0} candidatos, {folderBatchSummary?.summary?.contaminants || activeFolderBatchJob.contaminant_suspect_count || 0} sospechosos</span>
+                  <span>{folderBatchSummaryLoading ? "Cargando..." : `${folderBatchSummary?.summary?.candidates_count ?? folderBatchSummary?.summary?.candidates ?? activeFolderBatchJob.candidates_count ?? 0} candidatos, ${folderBatchSummary?.summary?.contaminants_count ?? folderBatchSummary?.summary?.contaminants ?? activeFolderBatchJob.contaminant_suspect_count ?? 0} sospechosos`}</span>
                 </div>
               </div>
+
+              {folderBatchOutputsError || folderBatchSummaryError ? (
+                <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800">
+                  No se pudo cargar outputs/summary del job. Revisa logs backend.
+                </div>
+              ) : null}
+              {!folderBatchOutputsLoading && activeFolderBatchJob && !folderBatchOutputs.length && (folderBatchSummary?.summary?.zero_candidates || Number(activeFolderBatchJob.candidates_count || 0) === 0) ? (
+                <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-sm text-slate-700">
+                  No hay clips generados para este job. La configuracion no produjo candidatos.
+                </div>
+              ) : null}
 
               <div className="max-h-96 overflow-auto rounded-lg border border-slate-200">
                 <table className="min-w-full text-left text-sm">

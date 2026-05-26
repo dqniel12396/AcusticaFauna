@@ -3,6 +3,14 @@ import re
 from pathlib import Path
 
 
+DEFAULT_CORS_ORIGINS = (
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://localhost:5174",
+    "http://127.0.0.1:5174",
+)
+
+
 def load_env_file(path: Path) -> None:
     if not path.exists():
         return
@@ -78,10 +86,21 @@ class Settings:
         self.ML_API_BASE_URL = os.getenv("ACUSTICAFAUNA_ML_API_URL") or os.getenv("ML_API_BASE_URL", "http://127.0.0.1:8010")
         self.ML_API_BASE_URL = self.ML_API_BASE_URL.rstrip("/")
         self.FRONTEND_URL = os.getenv("ACUSTICAFAUNA_FRONTEND_URL", "http://localhost:5173")
+        self.CORS_ORIGINS = self.resolve_cors_origins()
         self.RESOURCE_PROFILE = os.getenv("ACUSTICAFAUNA_RESOURCE_PROFILE", "auto")
         self.MAX_CPU_THREADS = os.getenv("ACUSTICAFAUNA_MAX_CPU_THREADS", "auto")
         self.MAX_WORKERS = os.getenv("ACUSTICAFAUNA_MAX_WORKERS", "auto")
         self.DEVICE = os.getenv("ACUSTICAFAUNA_DEVICE", "auto")
+
+    def resolve_cors_origins(self) -> tuple[str, ...]:
+        raw = os.getenv("CORS_ORIGINS") or os.getenv("BACKEND_CORS_ORIGINS") or ""
+        configured = [origin.strip().rstrip("/") for origin in raw.split(",") if origin.strip()]
+        defaults = [*DEFAULT_CORS_ORIGINS, self.FRONTEND_URL.rstrip("/")]
+        origins: list[str] = []
+        for origin in [*defaults, *configured]:
+            if origin and origin != "*" and origin not in origins:
+                origins.append(origin)
+        return tuple(origins)
 
     @property
     def MEDIA_ALLOWED_ROOTS(self) -> tuple[Path, ...]:

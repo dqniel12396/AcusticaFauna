@@ -281,6 +281,41 @@ def test_report_documents_when_no_candidates_are_detected(tmp_path):
     assert "No se detectaron candidatos" in report
 
 
+def test_no_candidates_does_not_repeat_exploratory_wide_when_already_tested(tmp_path):
+    from app.services.audio_calibration_service import test_audio_processing_configs
+
+    folder = synthetic_calibration_folder(tmp_path)
+    output_dir = tmp_path / "no_candidates_after_exploratory_report"
+    result = test_audio_processing_configs(
+        str(folder),
+        "Pristimantis_simoterus",
+        sample_size=3,
+        configs=[],
+        config_definitions=[
+            {
+                "name": "exploratory_wide",
+                "label": "Exploratoria amplia",
+                "frequency_min_hz": 1800,
+                "frequency_max_hz": 6000,
+                "threshold_dbfs": 0,
+                "min_band_energy_ratio": 0.99,
+                "bandpass": True,
+                "noise_reduce": False,
+                "normalize": False,
+                "detection_only": True,
+            }
+        ],
+        output_dir=output_dir,
+        allow_unrestricted=True,
+        detection_only=True,
+    )
+
+    assert result["configs"][0]["config"] == "exploratory_wide"
+    assert result["configs"][0]["total_candidates"] == 0
+    assert result["best_next_step"] != "try_exploratory_wide"
+    assert result["safe_recommended_config"] is None
+
+
 def test_exploratory_wide_is_not_safe_and_suggests_intermediate(tmp_path):
     from app.services.audio_calibration_service import test_audio_processing_configs
 
@@ -412,6 +447,92 @@ def test_safe_recommendation_rules_reject_exploratory_and_allow_real_safe_candid
     assert is_safe_recommended_summary({**base, "config": "intermedia_cerrada", "recommendation": "too_many_candidates"}) is False
 
 
+def test_broader_detection_safe_for_review_is_review_not_auto_safe():
+    from app.services.audio_calibration_service import (
+        RECOMMENDED_BROADER_DETECTION_CONFIG,
+        build_final_recommendation,
+        is_low_candidate_strict_probe,
+        is_recommended_broader_detection_summary,
+        is_safe_recommended_summary,
+    )
+
+    low_strict = {
+        "config": "revision_2500_5000_m51_r025_no_noise",
+        "parameters": {
+            "frequency_min_hz": 2500,
+            "frequency_max_hz": 5000,
+            "threshold_dbfs": -51,
+            "min_band_energy_ratio": 0.25,
+            "noise_reduce": False,
+            "normalize": False,
+        },
+        "total_candidates": 1,
+        "possible_damage_count": 0,
+        "clipping_count": 0,
+    }
+    broader = {
+        "config": "amplia_2200_3300_m51_r023_no_noise",
+        "label": "Amplia 2200-3300 sin reduccion",
+        "parameters": RECOMMENDED_BROADER_DETECTION_CONFIG,
+        "total_candidates": 8,
+        "possible_damage_count": 0,
+        "clipping_count": 0,
+        "average_band_energy_ratio": 0.656252,
+        "recommendation": "safe_for_review",
+        "detection_metrics": {"useful_candidates": 8},
+        "cleaning_metrics": {"cleaning_safe": True, "contrast_delta_db": 12.748875},
+    }
+
+    assert is_low_candidate_strict_probe(low_strict) is True
+    assert is_recommended_broader_detection_summary(broader) is True
+    assert is_safe_recommended_summary(broader) is False
+    recommendation = build_final_recommendation(broader, broader)
+    assert recommendation["mode"] == "review_previews"
+    assert recommendation["summary"] == "Esta configuracion encontro mas candidatos sin dano. Revisa previews antes de entrenamiento."
+    assert recommendation["warning"] == "No usar automaticamente para entrenamiento."
+
+
+def test_final_recommendation_profiles_pick_balanced_as_primary():
+    from app.services.audio_calibration_service import build_final_recommendation_profiles, choose_recommended_config
+
+    def row(config, candidates, duration, ratio, before, after):
+        return {
+            "config": config,
+            "label": config,
+            "parameters": {"name": config, "frequency_min_hz": 2200, "frequency_max_hz": 3300, "threshold_dbfs": -50, "min_band_energy_ratio": ratio, "noise_reduce": False, "normalize": False},
+            "total_candidates": candidates,
+            "total_duration_candidates": duration,
+            "average_band_energy_ratio": ratio,
+            "possible_damage_count": 0,
+            "clipping_count": 0,
+            "contrast_before_after": {"before_db": before, "after_db": after, "delta_db": after - before},
+            "recommendation": "safe_for_review",
+            "detection_metrics": {"useful_candidates": candidates},
+            "cleaning_metrics": {"cleaning_safe": True, "contrast_delta_db": after - before},
+        }
+
+    summaries = [
+        row("base_2200_3300_m51_r023_no_noise", 17, 8.272, 0.508106, 5.9, 18.6),
+        row("cerrada_2200_3200_m50_r025_no_noise", 14, 7.052, 0.573453, 8.29, 18.05),
+        row("intermedia_2100_3400_m51_r022_no_noise", 25, 11.892, 0.55, 6.0, 17.0),
+        row("selectiva_2300_3300_m50_r027_no_noise", 3, 2.082, 0.866921, 25.04, 30.13),
+        {**row("exploratoria_1800_3600_m55_r015_no_noise", 41, 38.386, 0.4, 3.0, 8.0), "recommendation": "too_many_candidates"},
+    ]
+    summaries[1]["parameters"].update({"frequency_min_hz": 2200, "frequency_max_hz": 3200, "min_band_energy_ratio": 0.25})
+    summaries[2]["parameters"].update({"frequency_min_hz": 2100, "frequency_max_hz": 3400, "min_band_energy_ratio": 0.22})
+    summaries[3]["parameters"].update({"frequency_min_hz": 2300, "frequency_max_hz": 3300, "min_band_energy_ratio": 0.27})
+    summaries[4]["parameters"].update({"frequency_min_hz": 1800, "frequency_max_hz": 3600, "min_band_energy_ratio": 0.15})
+
+    profiles = build_final_recommendation_profiles(summaries)
+
+    assert profiles["high_confidence_config"]["config"] == "selectiva_2300_3300_m50_r027_no_noise"
+    assert profiles["balanced_config"]["config"] == "cerrada_2200_3200_m50_r025_no_noise"
+    assert profiles["high_recall_config"]["config"] in {"base_2200_3300_m51_r023_no_noise", "intermedia_2100_3400_m51_r022_no_noise"}
+    assert profiles["exploratory_config"]["config"] == "exploratoria_1800_3600_m55_r015_no_noise"
+    assert profiles["training_allowed"] is False
+    assert choose_recommended_config(summaries)["config"] == "cerrada_2200_3200_m50_r025_no_noise"
+
+
 def test_closed_config_too_many_suggests_selective_not_intermediate():
     from app.services.audio_calibration_service import build_final_recommendation
 
@@ -444,6 +565,94 @@ def test_selective_too_many_requires_manual_review_or_tighten():
     assert recommendation["mode"] == "manual_review_or_tighten"
     assert "preview" in recommendation["warning"]
     assert "mas estricta" in recommendation["warning"]
+
+
+def test_requires_review_candidate_becomes_review_previews_report(tmp_path):
+    from app.services.audio_calibration_service import (
+        CONFIG_CANDIDATES,
+        build_final_recommendation,
+        is_review_preview_candidate,
+        write_test_reports,
+    )
+
+    row = {
+        "config": "intermedia_sin_norm",
+        "label": "Intermedia sin normalizacion",
+        "parameters": CONFIG_CANDIDATES["intermedia_sin_norm"],
+        "total_candidates": 1,
+        "total_duration_candidates": 0.9,
+        "average_band_energy_ratio": 0.448,
+        "average_rms_dbfs": -46.0,
+        "estimated_noise_floor": -55.0,
+        "possible_damage_count": 0,
+        "clipping_count": 0,
+        "contrast_before_after": {"before_db": 3.0, "after_db": 4.0, "delta_db": 1.0},
+        "noise_floor_before_after": {"before_db": -55.0, "after_db": -48.0, "delta_db": 7.0},
+        "detection_metrics": {
+            "total_candidates": 1,
+            "useful_candidates": 1,
+            "total_duration_candidates": 0.9,
+            "duration_ratio_of_sample": 0.02,
+            "duration_reasonable": True,
+            "requires_manual_review": False,
+            "candidate_for_small_batch_review": True,
+            "review_preview_candidate": True,
+            "average_band_energy_ratio": 0.448,
+            "average_score": 0.5,
+            "recommendation": "candidate_for_review",
+        },
+        "cleaning_metrics": {
+            "mode": "cleaning_preview",
+            "cleaning_safe": False,
+            "possible_damage_count": 0,
+            "clipping_count": 0,
+            "contrast_delta_db": 1.0,
+            "noise_floor_delta_db": 7.0,
+            "recommendation": "requires_review",
+        },
+        "recommendation": "requires_review",
+        "review_status": "candidate_for_small_batch_review",
+    }
+    recommendation = build_final_recommendation(row, None, review_candidate=row)
+    assert is_review_preview_candidate(row) is True
+    assert recommendation["mode"] == "review_previews"
+    assert recommendation["summary"] == "Hay candidatos sin dano, pero requieren revision humana."
+    assert recommendation["warning"] == "No usar automaticamente para entrenamiento."
+
+    result = {
+        "report_type": "audio_processing_config_test",
+        "report_id": "requires_review_report",
+        "folder_path": str(tmp_path),
+        "folder_path_resolved": str(tmp_path),
+        "label": "Pristimantis_simoterus",
+        "sample_size_used": 1,
+        "created_at": "2026-05-23T00:00:00",
+        "recommended_config": "intermedia_sin_norm",
+        "recommended_parameters": CONFIG_CANDIDATES["intermedia_sin_norm"],
+        "best_detection_config": "intermedia_sin_norm",
+        "best_detection_parameters": CONFIG_CANDIDATES["intermedia_sin_norm"],
+        "best_cleaning_config": None,
+        "best_cleaning_parameters": None,
+        "safe_recommended_config": None,
+        "safe_recommended_parameters": None,
+        "cleaning_safe": False,
+        "best_next_step": "review_previews",
+        "recommendation_explanation": "Revisa manualmente los candidatos antes de procesar toda la carpeta.",
+        "final_recommendation": recommendation,
+        "configs": [row],
+        "previews": [],
+        "output_dir": str(tmp_path),
+        "report_paths": {},
+        "warnings": [],
+    }
+    write_test_reports(result, tmp_path)
+
+    summary = json.loads((tmp_path / "summary.json").read_text(encoding="utf-8"))
+    report = (tmp_path / "report.md").read_text(encoding="utf-8")
+    assert summary["best_next_step"] == "review_previews"
+    assert summary["final_recommendation"]["summary"] == "Hay candidatos sin dano, pero requieren revision humana."
+    assert "## Revision humana requerida" in report
+    assert "Siguiente paso recomendado: abrir previews para revisar." in report
 
 
 def test_calibration_api_accepts_authorized_folder(client, tmp_path):
