@@ -95,20 +95,6 @@ Thumbs.db
 .vscode/*
 !.vscode/extensions.json
 
-# Local heavy/audio folders - never commit
-pristimantis natalia artos/
-**/pristimantis natalia artos/
-*.wav
-*.WAV
-*.flac
-*.FLAC
-*.mp3
-*.MP3
-*.ogg
-*.OGG
-*.m4a
-*.M4A
-
-# Local analysis metadata
+# Local analysis / code graph metadata
 .codegraph/
 **/.codegraph/

@@ -342,9 +342,24 @@ python scripts/check_environment.py
 python scripts/preflight_github.py
 ```
 
+## Barrido avanzado en la web
+
+El flujo principal esta en **Laboratorio de audio -> Asistente de calibracion acustica**. Pega la carpeta local, escribe el label, usa una muestra de 30 o 50 audios, elige **Tipo de barrido** y pulsa **Crear barrido avanzado**. No necesitas JSON manuales ni consola.
+
+Usa **Adaptativo general** para aves, insectos y otras ranas: el backend analiza el perfil acustico de la carpeta, toma las bandas con mayor contraste y recalcula las frecuencias del barrido. No reutiliza rangos de `Pristimantis_simoterus`.
+
+Usa **Pristimantis simoterus lluvia/viento** solo para ese caso. Estos rangos son un preset especifico, no universal:
+
+- **Alta confianza**: `2300-3300 Hz`, threshold `-50 dBFS`, ratio `0.27`, `noise_reduce=false`, `normalize=false`. Usala cuando prefieras pocos candidatos y menor riesgo de falsos positivos.
+- **Equilibrada recomendada**: `2200-3200 Hz`, threshold `-50 dBFS`, ratio `0.25`, `noise_reduce=false`, `normalize=false`. Usala como primera opcion para revision humana si no hay dano, clipping ni exceso de candidatos.
+- **Mayor cobertura**: `2200-3300 Hz`, threshold `-51 dBFS`, ratio `0.23`, `noise_reduce=false`, `normalize=false`. Usala cuando Alta confianza o Equilibrada dejan pocos candidatos; requiere mas revision.
+- **Exploratoria**: `2000-3500 Hz`, threshold `-52 dBFS`, ratio `0.20`, `noise_reduce=false`, `normalize=false`. Solo exploracion / no entrenamiento automatico.
+
+El boton **Aplicar al procesamiento masivo** copia ruta, label y parametros exactos al formulario masivo con preset personalizado. No inicia procesamiento automaticamente: escanea la carpeta y ejecuta un nuevo job despues de revisar previews. Los audios originales no se modifican.
+
 ## Barrido CLI de calibracion
 
-Para probar varias configuraciones sin depender de la UI:
+Los scripts CLI se mantienen para depuracion avanzada. Para uso normal, prefiere el barrido avanzado disponible en la web:
 
 ```powershell
 cd acusticafauna-General\acusticafauna-Back
