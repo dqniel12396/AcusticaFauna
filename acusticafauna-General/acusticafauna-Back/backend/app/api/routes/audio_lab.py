@@ -4,6 +4,7 @@ import uuid
 import base64
 import csv
 import fnmatch
+import hashlib
 import json
 import logging
 import math
@@ -62,11 +63,22 @@ VALID_FEEDBACK = {
 VALID_STATUS = {"active", "corrected", "retracted", "legacy", "needs_review"}
 VALID_EXCLUSION_REASONS = {
     "voz_humana",
+    "carro_motor",
+    "ave",
     "ruido",
     "sin_vocalizacion",
     "audio_equivocado",
     "etiqueta_incorrecta",
     "otro",
+}
+VALID_REVIEW_STATUS = {
+    "confirmed",
+    "excluded",
+    "human_voice",
+    "car_motor",
+    "bird",
+    "unsure",
+    "hard_negative",
 }
 BATCH_JOB_CANCEL_EVENTS: dict[str, threading.Event] = {}
 BATCH_JOB_STATUSES = {"queued", "running", "completed", "failed", "canceled"}
@@ -113,6 +125,15 @@ class AudioLabAnnotationPayload(BaseModel):
     final_label: str | None = None
     pipeline_stages_json: str | None = None
     model_ids_json: str | None = None
+    review_status: str | None = None
+    species_label: str | None = None
+    reviewer: str | None = None
+    reviewed_at: str | None = None
+    band_ratio: float | None = None
+    rms_dbfs: float | None = None
+    preset_name: str | None = None
+    config_used: str | None = None
+    bulk_action_id: str | None = None
 
 
 class AudioLabAnnotationUpdatePayload(BaseModel):
@@ -128,6 +149,34 @@ class AudioLabAnnotationUpdatePayload(BaseModel):
     previous_feedback: str | None = None
     new_feedback: str | None = None
     correction_note: str | None = None
+    review_status: str | None = None
+    species_label: str | None = None
+    reviewer: str | None = None
+    reviewed_at: str | None = None
+
+
+class AudioLabBulkAnnotationPayload(BaseModel):
+    job_id: str
+    output_ids: list[str]
+    review_status: str
+    species_label: str | None = None
+    reviewer: str | None = "web"
+    notes: str | None = None
+    confirmation_text: str | None = None
+
+
+class AudioLabDatasetExportPayload(BaseModel):
+    dataset_name: str
+    species_label: str
+    version: str = "v0.1"
+    include_confirmed_positives: bool = True
+    include_negatives_excluded: bool = True
+    include_hard_negatives: bool = True
+    exclude_unsure: bool = True
+    include_contaminants: bool = True
+    contaminants_as_negative: bool = False
+    copy_clips: bool = False
+    split_by_source_audio_path: bool = True
 
 
 class AudioClipPayload(BaseModel):
@@ -301,6 +350,8 @@ class CalibrationTestConfigsPayload(BaseModel):
     folder_path: str
     label: str
     sample_size: int = 10
+    mode: str | None = None
+    species_profile: str | None = None
     configs: list[str] = ["conservadora", "balanceada", "sensible"]
     config_definitions: list[dict[str, Any]] = []
     noise_type: str | None = None
@@ -1844,12 +1895,27 @@ def ensure_audio_lab_schema(conn) -> None:
         "final_label": "TEXT",
         "pipeline_stages_json": "TEXT",
         "model_ids_json": "TEXT",
+        "review_status": "TEXT",
+        "species_label": "TEXT",
+        "reviewer": "TEXT",
+        "reviewed_at": "TEXT",
+        "band_ratio": "REAL",
+        "rms_dbfs": "REAL",
+        "preset_name": "TEXT",
+        "config_used": "TEXT",
+        "bulk_action_id": "TEXT",
     }
     for name, definition in columns.items():
         if name not in existing:
             conn.execute(f"ALTER TABLE audio_lab_annotations ADD COLUMN {name} {definition}")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_audio_lab_annotations_status ON audio_lab_annotations(status)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_audio_lab_annotations_job ON audio_lab_annotations(batch_job_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_audio_lab_annotations_bulk ON audio_lab_annotations(bulk_action_id)"
     )
 
     conn.execute(
@@ -2222,11 +2288,97 @@ def validate_exclusion_reason(reason: str | None) -> None:
         )
 
 
+def validate_review_status(review_status: str | None) -> None:
+    if review_status and review_status not in VALID_REVIEW_STATUS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"review_status debe ser uno de: {sorted(VALID_REVIEW_STATUS)}",
+        )
+
+
+def review_status_defaults(review_status: str, species_label: str | None = None) -> dict[str, Any]:
+    label = species_label or "target_species"
+    mapping = {
+        "confirmed": {
+            "user_feedback": "confirmed_positive",
+            "feedback_type": "confirmed_positive",
+            "exclusion_reason": None,
+            "label_type": "species_target",
+            "recommended_training_use": "positive",
+            "hard_negative_candidate": False,
+            "final_label": label,
+            "user_label": label,
+        },
+        "excluded": {
+            "user_feedback": "excluded_from_training",
+            "feedback_type": "excluded_from_training",
+            "exclusion_reason": "ruido",
+            "label_type": "negative",
+            "recommended_training_use": "negative",
+            "hard_negative_candidate": False,
+            "final_label": "negative",
+            "user_label": "negative",
+        },
+        "human_voice": {
+            "user_feedback": "excluded_from_training",
+            "feedback_type": "excluded_from_training",
+            "exclusion_reason": "voz_humana",
+            "label_type": "human_voice",
+            "recommended_training_use": "contaminant",
+            "hard_negative_candidate": False,
+            "final_label": "human_voice",
+            "user_label": "human_voice",
+        },
+        "car_motor": {
+            "user_feedback": "excluded_from_training",
+            "feedback_type": "excluded_from_training",
+            "exclusion_reason": "carro_motor",
+            "label_type": "car_motor",
+            "recommended_training_use": "contaminant",
+            "hard_negative_candidate": False,
+            "final_label": "car_motor",
+            "user_label": "car_motor",
+        },
+        "bird": {
+            "user_feedback": "excluded_from_training",
+            "feedback_type": "excluded_from_training",
+            "exclusion_reason": "ave",
+            "label_type": "bird",
+            "recommended_training_use": "contaminant",
+            "hard_negative_candidate": False,
+            "final_label": "bird",
+            "user_label": "bird",
+        },
+        "unsure": {
+            "user_feedback": "uncertain",
+            "feedback_type": "uncertain",
+            "exclusion_reason": None,
+            "label_type": "unsure",
+            "recommended_training_use": "exclude_species_training",
+            "hard_negative_candidate": False,
+            "final_label": "unsure",
+            "user_label": "unsure",
+        },
+        "hard_negative": {
+            "user_feedback": "hard_negative",
+            "feedback_type": "hard_negative",
+            "exclusion_reason": None,
+            "label_type": "hard_negative",
+            "recommended_training_use": "hard_negative",
+            "hard_negative_candidate": True,
+            "final_label": "hard_negative",
+            "user_label": "hard_negative",
+        },
+    }
+    return mapping[review_status]
+
+
 @router.post("/annotations")
 def create_annotation(payload: AudioLabAnnotationPayload):
     validate_feedback(payload.user_feedback)
     validate_status(payload.status)
     validate_exclusion_reason(payload.exclusion_reason)
+    validate_review_status(payload.review_status)
 
     annotation_id = str(uuid.uuid4())
     created_at = now_iso()
@@ -2238,10 +2390,27 @@ def create_annotation(payload: AudioLabAnnotationPayload):
     label_type = payload.label_type
     recommended_training_use = payload.recommended_training_use
     hard_negative_candidate = payload.hard_negative_candidate
+    review_status = payload.review_status
+    if not review_status:
+        if payload.user_feedback == "confirmed_positive":
+            review_status = "confirmed"
+        elif payload.user_feedback == "hard_negative":
+            review_status = "hard_negative"
+        elif payload.user_feedback == "uncertain":
+            review_status = "unsure"
+        elif payload.exclusion_reason == "voz_humana":
+            review_status = "human_voice"
+        elif payload.exclusion_reason == "carro_motor":
+            review_status = "car_motor"
+        elif payload.exclusion_reason == "ave":
+            review_status = "bird"
+        elif payload.user_feedback == "excluded_from_training":
+            review_status = "excluded"
     if payload.user_feedback == "excluded_from_training" and payload.exclusion_reason == "voz_humana":
         label_type = label_type or "human_voice"
         recommended_training_use = recommended_training_use or "exclude_species_training"
         hard_negative_candidate = False if hard_negative_candidate is None else hard_negative_candidate
+    reviewed_at = payload.reviewed_at or created_at
 
     conn = get_connection()
     try:
@@ -2284,10 +2453,19 @@ def create_annotation(payload: AudioLabAnnotationPayload):
                 final_label,
                 pipeline_stages_json,
                 model_ids_json,
+                review_status,
+                species_label,
+                reviewer,
+                reviewed_at,
+                band_ratio,
+                rms_dbfs,
+                preset_name,
+                config_used,
+                bulk_action_id,
                 updated_at,
                 created_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 annotation_id,
@@ -2325,6 +2503,15 @@ def create_annotation(payload: AudioLabAnnotationPayload):
                 payload.final_label,
                 payload.pipeline_stages_json,
                 payload.model_ids_json,
+                review_status,
+                payload.species_label,
+                payload.reviewer,
+                reviewed_at,
+                payload.band_ratio,
+                payload.rms_dbfs,
+                payload.preset_name,
+                payload.config_used,
+                payload.bulk_action_id,
                 created_at,
                 created_at,
             ),
@@ -2342,9 +2529,12 @@ def create_annotation(payload: AudioLabAnnotationPayload):
 @router.get("/annotations")
 def list_annotations(
     audio_path: str | None = None,
+    job_id: str | None = None,
+    output_id: str | None = None,
     model_id: str | None = None,
     feedback_type: str | None = None,
     exclusion_reason: str | None = None,
+    review_status: str | None = None,
     status: str | None = None,
     date_from: str | None = None,
     date_to: str | None = None,
@@ -2355,9 +2545,12 @@ def list_annotations(
     params: list[Any] = []
     for column, value in {
         "audio_path": audio_path,
+        "batch_job_id": job_id,
+        "batch_output_id": output_id,
         "model_id": model_id,
         "feedback_type": feedback_type,
         "exclusion_reason": exclusion_reason,
+        "review_status": review_status,
         "status": status,
     }.items():
         if value:
@@ -2586,11 +2779,383 @@ def create_clean_manifest(payload: CleanManifestPayload):
         conn.close()
 
 
+def folder_batch_output_annotations_source(conn, job_id: str, output_ids: list[str]) -> list[dict[str, Any]]:
+    if not output_ids:
+        return []
+    placeholders = ",".join("?" for _ in output_ids)
+    rows = conn.execute(
+        f"""
+        SELECT o.*, s.start_seconds, s.end_seconds, s.duration_seconds, s.activity_score,
+               s.band_energy_ratio, s.rms_dbfs, s.contaminant_flags_json,
+               j.job_name, j.target_label, j.preset, j.params_json
+        FROM audio_lab_folder_batch_outputs o
+        LEFT JOIN audio_lab_folder_batch_segments s ON s.id = o.segment_id
+        LEFT JOIN audio_lab_folder_batch_jobs j ON j.id = o.job_id
+        WHERE o.job_id = ? AND o.id IN ({placeholders})
+        """,
+        (job_id, *output_ids),
+    ).fetchall()
+    return [row_to_dict(row) for row in rows]
+
+
+def annotation_payload_from_folder_output(
+    output: dict[str, Any],
+    review_status: str,
+    species_label: str | None,
+    reviewer: str | None,
+    notes: str | None,
+    bulk_action_id: str | None = None,
+) -> AudioLabAnnotationPayload:
+    defaults = review_status_defaults(review_status, species_label or output.get("target_label"))
+    processed_path = output.get("output_audio_path") or output.get("processed_audio_path")
+    source_path = output.get("original_audio_path") or processed_path
+    start_time = output.get("start_seconds") or 0
+    end_time = output.get("end_seconds")
+    if end_time is None:
+        end_time = float(start_time or 0) + float(output.get("duration_seconds") or 0)
+    return AudioLabAnnotationPayload(
+        audio_path=processed_path or source_path,
+        audio_name=Path(processed_path or source_path or "clip").name,
+        source_row_id=output.get("file_id"),
+        start_seconds=start_time,
+        end_seconds=end_time,
+        segment_start_seconds=start_time,
+        segment_end_seconds=end_time,
+        predicted_label=species_label or output.get("target_label"),
+        score=output.get("activity_score"),
+        score_used=output.get("activity_score"),
+        threshold=None,
+        user_feedback=defaults["user_feedback"],
+        feedback_type=defaults["feedback_type"],
+        exclusion_reason=defaults["exclusion_reason"],
+        label_type=defaults["label_type"],
+        recommended_training_use=defaults["recommended_training_use"],
+        hard_negative_candidate=defaults["hard_negative_candidate"],
+        user_label=defaults["user_label"],
+        notes=notes or "",
+        status="active",
+        processed_audio_path=processed_path,
+        batch_job_id=output.get("job_id"),
+        batch_output_id=output.get("id"),
+        processing_metadata_path=output.get("output_metadata_path"),
+        original_source_audio_path=source_path,
+        final_label=defaults["final_label"],
+        review_status=review_status,
+        species_label=species_label or output.get("target_label"),
+        reviewer=reviewer or "web",
+        reviewed_at=now_iso(),
+        band_ratio=output.get("band_energy_ratio"),
+        rms_dbfs=output.get("rms_dbfs"),
+        preset_name=output.get("preset"),
+        config_used=output.get("params_json"),
+        bulk_action_id=bulk_action_id,
+    )
+
+
+@router.post("/annotations/bulk")
+def bulk_create_annotations(payload: AudioLabBulkAnnotationPayload):
+    validate_review_status(payload.review_status)
+    if payload.review_status == "confirmed" and (payload.confirmation_text or "").strip() != "CONFIRMAR":
+        raise HTTPException(status_code=400, detail="Debes escribir CONFIRMAR para confirmar clips en bloque.")
+    if not payload.output_ids:
+        raise HTTPException(status_code=400, detail="Selecciona al menos un resultado.")
+
+    bulk_action_id = str(uuid.uuid4())
+    conn = get_connection()
+    try:
+        ensure_audio_lab_schema(conn)
+        ensure_audio_lab_extra_schema(conn)
+        outputs = folder_batch_output_annotations_source(conn, payload.job_id, payload.output_ids)
+    finally:
+        conn.close()
+    if len(outputs) != len(set(payload.output_ids)):
+        raise HTTPException(status_code=404, detail="Uno o mas outputs seleccionados no existen para el job.")
+
+    items = []
+    for output in outputs:
+        annotation_payload = annotation_payload_from_folder_output(
+            output,
+            payload.review_status,
+            payload.species_label,
+            payload.reviewer,
+            payload.notes,
+            bulk_action_id,
+        )
+        items.append(create_annotation(annotation_payload))
+    return {
+        "bulk_action_id": bulk_action_id,
+        "job_id": payload.job_id,
+        "review_status": payload.review_status,
+        "count": len(items),
+        "items": items,
+        "message": "Anotaciones guardadas. No se entreno ningun modelo.",
+    }
+
+
+@router.post("/annotations/undo-last-bulk")
+def undo_last_bulk_annotation(job_id: str | None = None):
+    conn = get_connection()
+    try:
+        ensure_audio_lab_schema(conn)
+        where = "WHERE bulk_action_id IS NOT NULL AND status != 'retracted'"
+        params: list[Any] = []
+        if job_id:
+            where += " AND batch_job_id = ?"
+            params.append(job_id)
+        last = conn.execute(
+            f"""
+            SELECT bulk_action_id, MAX(created_at) AS created_at
+            FROM audio_lab_annotations
+            {where}
+            GROUP BY bulk_action_id
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            params,
+        ).fetchone()
+        if not last:
+            raise HTTPException(status_code=404, detail="No hay accion masiva para deshacer.")
+        updated_at = now_iso()
+        result = conn.execute(
+            "UPDATE audio_lab_annotations SET status = 'retracted', updated_at = ? WHERE bulk_action_id = ? AND status != 'retracted'",
+            (updated_at, last["bulk_action_id"]),
+        )
+        conn.commit()
+        return {
+            "bulk_action_id": last["bulk_action_id"],
+            "undone_count": result.rowcount,
+            "message": "Ultima accion masiva deshecha. No se modificaron audios originales.",
+        }
+    finally:
+        conn.close()
+
+
+def annotation_source_audio(item: dict[str, Any]) -> str:
+    return item.get("original_source_audio_path") or item.get("source_audio_path") or item.get("audio_path") or ""
+
+
+def annotation_processed_clip(item: dict[str, Any]) -> str:
+    return item.get("processed_audio_path") or item.get("processed_clip_path") or item.get("audio_path") or ""
+
+
+def split_for_source(source_audio_path: str) -> str:
+    digest = hashlib.sha1(source_audio_path.encode("utf-8", errors="ignore")).hexdigest()
+    bucket = int(digest[:8], 16) % 100
+    if bucket < 70:
+        return "train"
+    if bucket < 85:
+        return "validation"
+    return "test"
+
+
+def dataset_category(item: dict[str, Any], payload: AudioLabDatasetExportPayload) -> tuple[str | None, str | None]:
+    review_status = item.get("review_status")
+    feedback = item.get("feedback_type") or item.get("user_feedback")
+    label_type = item.get("label_type")
+    exclusion_reason = item.get("exclusion_reason")
+    if review_status == "confirmed" or feedback == "confirmed_positive":
+        return ("positives", payload.species_label) if payload.include_confirmed_positives else (None, None)
+    if review_status == "hard_negative" or feedback == "hard_negative":
+        return ("hard_negatives", "hard_negative") if payload.include_hard_negatives else (None, None)
+    if review_status == "unsure" or feedback == "uncertain":
+        return ("unsure", "unsure")
+    if review_status in {"human_voice", "car_motor", "bird"} or label_type in {"human_voice", "car_motor", "bird"} or exclusion_reason in {"voz_humana", "carro_motor", "ave"}:
+        if not payload.include_contaminants:
+            return (None, None)
+        return ("negatives" if payload.contaminants_as_negative else "contaminants", label_type or review_status or exclusion_reason)
+    if review_status == "excluded" or feedback == "excluded_from_training":
+        return ("negatives", "negative") if payload.include_negatives_excluded else (None, None)
+    return (None, None)
+
+
+def dataset_warning_summary(rows: list[dict[str, Any]], class_counts: dict[str, int]) -> list[str]:
+    warnings: list[str] = []
+    positives = class_counts.get("positives", 0)
+    negatives = class_counts.get("negatives", 0)
+    hard_negatives = class_counts.get("hard_negatives", 0)
+    unique_sources = {annotation_source_audio(row) for row in rows if annotation_source_audio(row)}
+    if positives < 30:
+        warnings.append("pocos positivos")
+    if negatives < 100:
+        warnings.append("pocos negativos")
+    if hard_negatives < 50:
+        warnings.append("pocos hard negatives para primer modelo experimental")
+    if len(unique_sources) < 5:
+        warnings.append("falta diversidad de archivos originales")
+    per_source: dict[str, int] = {}
+    for row in rows:
+        source = annotation_source_audio(row)
+        if source:
+            per_source[source] = per_source.get(source, 0) + 1
+    if rows and per_source and max(per_source.values()) / len(rows) > 0.5:
+        warnings.append("demasiados clips de un solo audio")
+    return warnings
+
+
+@router.post("/curated-datasets")
+def create_curated_dataset_from_audio_lab(payload: AudioLabDatasetExportPayload):
+    species = safe_filename(payload.species_label)
+    version = safe_filename(payload.version)
+    dataset_name = safe_filename(payload.dataset_name or f"{species}_{version}")
+    dataset_dir = audio_lab_dir("curated_datasets", species, version)
+    for part in ["positives", "negatives", "hard_negatives", "contaminants", "unsure"]:
+        (dataset_dir / part).mkdir(parents=True, exist_ok=True)
+
+    conn = get_connection()
+    try:
+        ensure_audio_lab_schema(conn)
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM audio_lab_annotations
+            WHERE COALESCE(status, 'active') != 'retracted'
+              AND COALESCE(species_label, final_label, user_label, predicted_label, '') IN (?, 'negative', 'hard_negative', 'human_voice', 'car_motor', 'bird', 'unsure')
+            ORDER BY created_at ASC
+            """,
+            (payload.species_label,),
+        ).fetchall()
+        annotations = [row_to_dict(row) for row in rows]
+    finally:
+        conn.close()
+
+    metadata_fields = [
+        "clip_id",
+        "dataset_version",
+        "split",
+        "label",
+        "review_status",
+        "source_audio_path",
+        "processed_clip_path",
+        "start_time",
+        "end_time",
+        "duration",
+        "score",
+        "band_ratio",
+        "rms_dbfs",
+        "preset_name",
+        "config_used",
+        "job_id",
+        "reviewer",
+        "reviewed_at",
+        "notes",
+    ]
+    metadata_rows: list[dict[str, Any]] = []
+    manifest_items: list[dict[str, Any]] = []
+    class_counts = {"positives": 0, "negatives": 0, "hard_negatives": 0, "contaminants": 0, "unsure": 0}
+    duration_by_class = {key: 0.0 for key in class_counts}
+    split_counts = {"train": 0, "validation": 0, "test": 0, "excluded": 0}
+    included_rows: list[dict[str, Any]] = []
+
+    for item in annotations:
+        category, label = dataset_category(item, payload)
+        if not category:
+            continue
+        source_path = annotation_source_audio(item)
+        processed_path = annotation_processed_clip(item)
+        start = float(item.get("segment_start_seconds") or item.get("start_seconds") or 0)
+        end = float(item.get("segment_end_seconds") or item.get("end_seconds") or start)
+        duration = max(0.0, end - start)
+        split = "excluded" if category == "unsure" and payload.exclude_unsure else split_for_source(source_path)
+        output_clip_path = processed_path
+        if payload.copy_clips and processed_path and processed_path != source_path:
+            source_clip = Path(processed_path)
+            if source_clip.exists() and source_clip.is_file():
+                target = dataset_dir / category / f"{safe_filename(item['id'])}_{safe_filename(source_clip.name)}"
+                shutil.copy2(source_clip, target)
+                output_clip_path = str(target)
+        row = {
+            "clip_id": item["id"],
+            "dataset_version": payload.version,
+            "split": split,
+            "label": label,
+            "review_status": item.get("review_status"),
+            "source_audio_path": source_path,
+            "processed_clip_path": output_clip_path,
+            "start_time": start,
+            "end_time": end,
+            "duration": duration,
+            "score": item.get("score_used") if item.get("score_used") is not None else item.get("score"),
+            "band_ratio": item.get("band_ratio"),
+            "rms_dbfs": item.get("rms_dbfs"),
+            "preset_name": item.get("preset_name"),
+            "config_used": item.get("config_used"),
+            "job_id": item.get("batch_job_id"),
+            "reviewer": item.get("reviewer"),
+            "reviewed_at": item.get("reviewed_at"),
+            "notes": item.get("notes"),
+        }
+        metadata_rows.append(row)
+        manifest_items.append({**row, "category": category})
+        class_counts[category] += 1
+        duration_by_class[category] += duration
+        split_counts[split] = split_counts.get(split, 0) + 1
+        included_rows.append(item)
+
+    metadata_path = dataset_dir / "metadata.csv"
+    with metadata_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=metadata_fields)
+        writer.writeheader()
+        writer.writerows(metadata_rows)
+
+    manifest = {
+        "dataset_name": payload.dataset_name,
+        "species_label": payload.species_label,
+        "version": payload.version,
+        "dataset_dir": str(dataset_dir),
+        "copy_clips": payload.copy_clips,
+        "split_rule": "source_audio_path: 70 train / 15 validation / 15 test",
+        "items": manifest_items,
+    }
+    manifest_path = dataset_dir / "dataset_manifest.json"
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    readme_path = dataset_dir / "README.md"
+    readme_path.write_text(
+        "\n".join(
+            [
+                f"# {payload.dataset_name} {payload.version}",
+                "",
+                "Dataset creado desde anotaciones revisadas de AudioLab.",
+                "Los audios originales no se modificaron.",
+                "Confirmar clips no inicio entrenamiento automatico.",
+                "Los clips dudosos quedan excluidos de train por defecto.",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    summary = {
+        "positives": class_counts["positives"],
+        "negatives": class_counts["negatives"],
+        "hard_negatives": class_counts["hard_negatives"],
+        "contaminants": class_counts["contaminants"],
+        "unsure_excluded": split_counts.get("excluded", 0),
+        "split": split_counts,
+        "unique_source_audios": len({annotation_source_audio(row) for row in included_rows if annotation_source_audio(row)}),
+        "duration_by_class": duration_by_class,
+        "warnings": dataset_warning_summary(included_rows, class_counts),
+        "recommendations": {
+            "dataset_semilla": "30-100 positivos, 100-300 negativos",
+            "primer_modelo_experimental": "100+ positivos, 300+ negativos, 50+ hard negatives",
+            "modelo_util": "300+ positivos, 1000+ negativos, 200+ hard negatives",
+        },
+    }
+    return {
+        "dataset_name": dataset_name,
+        "dataset_dir": str(dataset_dir),
+        "metadata_path": str(metadata_path),
+        "manifest_path": str(manifest_path),
+        "readme_path": str(readme_path),
+        "summary": summary,
+        "message": "Dataset versionado creado. No se entreno ningun modelo.",
+    }
+
+
 @router.patch("/annotations/{annotation_id}")
 def update_annotation(annotation_id: str, payload: AudioLabAnnotationUpdatePayload):
     validate_feedback(payload.user_feedback)
     validate_status(payload.status)
     validate_exclusion_reason(payload.exclusion_reason)
+    validate_review_status(payload.review_status)
 
     updates = (
         payload.model_dump(exclude_unset=True)
@@ -3550,9 +4115,10 @@ def profile_calibration_folder(payload: CalibrationProfilePayload):
 def test_calibration_configs(payload: CalibrationTestConfigsPayload):
     try:
         output_dir = default_test_output_dir(payload.label)
+        mode = (payload.mode or payload.calibration_mode or "").strip().lower()
         detection_only = payload.detection_only
         if detection_only is None:
-            detection_only = payload.calibration_mode == "detect"
+            detection_only = False if mode in {"advanced_sweep", "profile_sweep", "adaptive_advanced_sweep"} else payload.calibration_mode == "detect"
         return test_audio_processing_configs(
             payload.folder_path,
             payload.label,
@@ -3563,6 +4129,8 @@ def test_calibration_configs(payload: CalibrationTestConfigsPayload):
             job_allowed_roots=payload.job_allowed_roots,
             allow_unrestricted=False,
             detection_only=detection_only,
+            mode=mode,
+            species_profile=payload.species_profile,
         )
     except Exception as exc:
         raise calibration_http_error(exc) from exc

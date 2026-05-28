@@ -331,6 +331,72 @@ MORE_SENSITIVE_VARIANT = {
     "detection_only": False,
 }
 
+PRISTIMANTIS_RAIN_WIND_SWEEP_CONFIGS = [
+    ("high_confidence_config", "Alta confianza", 2300, 3300, -50, 0.27),
+    ("balanced_config", "Equilibrada recomendada", 2200, 3200, -50, 0.25),
+    ("high_recall_config", "Mayor cobertura", 2200, 3300, -51, 0.23),
+    ("exploratory_config", "Exploratoria", 2000, 3500, -52, 0.20),
+]
+
+
+def sweep_config(
+    name: str,
+    label: str,
+    low_hz: float,
+    high_hz: float,
+    threshold_dbfs: float,
+    ratio: float,
+    *,
+    sweep_profile_type: str,
+    species_profile: str | None = None,
+    source_band: dict[str, Any] | None = None,
+    rationale: str = "",
+) -> dict[str, Any]:
+    return {
+        "name": name,
+        "label": label,
+        "frequency_min_hz": low_hz,
+        "frequency_max_hz": high_hz,
+        "threshold_dbfs": threshold_dbfs,
+        "min_band_energy_ratio": ratio,
+        "min_band_ratio": ratio,
+        "min_activity_seconds": 0.25,
+        "min_silence_seconds": 0.35,
+        "padding_seconds": 0.12,
+        "clip_duration_seconds": 3,
+        "max_segment_seconds": 5,
+        "bandpass": True,
+        "noise_reduce": False,
+        "normalize": False,
+        "preset": "personalizado",
+        "detection_only": False,
+        "sweep_profile_type": sweep_profile_type,
+        "species_profile": species_profile,
+        "adaptive_source_band": source_band,
+        "adaptive_rationale": rationale,
+        "training_allowed": name != "exploratory_config",
+    }
+
+
+def pristimantis_rain_wind_sweep_configs() -> list[dict[str, Any]]:
+    return [
+        normalize_config(
+            sweep_config(
+                name,
+                label,
+                low,
+                high,
+                threshold,
+                ratio,
+                sweep_profile_type="species_specific",
+                species_profile="pristimantis_simoterus_rain_wind",
+                rationale="Preset especifico para Pristimantis_simoterus en lluvia/viento; no es universal.",
+            ),
+            False,
+        )
+        for name, label, low, high, threshold, ratio in PRISTIMANTIS_RAIN_WIND_SWEEP_CONFIGS
+    ]
+
 
 class CalibrationError(ValueError):
     pass
@@ -764,6 +830,142 @@ def analyze_audio_folder_profile(
     return result
 
 
+def profile_top_contrast_bands(profile_report: dict[str, Any]) -> list[dict[str, Any]]:
+    suggested = profile_report.get("suggested_parameters") or {}
+    return [item for item in suggested.get("top_contrast_bands") or [] if isinstance(item, dict)]
+
+
+def band_bounds(item: dict[str, Any]) -> tuple[float, float] | None:
+    if item.get("low_hz") is not None and item.get("high_hz") is not None:
+        return float(item["low_hz"]), float(item["high_hz"])
+    raw = str(item.get("band_hz") or "")
+    if "-" not in raw:
+        return None
+    left, right = raw.split("-", 1)
+    return float(left), float(right)
+
+
+def profile_nyquist(profile_report: dict[str, Any]) -> float:
+    sample_rates = [float(item.get("sample_rate") or 0) for item in profile_report.get("files") or [] if item.get("sample_rate")]
+    return max(1000.0, min(sample_rates) / 2.0) if sample_rates else 24000.0
+
+
+def low_frequency_noise_dominant(profile_report: dict[str, Any]) -> bool:
+    low_energy = []
+    other_energy = []
+    for file_item in profile_report.get("files") or []:
+        for band in file_item.get("bands") or []:
+            bounds = band_bounds(band)
+            if not bounds or band.get("mean_db") is None:
+                continue
+            low, high = bounds
+            if high <= 1000:
+                low_energy.append(float(band["mean_db"]))
+            elif low >= 1000:
+                other_energy.append(float(band["mean_db"]))
+    return bool(low_energy and other_energy and (mean_or_none(low_energy) or -120) > (mean_or_none(other_energy) or -120) + 6)
+
+
+def pick_adaptive_band(profile_report: dict[str, Any]) -> dict[str, Any] | None:
+    avoid_low = low_frequency_noise_dominant(profile_report)
+    candidates = []
+    for item in profile_top_contrast_bands(profile_report):
+        bounds = band_bounds(item)
+        if not bounds:
+            continue
+        low, high = bounds
+        if avoid_low and high <= 1000:
+            continue
+        contrast = float(item.get("mean_contrast_db", item.get("contrast_db", 0)) or 0)
+        candidates.append((contrast, low, high, item))
+    if not candidates:
+        return None
+    contrast, low, high, item = sorted(candidates, reverse=True)[0]
+    if contrast < 1 or high <= low:
+        return None
+    return {**item, "low_hz": low, "high_hz": high, "mean_contrast_db": contrast}
+
+
+def clamp_hz(value: float, nyquist: float) -> float:
+    return float(max(100, min(nyquist, round(float(value) / 100) * 100)))
+
+
+def adaptive_thresholds(profile_report: dict[str, Any]) -> dict[str, float]:
+    summary = profile_report.get("summary") or {}
+    rms = summary.get("rms_dbfs") or {}
+    noise = summary.get("noise_floor_dbfs") or {}
+    base = max(float(noise.get("median", -58)) + 6, float(rms.get("p90", -46)) - 8)
+    base = max(-56, min(-42, base))
+    return {
+        "high_confidence_config": round(base + 2, 1),
+        "balanced_config": round(base, 1),
+        "high_recall_config": round(base - 2, 1),
+        "exploratory_config": round(base - 4, 1),
+    }
+
+
+def build_adaptive_sweep_configs(profile_report: dict[str, Any], label: str | None = None, noise_context: str | None = None) -> list[dict[str, Any]]:
+    nyquist = profile_nyquist(profile_report)
+    source = pick_adaptive_band(profile_report)
+    thresholds = adaptive_thresholds(profile_report)
+    ratios = {
+        "high_confidence_config": 0.34,
+        "balanced_config": 0.28,
+        "high_recall_config": 0.22,
+        "exploratory_config": 0.16,
+    }
+    labels = {
+        "high_confidence_config": "Alta confianza",
+        "balanced_config": "Equilibrada recomendada",
+        "high_recall_config": "Mayor cobertura",
+        "exploratory_config": "Exploratoria",
+    }
+    if source:
+        low = float(source["low_hz"])
+        high = float(source["high_hz"])
+        width = high - low
+        if width <= 1200 and (low + high) / 2 < 3500:
+            ranges = {
+                "high_confidence_config": (low + 300, high + 300),
+                "balanced_config": (low + 200, high + 200),
+                "high_recall_config": (low, high + 500),
+                "exploratory_config": (low - 200, high + 1000),
+            }
+        else:
+            ranges = {
+                "high_confidence_config": (low + width * 0.15, high - width * 0.05),
+                "balanced_config": (low, high),
+                "high_recall_config": (low - width * 0.1, high + width * 0.1),
+                "exploratory_config": (low - width * 0.2, high + width * 0.2),
+            }
+        rationale = f"Generada desde la banda de mayor contraste {source['low_hz']}-{source['high_hz']} Hz."
+    else:
+        ranges = {
+            "high_confidence_config": (1000, min(4000, nyquist)),
+            "balanced_config": (500, min(6000, nyquist)),
+            "high_recall_config": (300, min(8000, nyquist)),
+            "exploratory_config": (100, min(10000, nyquist)),
+        }
+        rationale = "Generada con barrido amplio conservador porque no hubo una banda dominante clara."
+    return [
+        normalize_config(
+            sweep_config(
+                name,
+                labels[name],
+                clamp_hz(ranges[name][0], nyquist),
+                max(clamp_hz(ranges[name][1], nyquist), clamp_hz(ranges[name][0], nyquist) + 500),
+                thresholds[name],
+                ratios[name],
+                sweep_profile_type="adaptive",
+                source_band=source,
+                rationale=rationale,
+            ),
+            False,
+        )
+        for name in ["high_confidence_config", "balanced_config", "high_recall_config", "exploratory_config"]
+    ]
+
+
 def detect_segments(audio: np.ndarray, sample_rate: int, source_path: Path, config: dict[str, Any]) -> list[Segment]:
     if audio.size == 0 or sample_rate <= 0:
         return []
@@ -947,11 +1149,37 @@ def test_audio_processing_configs(
     job_allowed_roots: list[str] | None = None,
     allow_unrestricted: bool = False,
     detection_only: bool | None = None,
+    mode: str | None = None,
+    species_profile: str | None = None,
 ) -> dict[str, Any]:
     folder = resolve_calibration_folder(folder_path, job_allowed_roots=job_allowed_roots, allow_unrestricted=allow_unrestricted)
     files = representative_sample(list_audio_files(folder), sample_size)
     if not files:
         raise CalibrationError("No se encontraron audios para probar configuraciones.")
+    sweep_mode = str(mode or "").strip().lower()
+    sweep_profile_type = "generic"
+    adaptive_profile_report = None
+    effective_species_profile = str(species_profile or "").strip().lower()
+    if sweep_mode == "adaptive_advanced_sweep":
+        adaptive_profile_report = analyze_audio_folder_profile(
+            str(folder),
+            label,
+            sample_size=sample_size,
+            job_allowed_roots=[str(folder)],
+            allow_unrestricted=False,
+        )
+        configs = []
+        config_definitions = build_adaptive_sweep_configs(adaptive_profile_report, label=label)
+        detection_only = False
+        sweep_profile_type = "adaptive"
+    elif sweep_mode in {"advanced_sweep", "profile_sweep"}:
+        if effective_species_profile and effective_species_profile != "pristimantis_simoterus_rain_wind":
+            raise CalibrationError(f"species_profile desconocido para advanced_sweep: {species_profile}")
+        configs = []
+        config_definitions = pristimantis_rain_wind_sweep_configs()
+        detection_only = False
+        effective_species_profile = "pristimantis_simoterus_rain_wind"
+        sweep_profile_type = "species_specific"
     selected = resolve_config_selection(configs, config_definitions, detection_only)
     report_root = Path(output_dir) if output_dir else settings.STORAGE_DIR / "audio_lab" / "calibration_reports" / safe_name(f"{label}_test_{now_id()}")
     report_root.mkdir(parents=True, exist_ok=True)
@@ -1140,6 +1368,12 @@ def test_audio_processing_configs(
     )
     result = {
         "report_type": "audio_processing_config_test",
+        "calibration_mode": sweep_mode or None,
+        "sweep_profile_type": sweep_profile_type,
+        "species_profile": effective_species_profile or None,
+        "adaptive_profile_summary": {
+            "top_contrast_bands": profile_top_contrast_bands(adaptive_profile_report),
+        } if adaptive_profile_report else None,
         "report_id": safe_name(f"{label}_test_{now_id()}"),
         "folder_path": str(folder),
         "folder_path_resolved": str(folder),
@@ -1186,6 +1420,8 @@ def test_audio_processing_configs(
         "recommendation_explanation": recommendation_explanation,
         "final_recommendation": final_recommendation,
         "final_recommendation_profiles": final_recommendation_profiles,
+        "primary_recommended_profile": final_recommendation_profiles.get("primary_recommended_profile"),
+        "balanced_recommendation_rationale": balanced_recommendation_rationale(final_recommendation_profiles),
         "incremental_recommendation": incremental_recommendation,
         "configs": summaries,
         "previews": preview_records,
@@ -1206,7 +1442,10 @@ def test_audio_processing_configs(
 
 def choose_recommended_config(summaries: list[dict[str, Any]]) -> dict[str, Any] | None:
     profiles = build_final_recommendation_profiles(summaries)
-    return (profiles.get("balanced_config") or {}).get("config_summary") or choose_best_cleaning_config(summaries) or choose_best_detection_config(summaries)
+    primary = profiles.get("primary_recommended_profile")
+    if primary and profiles.get(primary):
+        return profiles[primary].get("config_summary")
+    return choose_best_cleaning_config(summaries) or choose_best_detection_config(summaries)
 
 
 def profile_contrast_after(item: dict[str, Any] | None) -> float:
@@ -1265,11 +1504,62 @@ def profile_payload(item: dict[str, Any] | None, role: str, title: str, warning:
         "review_status": item.get("review_status") or "candidate_for_small_batch_review",
         "warning": warning,
         "training_allowed": False,
+        "badge": title.lower(),
+        "sweep_profile_type": (item.get("parameters") or {}).get("sweep_profile_type"),
+        "species_profile": (item.get("parameters") or {}).get("species_profile"),
+        "adaptive_source_band": (item.get("parameters") or {}).get("adaptive_source_band"),
+        "adaptive_rationale": (item.get("parameters") or {}).get("adaptive_rationale"),
         "config_summary": item,
     }
 
 
+def balanced_recommendation_rationale(profiles: dict[str, Any]) -> str | None:
+    balanced = profiles.get("balanced_config")
+    if not balanced:
+        return None
+    if profiles.get("primary_recommended_profile") != "balanced_config":
+        return "balanced_config no fue recomendacion principal porque no cumplio candidatos moderados, possible_damage_count=0, clipping_count=0 y safe_for_review."
+    params = balanced.get("parameters") or {}
+    if params.get("species_profile"):
+        source = " Usa el preset especifico pristimantis_simoterus_rain_wind."
+    elif params.get("adaptive_source_band"):
+        band = params["adaptive_source_band"]
+        source = f" Banda motivadora: {band.get('low_hz')}-{band.get('high_hz')} Hz."
+    else:
+        source = ""
+    return "balanced_config se eligio porque combina candidatos moderados, possible_damage_count=0, clipping_count=0 y safe_for_review." + source
+
+
+def is_balanced_primary_candidate(item: dict[str, Any] | None) -> bool:
+    return bool(
+        item
+        and 1 <= profile_candidates(item) <= 30
+        and int(item.get("possible_damage_count") or 0) == 0
+        and int(item.get("clipping_count") or 0) == 0
+        and item.get("recommendation") == "safe_for_review"
+    )
+
+
+def named_sweep_profiles(summaries: list[dict[str, Any]]) -> dict[str, Any] | None:
+    by_name = {item.get("config"): item for item in summaries}
+    names = {"high_confidence_config", "balanced_config", "high_recall_config", "exploratory_config"}
+    if not any(name in by_name for name in names):
+        return None
+    primary = "balanced_config" if is_balanced_primary_candidate(by_name.get("balanced_config")) else None
+    return {
+        "high_confidence_config": profile_payload(by_name.get("high_confidence_config"), "high_confidence", "Alta confianza", "Alta confianza. Revisar previews antes de entrenamiento."),
+        "balanced_config": profile_payload(by_name.get("balanced_config"), "balanced", "Equilibrada recomendada", "Equilibrada recomendada. Revisar previews antes de entrenamiento."),
+        "high_recall_config": profile_payload(by_name.get("high_recall_config"), "high_recall", "Mayor cobertura", "Mayor cobertura con mayor riesgo de falsos positivos. Revisar manualmente."),
+        "exploratory_config": profile_payload(by_name.get("exploratory_config"), "exploratory", "Exploratoria", "Solo exploracion / no entrenamiento automatico."),
+        "primary_recommended_profile": primary,
+        "training_allowed": False,
+    }
+
+
 def build_final_recommendation_profiles(summaries: list[dict[str, Any]]) -> dict[str, Any]:
+    named_profiles = named_sweep_profiles(summaries)
+    if named_profiles:
+        return named_profiles
     clean = clean_review_candidates(summaries)
     if not clean:
         exploratory = next((item for item in summaries if item.get("recommendation") == "too_many_candidates"), None)

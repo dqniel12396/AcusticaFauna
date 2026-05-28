@@ -19,10 +19,10 @@ ML_TIMEOUT = httpx.Timeout(90.0, connect=2.0)
 def ml_service_error(exc: Exception) -> HTTPException:
     return HTTPException(
         status_code=503,
-        detail=(
-            "El servicio ML no esta activo. Inicialo desde acusticafauna-ML "
-            "para usar prediccion."
-        ),
+        detail={
+            "detail": "ml_service_unavailable",
+            "message": "El servicio ML/espectrograma no esta disponible.",
+        },
     )
 
 

@@ -2,16 +2,31 @@ import assert from "node:assert/strict";
 import {
   DEFAULT_FOLDER_BATCH_CONFIG,
   ZERO_CANDIDATE_VARIANTS,
+  advancedSweepPayloadForType,
+  applyAudioBatchPresetToForm,
+  buildFolderBatchBulkPayload,
+  buildUserPresetFromFolderBatchForm,
   buildFolderBatchFormFromCalibration,
   calibrationReportHasExploratoryWide,
   calibrationRowIsLowCandidateStrictProbe,
+  defaultAudioLabDatasetExportForm,
+  deleteUserPreset,
+  duplicateAudioBatchPreset,
+  folderBatchSelectionAfterFilteredSelect,
+  folderBatchSelectionAfterPageSelect,
+  folderBatchSelectionCountLabel,
   folderBatchJobConfig,
   folderBatchJobFinishedWithoutCandidates,
+  FOLDER_BATCH_BULK_ACTIONS,
   isRecommendedBroaderDetectionConfig,
   normalizeFolderBatchOutputsResponse,
+  paginateFolderBatchOutputs,
   RECOMMENDED_BROADER_DETECTION_CONFIG,
   recommendedCalibrationNextStep,
   selectZeroCandidateRecovery,
+  shouldSkipHeavyFolderBatchRefresh,
+  updateFolderBatchDraftField,
+  upsertUserPreset,
   zeroCandidateConfigKey,
 } from "./audioLabFolderBatchCalibration.js";
 
@@ -162,6 +177,35 @@ assert.equal(emptyOutputs.empty, true);
 assert.equal(emptyOutputs.count, 0);
 assert.equal(emptyOutputs.message.includes("No se generaron clips"), true);
 
+const pageSelection = folderBatchSelectionAfterPageSelect(new Set(["old"]), [{ id: "a" }, { id: "b" }]);
+assert.equal(pageSelection.has("old"), true);
+assert.equal(pageSelection.has("a"), true);
+assert.equal(pageSelection.has("b"), true);
+
+const filteredSelection = folderBatchSelectionAfterFilteredSelect([{ id: "a" }, { id: "b" }, { id: "" }]);
+assert.deepEqual([...filteredSelection].sort(), ["a", "b"]);
+assert.equal(folderBatchSelectionCountLabel(new Set(["a"]), 2, false), "1 seleccionados");
+assert.equal(folderBatchSelectionCountLabel(new Set(["a", "b"]), 2, true), "2 seleccionados filtrados");
+
+assert.equal(FOLDER_BATCH_BULK_ACTIONS.confirm.review_status, "confirmed");
+assert.equal(FOLDER_BATCH_BULK_ACTIONS.confirm.requiresStrongConfirmation, true);
+const bulkPayload = buildFolderBatchBulkPayload({
+  actionKey: "confirm",
+  jobId: "job-1",
+  selectedOutputs: [{ id: "out-1" }, { id: "out-2" }],
+  speciesLabel: "Pristimantis_simoterus",
+  confirmationText: "CONFIRMAR",
+});
+assert.equal(bulkPayload.job_id, "job-1");
+assert.deepEqual(bulkPayload.output_ids, ["out-1", "out-2"]);
+assert.equal(bulkPayload.review_status, "confirmed");
+assert.equal(bulkPayload.confirmation_text, "CONFIRMAR");
+
+const exportForm = defaultAudioLabDatasetExportForm("Pristimantis_simoterus");
+assert.equal(exportForm.species_label, "Pristimantis_simoterus");
+assert.equal(exportForm.copy_clips, false);
+assert.equal(exportForm.split_by_source_audio_path, true);
+
 assert.equal(selectZeroCandidateRecovery(zeroCandidateJob).actionLabel, "Probar variante más sensible");
 
 const sensitiveNoiseJob = {
@@ -292,5 +336,91 @@ const broaderSafeReport = {
 };
 assert.equal(isRecommendedBroaderDetectionConfig(broaderSafeReport.configs[0]), true);
 assert.equal(recommendedCalibrationNextStep(broaderSafeReport), "review_previews");
+
+const adaptiveSweepPayload = advancedSweepPayloadForType({
+  folder_path: "F:\\PROYECTO de cosa de sonido\\wetransfer_prisim-40-wav_2026-05-18_2228",
+  label: "Otra_rana",
+  sample_size: 30,
+}, "adaptive_general");
+assert.equal(adaptiveSweepPayload.mode, "adaptive_advanced_sweep");
+assert.equal(adaptiveSweepPayload.sample_size, 30);
+assert.equal(adaptiveSweepPayload.species_profile, undefined);
+
+const pristimantisSweepPayload = advancedSweepPayloadForType({
+  folder_path: adaptiveSweepPayload.folder_path,
+  label: "Pristimantis_simoterus",
+  sample_size: 50,
+}, "pristimantis_simoterus_rain_wind");
+assert.equal(pristimantisSweepPayload.mode, "advanced_sweep");
+assert.equal(pristimantisSweepPayload.species_profile, "pristimantis_simoterus_rain_wind");
+assert.equal(pristimantisSweepPayload.sample_size, 50);
+
+const userPreset = buildUserPresetFromFolderBatchForm(currentForm, {
+  id: "preset_user_1",
+  name: "Boana lluvia noche",
+  species_label: "Boana_boans",
+  favorite: true,
+});
+assert.equal(userPreset.source, "user");
+assert.equal(userPreset.name, "Boana lluvia noche");
+assert.equal(userPreset.favorite, true);
+
+const savedPresets = upsertUserPreset([], userPreset);
+assert.equal(savedPresets.length, 1);
+const appliedPresetForm = applyAudioBatchPresetToForm(currentForm, {
+  ...userPreset,
+  frequency_min_hz: 2200,
+  frequency_max_hz: 3200,
+  threshold_dbfs: -50,
+  min_band_energy_ratio: 0.25,
+  min_band_ratio: 0.25,
+  noise_reduce: false,
+  normalize: false,
+});
+assert.equal(appliedPresetForm.preset, "preset_user_1");
+assert.equal(appliedPresetForm.frequency_min_hz, 2200);
+assert.equal(appliedPresetForm.min_band_ratio, 0.25);
+assert.equal(appliedPresetForm.noise_reduce, false);
+
+const editedPreset = buildUserPresetFromFolderBatchForm(appliedPresetForm, {
+  id: "preset_user_1",
+  name: "Boana lluvia editado",
+  species_label: "Boana_boans",
+});
+const editedPresets = upsertUserPreset(savedPresets, editedPreset);
+assert.equal(editedPresets.length, 1);
+assert.equal(editedPresets[0].name, "Boana lluvia editado");
+
+const duplicatedPreset = duplicateAudioBatchPreset({ ...editedPreset, source: "system" }, { id: "preset_copy_1", name: "Copia editable" });
+assert.equal(duplicatedPreset.source, "user");
+assert.equal(duplicatedPreset.id, "preset_copy_1");
+
+const afterDeleteUser = deleteUserPreset(editedPresets, editedPresets[0]);
+assert.equal(afterDeleteUser.length, 0);
+const afterDeleteSystem = deleteUserPreset([{ ...editedPreset, source: "system" }], { ...editedPreset, source: "system" });
+assert.equal(afterDeleteSystem.length, 1);
+
+let refreshCalls = 0;
+const draftJobName = updateFolderBatchDraftField(currentForm, "job_name", "trabajoprueba52");
+assert.equal(draftJobName.job_name, "trabajoprueba52");
+assert.equal(refreshCalls, 0);
+
+const draftRatio = updateFolderBatchDraftField(currentForm, "min_band_ratio", 0.25);
+assert.equal(draftRatio.min_band_ratio, 0.25);
+assert.equal(draftRatio.min_band_energy_ratio, 0.25);
+
+const skipHeavy = shouldSkipHeavyFolderBatchRefresh({ batchEditing: true, quiet: true, status: "running" });
+assert.equal(skipHeavy, true);
+const allowProgressRefresh = shouldSkipHeavyFolderBatchRefresh({ batchEditing: true, quiet: true, status: "completed" });
+assert.equal(allowProgressRefresh, false);
+
+const fiftyOutputs = Array.from({ length: 50 }, (_, index) => ({ id: `out_${index + 1}` }));
+const firstPage = paginateFolderBatchOutputs(fiftyOutputs, 1, 25);
+assert.equal(firstPage.items.length, 25);
+assert.equal(firstPage.totalPages, 2);
+assert.equal(firstPage.items[0].id, "out_1");
+const secondPage = paginateFolderBatchOutputs(fiftyOutputs, 2, 25);
+assert.equal(secondPage.items[0].id, "out_26");
+assert.equal(paginateFolderBatchOutputs([], 1, 25).items.length, 0);
 
 console.log("audioLabFolderBatchCalibration.test.js passed");

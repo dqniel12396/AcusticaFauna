@@ -533,6 +533,61 @@ def test_final_recommendation_profiles_pick_balanced_as_primary():
     assert choose_recommended_config(summaries)["config"] == "cerrada_2200_3200_m50_r025_no_noise"
 
 
+def test_adaptive_sweep_configs_follow_2000_3000_band():
+    from app.services.audio_calibration_service import build_adaptive_sweep_configs
+
+    profile_report = {
+        "suggested_parameters": {
+            "top_contrast_bands": [
+                {"band_hz": "2000-3000", "mean_contrast_db": 8.0},
+                {"band_hz": "4000-5000", "mean_contrast_db": 2.0},
+            ]
+        },
+        "summary": {"rms_dbfs": {"p90": -44}, "noise_floor_dbfs": {"median": -58}},
+        "files": [{"sample_rate": 48000, "bands": [{"band_hz": "0-1000", "mean_db": -68}, {"band_hz": "2000-3000", "mean_db": -42}]}],
+    }
+
+    configs = {item["name"]: item for item in build_adaptive_sweep_configs(profile_report, label="Otra_rana")}
+
+    assert configs["high_confidence_config"]["frequency_min_hz"] == 2300
+    assert configs["high_confidence_config"]["frequency_max_hz"] == 3300
+    assert configs["balanced_config"]["frequency_min_hz"] == 2200
+    assert configs["balanced_config"]["frequency_max_hz"] == 3200
+    assert configs["high_recall_config"]["frequency_min_hz"] == 2000
+    assert configs["high_recall_config"]["frequency_max_hz"] == 3500
+    assert configs["exploratory_config"]["training_allowed"] is False
+
+
+def test_adaptive_sweep_configs_follow_4000_7000_band():
+    from app.services.audio_calibration_service import build_adaptive_sweep_configs
+
+    profile_report = {
+        "suggested_parameters": {"top_contrast_bands": [{"band_hz": "4000-7000", "mean_contrast_db": 11.0}]},
+        "summary": {"rms_dbfs": {"p90": -44}, "noise_floor_dbfs": {"median": -58}},
+        "files": [{"sample_rate": 48000, "bands": [{"band_hz": "0-1000", "mean_db": -55}, {"band_hz": "4000-7000", "mean_db": -40}]}],
+    }
+
+    configs = {item["name"]: item for item in build_adaptive_sweep_configs(profile_report, label="Ave_x")}
+
+    assert configs["balanced_config"]["frequency_min_hz"] == 4000
+    assert configs["balanced_config"]["frequency_max_hz"] == 7000
+    assert configs["high_confidence_config"]["frequency_min_hz"] >= 4400
+    assert configs["high_recall_config"]["frequency_max_hz"] >= 7300
+    assert configs["balanced_config"]["frequency_min_hz"] != 2200
+
+
+def test_pristimantis_sweep_preset_keeps_balanced_exact_range():
+    from app.services.audio_calibration_service import pristimantis_rain_wind_sweep_configs
+
+    configs = {item["name"]: item for item in pristimantis_rain_wind_sweep_configs()}
+
+    assert configs["balanced_config"]["frequency_min_hz"] == 2200
+    assert configs["balanced_config"]["frequency_max_hz"] == 3200
+    assert configs["balanced_config"]["threshold_dbfs"] == -50
+    assert configs["balanced_config"]["min_band_energy_ratio"] == 0.25
+    assert configs["exploratory_config"]["training_allowed"] is False
+
+
 def test_closed_config_too_many_suggests_selective_not_intermediate():
     from app.services.audio_calibration_service import build_final_recommendation
 
@@ -694,9 +749,46 @@ def test_calibration_api_accepts_authorized_folder(client, tmp_path):
     assert tested_payload["folder_path_resolved"] == str(folder.resolve())
     assert tested_payload["legacy_report"] is False
 
+    advanced = client.post(
+        "/api/audio-lab/calibration/test-configs",
+        json={
+            "folder_path": str(folder),
+            "label": "Pristimantis_simoterus",
+            "sample_size": 3,
+            "mode": "advanced_sweep",
+            "species_profile": "pristimantis_simoterus_rain_wind",
+            "noise_type": "mezcla",
+            "job_allowed_roots": [str(folder)],
+        },
+    )
+    assert advanced.status_code == 200
+    profiles = advanced.json()["final_recommendation_profiles"]
+    assert profiles["balanced_config"]["parameters"]["frequency_min_hz"] == 2200
+    assert profiles["balanced_config"]["parameters"]["frequency_max_hz"] == 3200
+    assert profiles["training_allowed"] is False
+
     reports = client.get("/api/audio-lab/calibration/reports")
     assert reports.status_code == 200
     assert any(item["folder_path"] == str(folder.resolve()) for item in reports.json()["items"])
+
+
+def test_spectrogram_endpoint_returns_structured_503_when_ml_down(client, monkeypatch):
+    import httpx
+
+    async def raise_ml_down(self, *args, **kwargs):
+        raise httpx.RequestError("ML down")
+
+    monkeypatch.setattr(httpx.AsyncClient, "request", raise_ml_down)
+
+    response = client.post(
+        "/api/ml/spectrogram/audio-path",
+        json={"audio_path": "missing.wav", "start_seconds": 0, "end_seconds": 1},
+    )
+
+    assert response.status_code == 503
+    payload = response.json()
+    assert payload["detail"]["detail"] == "ml_service_unavailable"
+    assert "servicio ML" in payload["detail"]["message"]
 
 
 def test_calibration_report_legacy_metadata(client, test_settings):

@@ -1,4 +1,5 @@
 import base64
+import csv
 import json
 import math
 import struct
@@ -117,6 +118,186 @@ def test_audio_lab_excluded_human_voice_defaults(client):
     assert item["label_type"] == "human_voice"
     assert item["recommended_training_use"] == "exclude_species_training"
     assert item["hard_negative_candidate"] == 0
+
+
+def test_audio_lab_annotation_dataset_review_fields(client):
+    response = client.post(
+        "/api/audio-lab/annotations",
+        json={
+            "audio_path": "F:/audios/clip.wav",
+            "audio_name": "clip.wav",
+            "start_seconds": 1,
+            "end_seconds": 4,
+            "score": 0.8,
+            "user_feedback": "confirmed_positive",
+            "review_status": "confirmed",
+            "species_label": "Pristimantis_simoterus",
+            "reviewer": "pytest",
+            "band_ratio": 0.42,
+            "rms_dbfs": -31.5,
+            "preset_name": "normal",
+            "config_used": "{\"threshold_dbfs\": -45}",
+        },
+    )
+    assert response.status_code == 200
+    item = response.json()
+    assert item["review_status"] == "confirmed"
+    assert item["species_label"] == "Pristimantis_simoterus"
+    assert item["reviewer"] == "pytest"
+    assert item["band_ratio"] == 0.42
+
+    listed = client.get("/api/audio-lab/annotations", params={"job_id": "missing"})
+    assert listed.status_code == 200
+    assert listed.json()["total"] == 0
+
+
+def test_audio_lab_folder_batch_bulk_annotation_and_undo(client, tmp_path):
+    folder = tmp_path / "bulk_folder_batch"
+    write_tone_wav(folder / "candidate.wav", 2400)
+    job = client.post(
+        "/api/audio-lab/folder-batch/jobs",
+        json={
+            "job_name": "pytest_bulk_folder_batch",
+            "folder_path": str(folder),
+            "recursive": True,
+            "target_label": "Pristimantis_simoterus",
+            "mode": "species_folder_cleanup",
+            "preset": "normal",
+            "frequency_min_hz": 2000,
+            "frequency_max_hz": 3000,
+            "threshold_dbfs": -45,
+            "min_activity_seconds": 0.2,
+            "min_silence_seconds": 0.2,
+            "padding_seconds": 0.05,
+            "clip_duration_seconds": 1.0,
+            "max_segment_seconds": 1.0,
+            "min_band_ratio": 0.45,
+            "bandpass": True,
+            "noise_reduce": False,
+            "normalize": True,
+            "discard_empty": True,
+            "detect_frog": False,
+            "detect_contaminants_heuristic": True,
+            "create_clips": True,
+            "create_manifest": True,
+            "resource_profile": "eco",
+            "extensions": [".wav"],
+        },
+    )
+    assert job.status_code == 200
+    job_id = job.json()["job_id"]
+    outputs = client.get(f"/api/audio-lab/folder-batch/jobs/{job_id}/outputs")
+    assert outputs.status_code == 200
+    output_ids = [item["id"] for item in outputs.json()["items"]]
+    assert output_ids
+
+    denied = client.post(
+        "/api/audio-lab/annotations/bulk",
+        json={
+            "job_id": job_id,
+            "output_ids": output_ids,
+            "review_status": "confirmed",
+            "species_label": "Pristimantis_simoterus",
+            "confirmation_text": "NO",
+        },
+    )
+    assert denied.status_code == 400
+
+    created = client.post(
+        "/api/audio-lab/annotations/bulk",
+        json={
+            "job_id": job_id,
+            "output_ids": output_ids,
+            "review_status": "confirmed",
+            "species_label": "Pristimantis_simoterus",
+            "confirmation_text": "CONFIRMAR",
+        },
+    )
+    assert created.status_code == 200
+    payload = created.json()
+    assert payload["count"] == len(output_ids)
+    assert payload["items"][0]["review_status"] == "confirmed"
+    assert payload["items"][0]["batch_job_id"] == job_id
+    assert payload["message"].endswith("No se entreno ningun modelo.")
+
+    undone = client.post("/api/audio-lab/annotations/undo-last-bulk", params={"job_id": job_id})
+    assert undone.status_code == 200
+    assert undone.json()["undone_count"] == len(output_ids)
+
+
+def test_audio_lab_export_versioned_dataset_manifest_split_and_unsure(client, test_settings):
+    source_a = write_tone_wav(test_settings.STORAGE_DIR / "sources" / "source_a.wav", 1000)
+    source_b = write_tone_wav(test_settings.STORAGE_DIR / "sources" / "source_b.wav", 1200)
+    clip_pos_1 = write_tone_wav(test_settings.STORAGE_DIR / "clips" / "pos1.wav", 2400)
+    clip_pos_2 = write_tone_wav(test_settings.STORAGE_DIR / "clips" / "pos2.wav", 2400)
+    clip_neg = write_tone_wav(test_settings.STORAGE_DIR / "clips" / "neg.wav", 500)
+    clip_hard = write_tone_wav(test_settings.STORAGE_DIR / "clips" / "hard.wav", 700)
+    clip_unsure = write_tone_wav(test_settings.STORAGE_DIR / "clips" / "unsure.wav", 900)
+
+    base = {
+        "start_seconds": 0,
+        "end_seconds": 0.15,
+        "model_id": "pytest_model",
+        "predicted_label": "Pristimantis_simoterus",
+        "score": 0.9,
+        "score_used": 0.9,
+        "species_label": "Pristimantis_simoterus",
+        "reviewer": "pytest",
+    }
+    rows = [
+        (clip_pos_1, source_a, "confirmed_positive", "confirmed"),
+        (clip_pos_2, source_a, "confirmed_positive", "confirmed"),
+        (clip_neg, source_b, "excluded_from_training", "excluded"),
+        (clip_hard, source_b, "hard_negative", "hard_negative"),
+        (clip_unsure, source_b, "uncertain", "unsure"),
+    ]
+    for clip, source, feedback, review_status in rows:
+        response = client.post(
+            "/api/audio-lab/annotations",
+            json={
+                **base,
+                "audio_path": str(clip),
+                "processed_audio_path": str(clip),
+                "original_source_audio_path": str(source),
+                "audio_name": clip.name,
+                "user_feedback": feedback,
+                "feedback_type": feedback,
+                "review_status": review_status,
+            },
+        )
+        assert response.status_code == 200
+
+    exported = client.post(
+        "/api/audio-lab/curated-datasets",
+        json={
+            "dataset_name": "pytest_dataset",
+            "species_label": "Pristimantis_simoterus",
+            "version": "v0.1",
+            "copy_clips": False,
+            "exclude_unsure": True,
+        },
+    )
+    assert exported.status_code == 200
+    result = exported.json()
+    assert result["message"].endswith("No se entreno ningun modelo.")
+    assert result["summary"]["positives"] == 2
+    assert result["summary"]["negatives"] == 1
+    assert result["summary"]["hard_negatives"] == 1
+    assert result["summary"]["unsure_excluded"] == 1
+
+    metadata_path = Path(result["metadata_path"])
+    rows = list(csv.DictReader(metadata_path.open(encoding="utf-8")))
+    assert rows
+    by_source: dict[str, set[str]] = {}
+    for row in rows:
+        if row["split"] == "excluded":
+            continue
+        by_source.setdefault(row["source_audio_path"], set()).add(row["split"])
+    assert all(len(splits) == 1 for splits in by_source.values())
+    assert all(row["split"] != "train" for row in rows if row["review_status"] == "unsure")
+    assert all(not Path(row["processed_clip_path"]).is_relative_to(Path(result["dataset_dir"])) for row in rows if row["processed_clip_path"])
+    assert source_a.exists()
+    assert source_b.exists()
 
 
 def test_training_dataset_excludes_audio_lab_excluded_from_training(client, imported_curated_dataset):

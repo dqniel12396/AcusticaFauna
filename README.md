@@ -357,6 +357,8 @@ Usa **Pristimantis simoterus lluvia/viento** solo para ese caso. Estos rangos so
 
 El boton **Aplicar al procesamiento masivo** copia ruta, label y parametros exactos al formulario masivo con preset personalizado. No inicia procesamiento automaticamente: escanea la carpeta y ejecuta un nuevo job despues de revisar previews. Los audios originales no se modifican.
 
+Si aparece `Extension context invalidated`, viene de una extension del navegador. Prueba modo incognito o desactiva extensiones; no es un error de AcusticaFauna.
+
 ## Barrido CLI de calibracion
 
 Los scripts CLI se mantienen para depuracion avanzada. Para uso normal, prefiere el barrido avanzado disponible en la web:

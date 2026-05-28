@@ -1,18 +1,36 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Badge from "../components/shared/Badge";
 import SectionCard from "../components/shared/SectionCard";
+import AudioLabFolderBatchForm from "./AudioLabFolderBatchForm";
 import {
+  ADVANCED_SWEEP_APPLIED_MESSAGE,
   FOLDER_BATCH_APPLIED_MESSAGE,
+  USER_AUDIO_BATCH_PRESETS_STORAGE_KEY,
   ZERO_CANDIDATE_VARIANTS,
+  advancedSweepPayloadForType,
+  applyAudioBatchPresetToForm,
+  buildFolderBatchBulkPayload,
   buildFolderBatchFormFromCalibration,
+  buildUserPresetFromFolderBatchForm,
   calibrationFolderBatchPath,
   calibrationRowIsLowCandidateStrictProbe,
+  defaultAudioLabDatasetExportForm,
+  deleteUserPreset,
+  duplicateAudioBatchPreset,
+  folderBatchSelectionAfterFilteredSelect,
+  folderBatchSelectionAfterPageSelect,
+  folderBatchSelectionCountLabel,
   folderBatchJobConfig,
   folderBatchJobFinishedWithoutCandidates,
+  FOLDER_BATCH_BULK_ACTIONS,
   isRecommendedBroaderDetectionConfig,
   normalizeFolderBatchOutputsResponse,
+  paginateFolderBatchOutputs,
   RECOMMENDED_BROADER_DETECTION_CONFIG,
   selectZeroCandidateRecovery,
+  sanitizeUserPreset,
+  shouldSkipHeavyFolderBatchRefresh,
+  upsertUserPreset,
   ZERO_CANDIDATE_RECOVERY_MESSAGE,
 } from "./audioLabFolderBatchCalibration";
 import {
@@ -20,8 +38,10 @@ import {
   cancelAudioLabFolderBatchJob,
   cleanupAudioLabTestDerivatives,
   createAudioLabAnnotation,
+  createAudioLabAnnotationsBulk,
   createAudioLabActivityClips,
   createAudioLabBatchProcessingJob,
+  createAudioLabCuratedDataset,
   createAudioLabClip,
   createAudioLabFolderBatchJob,
   createAudioLabQualityReport,
@@ -62,6 +82,7 @@ import {
   scanAudioLabFolderBatch,
   testAudioLabCalibrationConfigs,
   updateAudioLabAnnotation,
+  undoLastAudioLabBulkAnnotation,
   uploadAudioLabBatch,
 } from "../services/api";
 
@@ -216,9 +237,10 @@ const FOLDER_BATCH_PRESET_OPTIONS = [
 const CALIBRATION_DEFAULT_FORM = {
   folder_path: "",
   label: "Pristimantis_simoterus",
-  sample_size: 20,
+  sample_size: 30,
   noise_type: "mezcla",
   calibration_mode: "detect",
+  sweep_type: "adaptive_general",
 };
 const CALIBRATION_LAST_PATH_STORAGE_KEYS = [
   "acusticafauna_audio_lab_last_calibration_folder_path",
@@ -1171,6 +1193,8 @@ export default function AudioLabPage() {
   const [analysisHistory, setAnalysisHistory] = useState([]);
   const [spectrogramUrl, setSpectrogramUrl] = useState("");
   const [spectrogramLoading, setSpectrogramLoading] = useState(false);
+  const [spectrogramError, setSpectrogramError] = useState("");
+  const [lastSpectrogramTarget, setLastSpectrogramTarget] = useState(null);
   const [analyzing, setAnalyzing] = useState(false);
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
@@ -1262,6 +1286,17 @@ export default function AudioLabPage() {
   const [folderBatchOutputFilter, setFolderBatchOutputFilter] = useState("candidates");
   const [folderBatchMinScore, setFolderBatchMinScore] = useState("");
   const [folderBatchMinRatio, setFolderBatchMinRatio] = useState("");
+  const [folderBatchOutputPage, setFolderBatchOutputPage] = useState(1);
+  const [folderBatchOutputPageSize, setFolderBatchOutputPageSize] = useState(50);
+  const [folderBatchSelectedOutputIds, setFolderBatchSelectedOutputIds] = useState(new Set());
+  const [folderBatchBulkDraft, setFolderBatchBulkDraft] = useState(null);
+  const [folderBatchBulkSaving, setFolderBatchBulkSaving] = useState(false);
+  const [datasetExportDraft, setDatasetExportDraft] = useState(null);
+  const [datasetExportSaving, setDatasetExportSaving] = useState(false);
+  const [datasetExportSummary, setDatasetExportSummary] = useState(null);
+  const [userFolderBatchPresets, setUserFolderBatchPresets] = useState([]);
+  const [presetSpeciesFilter, setPresetSpeciesFilter] = useState("");
+  const [presetFavoritesOnly, setPresetFavoritesOnly] = useState(false);
   const [qualityReport, setQualityReport] = useState(null);
   const [qualityReportLoading, setQualityReportLoading] = useState("");
   const [batchOutputDetails, setBatchOutputDetails] = useState(null);
@@ -1290,6 +1325,23 @@ export default function AudioLabPage() {
       }
     }
   }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    try {
+      const parsed = JSON.parse(window.localStorage.getItem(USER_AUDIO_BATCH_PRESETS_STORAGE_KEY) || "[]");
+      setUserFolderBatchPresets(Array.isArray(parsed) ? parsed.map(sanitizeUserPreset) : []);
+    } catch {
+      setUserFolderBatchPresets([]);
+    }
+  }, []);
+
+  function persistUserFolderBatchPresets(nextPresets) {
+    setUserFolderBatchPresets(nextPresets);
+    if (typeof window !== "undefined") {
+      window.localStorage.setItem(USER_AUDIO_BATCH_PRESETS_STORAGE_KEY, JSON.stringify(nextPresets));
+    }
+  }
 
   const labelOptions = useMemo(() => labels.map((item) => item.label).filter(Boolean), [labels]);
   const selectableModels = useMemo(() => {
@@ -1435,6 +1487,10 @@ export default function AudioLabPage() {
   useEffect(() => {
     previousFolderBatchPathRef.current = folderBatchForm.folder_path.trim();
   }, [folderBatchForm.folder_path]);
+
+  useEffect(() => {
+    setFolderBatchOutputPage(1);
+  }, [activeFolderBatchJob?.id, folderBatchMinRatio, folderBatchMinScore, folderBatchOutputFilter, folderBatchSearch]);
 
   async function loadAudioChoices() {
     try {
@@ -1713,8 +1769,11 @@ export default function AudioLabPage() {
       setError("Primero analiza el audio subido para crear una copia temporal utilizable por el servicio ML.");
       return;
     }
+    const spectrogramTarget = targetSegment || null;
     try {
       setSpectrogramLoading(true);
+      setSpectrogramError("");
+      setLastSpectrogramTarget(spectrogramTarget);
       setError("");
       const blob = await fetchMlSpectrogramBlob({
         audio_path: audioPath,
@@ -1726,7 +1785,12 @@ export default function AudioLabPage() {
       setSpectrogramUrl(URL.createObjectURL(blob));
       setMessage("Espectrograma generado.");
     } catch (err) {
-      setError(err.message || "No fue posible generar el espectrograma.");
+      const message = err.message || "";
+      const friendly = message.includes("servicio de espectrograma") || message.includes("ML")
+        ? message
+        : "El servicio de espectrograma no estÃ¡ disponible. Inicia acusticafauna-ml-api o revisa ML_API_BASE_URL.";
+      setSpectrogramError(friendly);
+      setMessage(friendly);
     } finally {
       setSpectrogramLoading(false);
     }
@@ -2678,10 +2742,11 @@ export default function AudioLabPage() {
 
   function buildCalibrationPayload(sampleSize = calibrationForm.sample_size) {
     const folderPath = calibrationForm.folder_path.trim();
+    const normalizedSampleSize = Math.max(1, Math.min(200, Number(sampleSize) || 30));
     return {
       folder_path: folderPath,
       label: calibrationForm.label.trim() || "Pristimantis_simoterus",
-      sample_size: Number(sampleSize),
+      sample_size: normalizedSampleSize,
       noise_type: calibrationForm.noise_type,
       calibration_mode: calibrationForm.calibration_mode,
       detection_only: calibrationForm.calibration_mode === "detect",
@@ -2733,6 +2798,41 @@ export default function AudioLabPage() {
       setMessage(`Prueba de configuraciones lista. Recomendada: ${result.recommended_config || "revisar tabla"}.`);
     } catch (err) {
       setError(err.detail?.message || err.message || "No fue posible probar configuraciones.");
+    } finally {
+      setCalibrationLoading("");
+    }
+  }
+
+  async function runAdvancedSweepCalibrationTest() {
+    if (!calibrationForm.folder_path.trim()) {
+      setError("Escribe la ruta local de la carpeta antes de crear el barrido avanzado.");
+      return;
+    }
+    if (!calibrationForm.label.trim()) {
+      setError("Escribe la especie/label antes de crear el barrido avanzado.");
+      return;
+    }
+    try {
+      setCalibrationLoading("advanced_sweep");
+      setError("");
+      const payload = advancedSweepPayloadForType(
+        buildCalibrationPayload(Number(calibrationForm.sample_size) || 30),
+        calibrationForm.sweep_type || "adaptive_general"
+      );
+      setMessage(payload.mode === "adaptive_advanced_sweep" ? "Analizando perfil acustico y comparando perfiles recomendados..." : "Comparando perfiles recomendados...");
+      const result = await testAudioLabCalibrationConfigs(payload);
+      setCalibrationTest(result);
+      setPreviewReviewStarted(false);
+      setCalibrationReport(result);
+      setCalibrationReportHistorical(false);
+      setCalibrationRouteMeta({ source: "report", reportName: calibrationReportTitle(result), reportDate: result.created_at });
+      if (!result.final_recommendation_profiles) {
+        setError("El backend no devolvi\u00f3 final_recommendation_profiles.");
+      } else {
+        setMessage("Barrido avanzado listo. Revisa tarjetas y previews antes de entrenamiento.");
+      }
+    } catch (err) {
+      setError(err.detail?.message || err.message || "No fue posible crear el barrido avanzado.");
     } finally {
       setCalibrationLoading("");
     }
@@ -2797,8 +2897,9 @@ export default function AudioLabPage() {
     }
   }
 
-  function openCalibrationPreviewsForReview() {
-    const activeConfig = calibrationTest?.recommended_config || recommendedConfigName;
+  function openCalibrationPreviewsForReview(configName = "") {
+    if (typeof configName !== "string") configName = "";
+    const activeConfig = configName || calibrationTest?.recommended_config || recommendedConfigName;
     const preview = (calibrationTest?.previews || []).find((item) => item.config === activeConfig) || calibrationTest?.previews?.[0];
     const path = preview?.processed_preview_path || preview?.raw_preview_path;
     if (!path && folderBatchOutputs.length) {
@@ -2950,7 +3051,7 @@ export default function AudioLabPage() {
     setFolderBatchScan(null);
     setFolderBatchScanState({
       status: "pending",
-      message: FOLDER_BATCH_APPLIED_MESSAGE,
+      message: options.messageOverride || FOLDER_BATCH_APPLIED_MESSAGE,
     });
     setActiveFolderBatchJob((current) => current && !isFolderBatchJobForPath(current, targetFolderPath) ? null : current);
     setFolderBatchOutputs([]);
@@ -3062,6 +3163,27 @@ export default function AudioLabPage() {
     applyCalibrationToFolderBatch(params, { copyFolderPath: false, copyLabel: false });
   }
 
+  function applyCalibrationProfileToFolderBatch(profile) {
+    const params = profile?.parameters;
+    if (!params) {
+      setError("Esta tarjeta no tiene parametros para aplicar.");
+      return;
+    }
+    if (profile.role === "exploratory" || profile.config === "exploratory_config") {
+      const confirmed = window.confirm("Esta configuracion puede generar falsos positivos. Usala solo para explorar, no para entrenamiento automatico.");
+      if (!confirmed) return;
+    }
+    applyCalibrationToFolderBatch(params, {
+      copyFolderPath: true,
+      copyLabel: true,
+      exploratory: profile.role === "exploratory" || profile.config === "exploratory_config",
+      skipExploratoryConfirm: true,
+      configName: profile.config || params.name,
+      calibration: currentCalibrationSource(),
+      messageOverride: ADVANCED_SWEEP_APPLIED_MESSAGE,
+    });
+  }
+
   function applyZeroCandidateVariant(variant) {
     if (!activeFolderBatchJob?.id) {
       setError("Selecciona primero el job que termino sin candidatos.");
@@ -3164,6 +3286,48 @@ export default function AudioLabPage() {
     }, 1500);
   }
 
+  function pauseFolderBatchHeavyRefresh() {
+    if (folderBatchEditResumeTimerRef.current) window.clearTimeout(folderBatchEditResumeTimerRef.current);
+    folderBatchEditResumeTimerRef.current = null;
+    setFolderBatchEditing(true);
+  }
+
+  function resumeFolderBatchHeavyRefreshSoon() {
+    if (folderBatchEditResumeTimerRef.current) window.clearTimeout(folderBatchEditResumeTimerRef.current);
+    folderBatchEditResumeTimerRef.current = window.setTimeout(() => {
+      setFolderBatchEditing(false);
+      folderBatchEditResumeTimerRef.current = null;
+    }, 1500);
+  }
+
+  function commitFolderBatchDraft(nextDraft, reason = "blur") {
+    if (!nextDraft) return;
+    setFolderBatchForm((current) => {
+      const pathChanged = normalizeFolderPathForCompare(String(nextDraft.folder_path || "").trim()) !== normalizeFolderPathForCompare(current.folder_path.trim());
+      const recursiveChanged = Boolean(nextDraft.recursive) !== Boolean(current.recursive);
+      if (pathChanged || recursiveChanged) {
+        setFolderBatchScan(null);
+        setFolderBatchScanState({
+          status: "pending",
+          message: pathChanged ? "Ruta cambiada. Escanea esta carpeta para crear un nuevo job." : "Cambiaron la carpeta o el modo de busqueda. Escanea la carpeta actual antes de iniciar.",
+        });
+      }
+      if (pathChanged) {
+        setActiveFolderBatchJob((job) => job && !isFolderBatchJobForPath(job, nextDraft.folder_path) ? null : job);
+        setFolderBatchOutputs([]);
+        setFolderBatchSummary(null);
+        setFolderBatchOutputsError("");
+        setFolderBatchSummaryError("");
+        setFolderBatchLogs("");
+        setSelectedAudio((selected) => selected?.kind === "folder_batch_output" ? null : selected);
+      }
+      return { ...current, ...nextDraft };
+    });
+    if (import.meta.env.DEV && window.__ACUSTICAFAUNA_DEBUG_RENDERS__) {
+      console.debug("[AudioLabPage] committed folder batch draft", reason);
+    }
+  }
+
   function updateFolderBatchField(key, value) {
     markFolderBatchEditing();
     if (key === "folder_path") {
@@ -3193,27 +3357,133 @@ export default function AudioLabPage() {
     }
   }
 
-  function applyFolderBatchPreset(preset) {
-    const values = FOLDER_BATCH_PRESETS[preset] || {};
-    setFolderBatchForm((current) => ({
-      ...current,
-      preset,
-      ...values,
-    }));
+  function applyFolderBatchPreset(preset, nextDraft = null) {
+    const presetItem = typeof preset === "string" ? folderBatchPresetItems.find((item) => item.id === preset) : preset;
+    if (!presetItem) return;
+    setFolderBatchForm((current) => nextDraft || (
+      presetItem.source === "user"
+        ? applyAudioBatchPresetToForm(current, presetItem)
+        : { ...current, preset: presetItem.id, ...(FOLDER_BATCH_PRESETS[presetItem.id] || presetItem) }
+    ));
+    setFolderBatchScan(null);
+    setFolderBatchScanState({ status: "pending", message: "Preset aplicado. Escanea la carpeta para iniciar un nuevo job." });
+    setActiveFolderBatchJob(null);
+    setFolderBatchOutputs([]);
+    setFolderBatchSummary(null);
+    setFolderBatchOutputsError("");
+    setFolderBatchSummaryError("");
+    setFolderBatchLogs("");
+    setSelectedAudio((current) => current?.kind === "folder_batch_output" ? null : current);
+    setMessage("Preset aplicado. Escanea la carpeta para iniciar un nuevo job.");
   }
 
-  function buildFolderBatchScanPayload() {
+  function currentFolderBatchPresetItem() {
+    return folderBatchPresetItems.find((item) => item.id === folderBatchForm.preset) || null;
+  }
+
+  function saveCurrentFolderBatchPreset(sourceForm = folderBatchForm) {
+    const name = window.prompt("Nombre del preset", `${sourceForm.target_label || "audio"} preset`);
+    if (!name) return;
+    const species = window.prompt("Especie opcional", sourceForm.target_label || "") || "";
+    const preset = buildUserPresetFromFolderBatchForm(sourceForm, { name, species_label: species });
+    persistUserFolderBatchPresets(upsertUserPreset(userFolderBatchPresets, preset));
+    setFolderBatchForm((current) => ({ ...current, preset: preset.id }));
+    setMessage("Preset de usuario guardado.");
+  }
+
+  function editSelectedFolderBatchPreset(sourceForm = folderBatchForm) {
+    const preset = currentFolderBatchPresetItem();
+    if (!preset || preset.source === "system") {
+      setError("Los presets de sistema no se pueden editar. Duplica el preset para crear una copia editable.");
+      return;
+    }
+    const name = window.prompt("Nombre del preset", preset.name);
+    if (!name) return;
+    const species = window.prompt("Especie opcional", preset.species_label || sourceForm.target_label || "") || "";
+    const updated = buildUserPresetFromFolderBatchForm(sourceForm, {
+      id: preset.id,
+      name,
+      species_label: species,
+      description: preset.description,
+      favorite: preset.favorite,
+    });
+    persistUserFolderBatchPresets(upsertUserPreset(userFolderBatchPresets, updated));
+    setMessage("Preset de usuario actualizado.");
+  }
+
+  function deleteSelectedFolderBatchPreset() {
+    const preset = currentFolderBatchPresetItem();
+    if (!preset || preset.source === "system") {
+      setError("Los presets de sistema no se pueden borrar.");
+      return;
+    }
+    if (!window.confirm(`Eliminar preset "${preset.name}"?`)) return;
+    persistUserFolderBatchPresets(deleteUserPreset(userFolderBatchPresets, preset));
+    setFolderBatchForm((current) => ({ ...current, preset: "personalizado" }));
+    setMessage("Preset de usuario eliminado.");
+  }
+
+  function duplicateSelectedFolderBatchPreset() {
+    const preset = currentFolderBatchPresetItem();
+    if (!preset) return;
+    const name = window.prompt("Nombre de la copia", `${preset.name} copia`);
+    if (!name) return;
+    const duplicated = duplicateAudioBatchPreset(preset, { name, species_label: preset.species_label || folderBatchForm.target_label || "" });
+    persistUserFolderBatchPresets(upsertUserPreset(userFolderBatchPresets, duplicated));
+    setFolderBatchForm((current) => ({ ...current, preset: duplicated.id }));
+    setMessage("Preset duplicado como editable.");
+  }
+
+  function toggleSelectedFolderBatchPresetFavorite() {
+    const preset = currentFolderBatchPresetItem();
+    if (!preset || preset.source === "system") {
+      setError("Marca favoritos en presets de usuario. Duplica uno de sistema si quieres guardarlo como favorito.");
+      return;
+    }
+    persistUserFolderBatchPresets(upsertUserPreset(userFolderBatchPresets, { ...preset, favorite: !preset.favorite }));
+  }
+
+  function exportUserFolderBatchPresets() {
+    const blob = new Blob([JSON.stringify(userFolderBatchPresets, null, 2)], { type: "application/json" });
+    const link = document.createElement("a");
+    link.href = URL.createObjectURL(blob);
+    link.download = "acusticafauna_user_audio_batch_presets.json";
+    link.click();
+    URL.revokeObjectURL(link.href);
+  }
+
+  function importUserFolderBatchPresets(event) {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const parsed = JSON.parse(String(reader.result || "[]"));
+        const imported = Array.isArray(parsed) ? parsed.map(sanitizeUserPreset) : [];
+        persistUserFolderBatchPresets(imported.reduce((items, preset) => upsertUserPreset(items, preset), userFolderBatchPresets));
+        setMessage(`Presets importados: ${imported.length}.`);
+      } catch {
+        setError("No fue posible importar presets: JSON invalido.");
+      } finally {
+        event.target.value = "";
+      }
+    };
+    reader.readAsText(file);
+  }
+
+  function buildFolderBatchScanPayload(formOverride = folderBatchForm) {
     return {
-      folder_path: folderBatchForm.folder_path.trim(),
-      recursive: Boolean(folderBatchForm.recursive),
+      folder_path: formOverride.folder_path.trim(),
+      recursive: Boolean(formOverride.recursive),
       extensions: [".wav", ".flac", ".mp3", ".ogg", ".m4a"],
       include_patterns: [],
       exclude_patterns: [],
     };
   }
 
-  async function scanFolderBatch() {
-    if (!folderBatchForm.folder_path.trim()) {
+  async function scanFolderBatch(formOverride = folderBatchForm) {
+    commitFolderBatchDraft(formOverride, "scan");
+    if (!formOverride.folder_path.trim()) {
       setError("Escribe la ruta local de la carpeta antes de escanear.");
       return;
     }
@@ -3226,7 +3496,7 @@ export default function AudioLabPage() {
       setFolderBatchScanState({ status: "scanning", message: "Escaneando carpeta local..." });
       setError("");
       setMessage("Escaneando carpeta local...");
-      const scan = await scanAudioLabFolderBatch(buildFolderBatchScanPayload(), { signal: controller.signal });
+      const scan = await scanAudioLabFolderBatch(buildFolderBatchScanPayload(formOverride), { signal: controller.signal });
       if (controller.signal.aborted || scanAbortControllerRef.current !== controller) return;
       setFolderBatchScan(scan);
       setFolderBatchScanState({
@@ -3271,37 +3541,38 @@ export default function AudioLabPage() {
     setMessage("Escaneo cancelado por el usuario.");
   }
 
-  function buildFolderBatchPayload() {
+  function buildFolderBatchPayload(formOverride = folderBatchForm) {
     return {
-      job_name: folderBatchForm.job_name || `folder_batch_${new Date().toISOString().slice(0, 10)}`,
-      folder_path: folderBatchForm.folder_path.trim(),
-      recursive: Boolean(folderBatchForm.recursive),
-      target_label: folderBatchForm.target_label.trim() || "target_species",
+      job_name: formOverride.job_name || `folder_batch_${new Date().toISOString().slice(0, 10)}`,
+      folder_path: formOverride.folder_path.trim(),
+      recursive: Boolean(formOverride.recursive),
+      target_label: formOverride.target_label.trim() || "target_species",
       mode: "species_folder_cleanup",
-      preset: folderBatchForm.preset,
-      frequency_min_hz: Number(folderBatchForm.frequency_min_hz),
-      frequency_max_hz: Number(folderBatchForm.frequency_max_hz),
-      threshold_dbfs: Number(folderBatchForm.threshold_dbfs),
-      min_activity_seconds: Number(folderBatchForm.min_activity_seconds),
-      min_silence_seconds: Number(folderBatchForm.min_silence_seconds),
-      padding_seconds: Number(folderBatchForm.padding_seconds),
-      clip_duration_seconds: Number(folderBatchForm.clip_duration_seconds),
-      max_segment_seconds: Number(folderBatchForm.max_segment_seconds),
-      min_band_ratio: Number(folderBatchForm.min_band_ratio),
-      min_band_energy_ratio: Number(folderBatchForm.min_band_ratio),
-      bandpass: Boolean(folderBatchForm.bandpass),
-      noise_reduce: Boolean(folderBatchForm.noise_reduce),
-      normalize: Boolean(folderBatchForm.normalize),
-      discard_empty: Boolean(folderBatchForm.discard_empty),
-      detect_frog: Boolean(folderBatchForm.detect_frog),
-      detect_contaminants_heuristic: Boolean(folderBatchForm.detect_contaminants_heuristic),
-      create_clips: Boolean(folderBatchForm.create_clips),
-      create_manifest: Boolean(folderBatchForm.create_manifest),
-      resource_profile: folderBatchForm.resource_profile,
+      preset: formOverride.preset,
+      frequency_min_hz: Number(formOverride.frequency_min_hz),
+      frequency_max_hz: Number(formOverride.frequency_max_hz),
+      threshold_dbfs: Number(formOverride.threshold_dbfs),
+      min_activity_seconds: Number(formOverride.min_activity_seconds),
+      min_silence_seconds: Number(formOverride.min_silence_seconds),
+      padding_seconds: Number(formOverride.padding_seconds),
+      clip_duration_seconds: Number(formOverride.clip_duration_seconds),
+      max_segment_seconds: Number(formOverride.max_segment_seconds),
+      min_band_ratio: Number(formOverride.min_band_ratio),
+      min_band_energy_ratio: Number(formOverride.min_band_ratio),
+      bandpass: Boolean(formOverride.bandpass),
+      noise_reduce: Boolean(formOverride.noise_reduce),
+      normalize: Boolean(formOverride.normalize),
+      discard_empty: Boolean(formOverride.discard_empty),
+      detect_frog: Boolean(formOverride.detect_frog),
+      detect_contaminants_heuristic: Boolean(formOverride.detect_contaminants_heuristic),
+      create_clips: Boolean(formOverride.create_clips),
+      create_manifest: Boolean(formOverride.create_manifest),
+      resource_profile: formOverride.resource_profile,
     };
   }
 
-  async function startFolderBatchJob() {
+  async function startFolderBatchJob(formOverride = folderBatchForm) {
+    commitFolderBatchDraft(formOverride, "start");
     if (folderBatchStartDisabledReason) {
       setError(folderBatchStartDisabledReason);
       return;
@@ -3310,7 +3581,7 @@ export default function AudioLabPage() {
       setError("Espera a que termine el escaneo o cancélalo.");
       return;
     }
-    if (!folderBatchForm.folder_path.trim()) {
+    if (!formOverride.folder_path.trim()) {
       setError("Escribe la ruta local de la carpeta antes de iniciar.");
       return;
     }
@@ -3318,20 +3589,20 @@ export default function AudioLabPage() {
       setError("Escanea la carpeta antes de iniciar el procesamiento.");
       return;
     }
-    if (folderBatchForm.exploratory_mode && Number(folderBatchScan.files_found || 0) > 20) {
+    if (formOverride.exploratory_mode && Number(folderBatchScan.files_found || 0) > 20) {
       const exploratoryConfirmed = window.confirm(
         "Modo exploratorio activo: esta configuración puede generar falsos candidatos. Hay más de 20 audios. Recomendación: procesa primero una muestra pequeña. ¿Quieres continuar de todos modos?"
       );
       if (!exploratoryConfirmed) return;
     }
     const confirmed = window.confirm(
-      `Iniciar procesamiento masivo por carpeta?\n\nCarpeta: ${folderBatchForm.folder_path}\nArchivos: ${folderBatchScan.files_found || 0}\nBanda: ${folderBatchForm.frequency_min_hz}-${folderBatchForm.frequency_max_hz} Hz\nDestino: backend/storage/audio_lab/folder_batch_jobs/{job_id}\n\nNo se modificaran ni borraran audios originales.`
+      `Iniciar procesamiento masivo por carpeta?\n\nCarpeta: ${formOverride.folder_path}\nArchivos: ${folderBatchScan.files_found || 0}\nBanda: ${formOverride.frequency_min_hz}-${formOverride.frequency_max_hz} Hz\nDestino: backend/storage/audio_lab/folder_batch_jobs/{job_id}\n\nNo se modificaran ni borraran audios originales.`
     );
     if (!confirmed) return;
     try {
       setFolderBatchSubmitting(true);
       setError("");
-      const created = await createAudioLabFolderBatchJob(buildFolderBatchPayload());
+      const created = await createAudioLabFolderBatchJob(buildFolderBatchPayload(formOverride));
       setMessage("Job de carpeta local creado. El procesamiento queda trazado y los originales no se modifican.");
       await refreshFolderBatchJob(created.job_id || created.id);
       await loadFolderBatchJobs();
@@ -3343,7 +3614,12 @@ export default function AudioLabPage() {
   }
 
   async function refreshFolderBatchJob(jobId, options = {}) {
-    const skipHeavyRefresh = Boolean(options.quiet && folderBatchEditing && !options.forceHeavy);
+    const skipHeavyRefresh = shouldSkipHeavyFolderBatchRefresh({
+      batchEditing: folderBatchEditing,
+      quiet: options.quiet,
+      forceHeavy: options.forceHeavy,
+      status: activeFolderBatchJob?.status,
+    });
     try {
       const detail = await fetchAudioLabFolderBatchJob(jobId);
       setActiveFolderBatchJob(detail);
@@ -3359,10 +3635,11 @@ export default function AudioLabPage() {
         });
       setFolderBatchOutputsLoading(true);
       setFolderBatchOutputsError("");
-      fetchAudioLabFolderBatchOutputs(jobId)
+      fetchAudioLabFolderBatchOutputs(jobId, { limit: 5000 })
         .then((outputs) => {
           const normalized = normalizeFolderBatchOutputsResponse(outputs);
           setFolderBatchOutputs(normalized.items);
+          setFolderBatchSelectedOutputIds(new Set());
           if (normalized.empty && normalized.message) {
             setMessage(normalized.message);
           }
@@ -3466,30 +3743,140 @@ export default function AudioLabPage() {
       predicted_label: activeFolderBatchJob?.target_label || folderBatchForm.target_label,
       score: output.activity_score,
       score_used: output.activity_score,
+      band_ratio: output.band_energy_ratio,
+      rms_dbfs: output.rms_dbfs,
+      preset_name: activeFolderBatchJob?.preset || folderBatchForm.preset,
+      config_used: activeFolderBatchJob?.params_json || null,
+      species_label: activeFolderBatchJob?.target_label || folderBatchForm.target_label,
       threshold: folderBatchForm.threshold_dbfs,
       raw_argmax_label: "",
       decision_rule_applied: false,
     };
   }
 
-  function openFolderBatchFeedback(output, feedbackType, exclusionReason = "") {
+  function openFolderBatchFeedback(output, feedbackType, exclusionReason = "", reviewStatus = "") {
     const row = feedbackRowFromFolderBatchOutput(output);
+    const resolvedReviewStatus = reviewStatus ||
+      (feedbackType === "confirmed_positive" ? "confirmed" :
+        feedbackType === "uncertain" ? "unsure" :
+          exclusionReason === "voz_humana" ? "human_voice" :
+            exclusionReason === "carro_motor" ? "car_motor" :
+              exclusionReason === "ave" ? "bird" : "excluded");
     if (feedbackType === "excluded_from_training") {
       setFeedbackDraft({
         mode: "create",
         row,
         feedbackType,
         exclusionReason: exclusionReason || "ruido",
+        reviewStatus: resolvedReviewStatus,
         notes,
       });
       return;
     }
-    openFeedbackDraft(feedbackType, row);
+    setFeedbackDraft({
+      mode: "create",
+      row,
+      feedbackType,
+      exclusionReason: "",
+      reviewStatus: resolvedReviewStatus,
+      notes,
+    });
   }
 
   function openFolderBatchManifest() {
     if (!activeFolderBatchJob?.id) return;
     window.open(getAudioLabFolderBatchManifestUrl(activeFolderBatchJob.id), "_blank", "noopener,noreferrer");
+  }
+
+  function toggleFolderBatchOutputSelection(outputId) {
+    setFolderBatchSelectedOutputIds((current) => {
+      const next = new Set(current);
+      if (next.has(outputId)) next.delete(outputId);
+      else next.add(outputId);
+      return next;
+    });
+  }
+
+  function selectFolderBatchPage() {
+    setFolderBatchSelectedOutputIds((current) => folderBatchSelectionAfterPageSelect(current, paginatedFolderBatchOutputs.items));
+  }
+
+  function selectAllFilteredFolderBatchOutputs() {
+    setFolderBatchSelectedOutputIds(folderBatchSelectionAfterFilteredSelect(filteredFolderBatchOutputs));
+  }
+
+  function openFolderBatchBulkDraft(actionKey) {
+    if (!activeFolderBatchJob?.id || !folderBatchSelectedOutputs.length) {
+      setError("Selecciona resultados antes de aplicar una accion masiva.");
+      return;
+    }
+    setFolderBatchBulkDraft({
+      actionKey,
+      confirmationText: "",
+      notes: "",
+    });
+  }
+
+  async function saveFolderBatchBulkDraft() {
+    if (!folderBatchBulkDraft || !activeFolderBatchJob?.id) return;
+    const action = FOLDER_BATCH_BULK_ACTIONS[folderBatchBulkDraft.actionKey];
+    if (action?.requiresStrongConfirmation && folderBatchBulkDraft.confirmationText !== "CONFIRMAR") {
+      setError("Escribe CONFIRMAR para continuar.");
+      return;
+    }
+    try {
+      setFolderBatchBulkSaving(true);
+      setError("");
+      const payload = buildFolderBatchBulkPayload({
+        actionKey: folderBatchBulkDraft.actionKey,
+        jobId: activeFolderBatchJob.id,
+        selectedOutputs: folderBatchSelectedOutputs,
+        speciesLabel: activeFolderBatchJob.target_label || folderBatchForm.target_label,
+        reviewer: "web",
+        notes: folderBatchBulkDraft.notes,
+        confirmationText: folderBatchBulkDraft.confirmationText,
+      });
+      const saved = await createAudioLabAnnotationsBulk(payload);
+      setFolderBatchBulkDraft(null);
+      setFolderBatchSelectedOutputIds(new Set());
+      setMessage(`${saved.count || payload.output_ids.length} anotacion(es) guardadas. No se entreno ningun modelo.`);
+      await refreshFolderBatchJob(activeFolderBatchJob.id, { quiet: true });
+    } catch (err) {
+      setError(err.message || "No fue posible guardar la accion masiva.");
+    } finally {
+      setFolderBatchBulkSaving(false);
+    }
+  }
+
+  async function undoLastFolderBatchBulkAction() {
+    if (!activeFolderBatchJob?.id) return;
+    try {
+      const result = await undoLastAudioLabBulkAnnotation(activeFolderBatchJob.id);
+      setMessage(`${result.undone_count || 0} anotacion(es) revertidas. Audios originales intactos.`);
+      await refreshFolderBatchJob(activeFolderBatchJob.id, { quiet: true });
+    } catch (err) {
+      setError(err.message || "No fue posible deshacer la ultima accion masiva.");
+    }
+  }
+
+  function openDatasetExportDraft() {
+    setDatasetExportDraft(defaultAudioLabDatasetExportForm(activeFolderBatchJob?.target_label || folderBatchForm.target_label));
+    setDatasetExportSummary(null);
+  }
+
+  async function saveDatasetExportDraft() {
+    if (!datasetExportDraft) return;
+    try {
+      setDatasetExportSaving(true);
+      setError("");
+      const result = await createAudioLabCuratedDataset(datasetExportDraft);
+      setDatasetExportSummary(result);
+      setMessage("Dataset versionado creado desde revisados. No se entreno ningun modelo.");
+    } catch (err) {
+      setError(err.message || "No fue posible crear el dataset versionado.");
+    } finally {
+      setDatasetExportSaving(false);
+    }
   }
 
   async function copyTextToClipboard(text, successMessage = "Copiado.") {
@@ -3643,6 +4030,54 @@ export default function AudioLabPage() {
       setQualityReport(await response.json());
     } catch (err) {
       setError(`No se pudo generar el reporte de calidad. ${err.message || ""}`.trim());
+    } finally {
+      setQualityReportLoading("");
+    }
+  }
+
+  function metricAvailable(value) {
+    return value !== null && value !== undefined && value !== "" && Number.isFinite(Number(value));
+  }
+
+  function formatMetricOrUnavailable(value, digits = 1, suffix = "") {
+    return metricAvailable(value) ? `${formatNumber(value, digits)}${suffix}` : "No disponible";
+  }
+
+  function qualityReportHasMissingMetrics(report) {
+    if (!report) return true;
+    return [
+      report.rms_db_source,
+      report.rms_db_processed,
+      report.noise_floor_db_source,
+      report.noise_floor_db_processed,
+      report.contrast_db_source,
+      report.contrast_db_processed,
+      report.clipping_processed_ratio,
+    ].some((value) => !metricAvailable(value));
+  }
+
+  async function calculateQualityReportFromModal() {
+    const sourcePath = qualityReport?.source_audio_path || qualityReport?.original_audio_path || qualityReport?.segment_audio_path;
+    const processedPath = qualityReport?.processed_audio_path || qualityReport?.output_audio_path;
+    if (!processedPath || !sourcePath) {
+      setError("No hay rutas suficientes para calcular el reporte de calidad.");
+      return;
+    }
+    try {
+      setQualityReportLoading("modal");
+      setError("");
+      const report = await createAudioLabQualityReport({
+        source_audio_path: sourcePath,
+        processed_audio_path: processedPath,
+        run_frog_detector: true,
+        frog_detector_model_id: DEFAULT_GENERAL_MODEL_ID,
+        frog_detector_threshold: Number(batchProcessingParams.detector_threshold),
+        batch_output_id: qualityReport.batch_output_id,
+      });
+      setQualityReport(report);
+      setMessage("Reporte de calidad calculado.");
+    } catch (err) {
+      setError(`No se pudo calcular el reporte de calidad. ${err.message || ""}`.trim());
     } finally {
       setQualityReportLoading("");
     }
@@ -3870,6 +4305,14 @@ export default function AudioLabPage() {
     const row = feedbackDraft.row;
     const excludedVoice =
       feedbackDraft.feedbackType === "excluded_from_training" && feedbackDraft.exclusionReason === "voz_humana";
+    const reviewStatus =
+      feedbackDraft.feedbackType === "confirmed_positive" ? "confirmed" :
+        feedbackDraft.feedbackType === "hard_negative" ? "hard_negative" :
+          feedbackDraft.feedbackType === "uncertain" ? "unsure" :
+            feedbackDraft.exclusionReason === "voz_humana" ? "human_voice" :
+              feedbackDraft.exclusionReason === "carro_motor" ? "car_motor" :
+                feedbackDraft.exclusionReason === "ave" ? "bird" :
+                  feedbackDraft.feedbackType === "excluded_from_training" ? "excluded" : feedbackDraft.reviewStatus || null;
     const payload = {
       audio_path: row.audio_path,
       audio_name: row.audio_name || getAudioName(row.audio_path),
@@ -3905,6 +4348,14 @@ export default function AudioLabPage() {
       final_label: row.final_label || null,
       pipeline_stages_json: row.pipeline_stages_json || null,
       model_ids_json: row.model_ids_json || null,
+      review_status: reviewStatus,
+      species_label: row.species_label || row.predicted_label || activeFolderBatchJob?.target_label || folderBatchForm.target_label || null,
+      reviewer: "web",
+      reviewed_at: new Date().toISOString(),
+      band_ratio: row.band_ratio ?? row.band_energy_ratio ?? null,
+      rms_dbfs: row.rms_dbfs ?? null,
+      preset_name: row.preset_name || activeFolderBatchJob?.preset || folderBatchForm.preset || null,
+      config_used: row.config_used || activeFolderBatchJob?.params_json || null,
     };
     try {
       const saved =
@@ -4155,7 +4606,7 @@ export default function AudioLabPage() {
   const folderBatchProgress = activeFolderBatchJob?.total_files
     ? Math.round((Number(activeFolderBatchJob.processed_files || 0) / Number(activeFolderBatchJob.total_files || 1)) * 100)
     : 0;
-  const filteredFolderBatchOutputs = folderBatchOutputs.filter((output) => {
+  const filteredFolderBatchOutputs = useMemo(() => folderBatchOutputs.filter((output) => {
     const searchTerm = normalizedFolderBatchSearch;
     const flags = output.contaminant_flags || output.contaminant_flags_json || "";
     const recommendation = output.recommendation || "";
@@ -4180,7 +4631,21 @@ export default function AudioLabPage() {
     const matchesScore = folderBatchMinScore === "" || score >= Number(folderBatchMinScore);
     const matchesRatio = folderBatchMinRatio === "" || ratio >= Number(folderBatchMinRatio);
     return matchesSelectedJob && matchesSearch && matchesMode && matchesScore && matchesRatio && durationValue >= 0;
-  });
+  }), [activeFolderBatchJob?.id, folderBatchMinRatio, folderBatchMinScore, folderBatchOutputFilter, folderBatchOutputs, normalizedFolderBatchSearch]);
+  const paginatedFolderBatchOutputs = useMemo(
+    () => paginateFolderBatchOutputs(filteredFolderBatchOutputs, folderBatchOutputPage, folderBatchOutputPageSize),
+    [filteredFolderBatchOutputs, folderBatchOutputPage, folderBatchOutputPageSize]
+  );
+  const folderBatchSelectedOutputs = useMemo(
+    () => filteredFolderBatchOutputs.filter((output) => folderBatchSelectedOutputIds.has(output.id)),
+    [filteredFolderBatchOutputs, folderBatchSelectedOutputIds]
+  );
+  const folderBatchAllFilteredSelected = filteredFolderBatchOutputs.length > 0 && filteredFolderBatchOutputs.every((output) => folderBatchSelectedOutputIds.has(output.id));
+  const folderBatchSelectionLabel = folderBatchSelectionCountLabel(
+    folderBatchSelectedOutputIds,
+    filteredFolderBatchOutputs.length,
+    folderBatchAllFilteredSelected
+  );
   const calibrationFolderPath = calibrationForm.folder_path.trim();
   const calibrationAndFolderBatchDiffer = Boolean(
     calibrationFolderPath &&
@@ -4226,6 +4691,32 @@ export default function AudioLabPage() {
     finalRecommendationProfiles.high_recall_config,
     finalRecommendationProfiles.exploratory_config,
   ].filter(Boolean);
+  const calibrationSweepTypeMessage =
+    calibrationTest?.sweep_profile_type === "species_specific"
+      ? "Este perfil es especÃ­fico para Pristimantis_simoterus."
+      : calibrationTest?.sweep_profile_type === "adaptive"
+        ? "Este perfil fue generado automÃ¡ticamente desde el anÃ¡lisis acÃºstico."
+        : "";
+  const calibrationProfilesMissing = Boolean(
+    calibrationTest &&
+      ["advanced_sweep", "adaptive_advanced_sweep"].includes(calibrationTest.calibration_mode) &&
+      !calibrationProfileCards.length
+  );
+  const systemFolderBatchPresets = FOLDER_BATCH_PRESET_OPTIONS.map(([id, name]) => ({
+    id,
+    name,
+    species_label: id.includes("pristimantis") ? "Pristimantis_simoterus" : "",
+    source: "system",
+    favorite: false,
+    ...(FOLDER_BATCH_PRESETS[id] || {}),
+  }));
+  const folderBatchPresetItems = [...systemFolderBatchPresets, ...userFolderBatchPresets];
+  const visibleFolderBatchPresetItems = folderBatchPresetItems.filter((preset) => {
+    const speciesTerm = presetSpeciesFilter.trim().toLowerCase();
+    const matchesSpecies = !speciesTerm || String(preset.species_label || preset.name || "").toLowerCase().includes(speciesTerm);
+    const matchesFavorite = !presetFavoritesOnly || Boolean(preset.favorite);
+    return matchesSpecies && matchesFavorite;
+  });
   const calibrationConfigsAllZero = Boolean(calibrationRows.length) && calibrationRows.every((item) => Number(item.total_candidates || 0) === 0);
   const exploratoryWideRow = calibrationRows.find(isExploratoryWideCalibrationRow) || null;
   const calibrationHasExploratoryWide = Boolean(exploratoryWideRow);
@@ -5191,16 +5682,32 @@ python -m uvicorn ml_api.main:app --host 127.0.0.1 --port 8010 --reload`}
                   Este reporte pertenece a otra carpeta o a una ejecución anterior. Puedes verlo como histórico y copiar solo parámetros sin copiar la ruta.
                 </p>
               ) : null}
-              <div className="grid gap-3 md:grid-cols-4">
+              <div className="grid gap-3 md:grid-cols-5">
                 <label className="text-sm md:col-span-1">
                   <span className="mb-1 block font-semibold text-slate-700">Especie objetivo</span>
                   <input value={calibrationForm.label} onChange={(event) => updateCalibrationField("label", event.target.value)} className="w-full rounded-lg border border-slate-300 px-3 py-2" />
                 </label>
                 <label className="text-sm">
                   <span className="mb-1 block font-semibold text-slate-700">Tamaño de muestra</span>
-                  <select value={calibrationForm.sample_size} onChange={(event) => updateCalibrationField("sample_size", Number(event.target.value))} className="w-full rounded-lg border border-slate-300 px-3 py-2">
-                    {[5, 10, 20, 50].map((size) => <option key={size} value={size}>{size}</option>)}
+                  <input type="number" min="1" max="200" step="1" value={calibrationForm.sample_size} onChange={(event) => updateCalibrationField("sample_size", event.target.value)} className="w-full rounded-lg border border-slate-300 px-3 py-2" />
+                  <div className="mt-2 flex flex-wrap gap-1">
+                    {[5, 10, 20, 30, 50, 100].map((size) => (
+                      <button key={size} type="button" onClick={() => updateCalibrationField("sample_size", size)} className="rounded-full border border-slate-300 bg-white px-2 py-1 text-[11px] font-semibold text-slate-700">
+                        {size}
+                      </button>
+                    ))}
+                  </div>
+                </label>
+                <label className="text-sm">
+                  <span className="mb-1 block font-semibold text-slate-700">Tipo de barrido</span>
+                  <select value={calibrationForm.sweep_type} onChange={(event) => updateCalibrationField("sweep_type", event.target.value)} className="w-full rounded-lg border border-slate-300 px-3 py-2">
+                    <option value="adaptive_general">Adaptativo general</option>
+                    <option value="pristimantis_simoterus_rain_wind">Pristimantis simoterus lluvia/viento</option>
+                    <option value="custom">Personalizado</option>
                   </select>
+                  <p className="mt-1 text-xs text-slate-500">
+                    {calibrationForm.sweep_type === "pristimantis_simoterus_rain_wind" ? "Usa perfiles exactos para Pristimantis_simoterus." : "Recalcula bandas desde el perfil acÃºstico."}
+                  </p>
                 </label>
                 <label className="text-sm">
                   <span className="mb-1 block font-semibold text-slate-700">Ruido predominante</span>
@@ -5275,6 +5782,9 @@ python -m uvicorn ml_api.main:app --host 127.0.0.1 --port 8010 --reload`}
                 </button>
                 <button type="button" onClick={runCalibrationConfigTest} disabled={Boolean(calibrationLoading) || !calibrationFolderPath} className="rounded-lg bg-emerald-600 px-4 py-2 text-sm font-semibold text-white disabled:opacity-50">
                   <LoadingText loading={calibrationLoading === "test"} loadingText="Probando...">Probar configuraciones</LoadingText>
+                </button>
+                <button type="button" onClick={runAdvancedSweepCalibrationTest} disabled={Boolean(calibrationLoading) || !calibrationFolderPath || !calibrationForm.label || !Number(calibrationForm.sample_size)} className="rounded-lg bg-cyan-700 px-4 py-2 text-sm font-semibold text-white disabled:opacity-50">
+                  <LoadingText loading={calibrationLoading === "advanced_sweep"} loadingText="Comparando...">Crear barrido avanzado</LoadingText>
                 </button>
                 <button type="button" onClick={runMoreSensitiveCalibrationTest} disabled={Boolean(calibrationLoading) || !calibrationFolderPath || !hasCalibrationBase} title={hasCalibrationBase ? "Crear prueba más sensible: detecta más cantos suaves bajando threshold/ratio." : moreSensitiveDisabledReason} className="rounded-lg bg-teal-700 px-4 py-2 text-sm font-semibold text-white disabled:opacity-50">
                   <LoadingText loading={calibrationLoading === "sensitive"} loadingText="Probando...">Crear prueba más sensible</LoadingText>
@@ -5374,7 +5884,6 @@ python -m uvicorn ml_api.main:app --host 127.0.0.1 --port 8010 --reload`}
                 <button type="button" onClick={() => openCalibrationDownload("markdown")} className="rounded-lg border border-slate-300 px-3 py-2 text-xs font-semibold">Descargar Markdown</button>
               </div>
             </div>
-
             <div className="space-y-4">
               {recommendedCalibrationParameters() ? (
                 <div className="rounded-lg border border-emerald-200 bg-white p-4">
@@ -5510,6 +6019,12 @@ python -m uvicorn ml_api.main:app --host 127.0.0.1 --port 8010 --reload`}
                 <p className="rounded-lg border border-slate-200 p-4 text-sm text-slate-500">Analiza el perfil acústico para ver banda sugerida, threshold, ratio y advertencias antes de procesar la carpeta.</p>
               )}
 
+              {calibrationSweepTypeMessage ? (
+                <p className="rounded-lg border border-blue-200 bg-blue-50 p-3 text-sm font-semibold text-blue-900">{calibrationSweepTypeMessage}</p>
+              ) : null}
+              {calibrationProfilesMissing ? (
+                <p className="rounded-lg border border-red-200 bg-red-50 p-3 text-sm font-semibold text-red-800">El backend no devolviÃ³ final_recommendation_profiles.</p>
+              ) : null}
               {calibrationProfileCards.length ? (
                 <div className="grid gap-3 lg:grid-cols-2">
                   {calibrationProfileCards.map((profile) => {
@@ -5524,16 +6039,20 @@ python -m uvicorn ml_api.main:app --host 127.0.0.1 --port 8010 --reload`}
                             <p className="mt-1 text-xs font-semibold text-slate-600">{profile.config}</p>
                           </div>
                           <Badge tone={profile.role === "exploratory" ? "warning" : profile.role === "balanced" ? "success" : "info"}>
-                            {recommendationLabel(profile.recommendation)}
+                            {profile.badge || recommendationLabel(profile.recommendation)}
                           </Badge>
                         </div>
                         <div className="mt-3 grid gap-2 text-xs text-slate-700 sm:grid-cols-2">
+                          <span>Frecuencia: <strong>{params.frequency_min_hz}-{params.frequency_max_hz} Hz</strong></span>
+                          <span>Threshold: <strong>{params.threshold_dbfs} dBFS</strong></span>
+                          <span>Ratio: <strong>{formatNumber(params.min_band_energy_ratio ?? params.min_band_ratio, 3)}</strong></span>
                           <span>Candidatos: <strong>{profile.total_candidates ?? 0}</strong></span>
                           <span>Duración: <strong>{formatNumber(profile.total_duration_candidates, 3)} s</strong></span>
-                          <span>Ratio: <strong>{formatNumber(profile.average_band_energy_ratio, 6)}</strong></span>
+                          <span>Ratio banda: <strong>{formatNumber(profile.average_band_energy_ratio, 6)}</strong></span>
                           <span>Contraste: <strong>{formatNumber(contrast.before_db, 2)} → {formatNumber(contrast.after_db, 2)} dB</strong></span>
                           <span>Posible daño: <strong>{profile.possible_damage_count ?? 0}</strong></span>
                           <span>Banda: <strong>{params.frequency_min_hz}-{params.frequency_max_hz} Hz</strong></span>
+                          <span>RecomendaciÃ³n: <strong>{recommendationLabel(profile.recommendation)}</strong></span>
                         </div>
                         <p className="mt-3 rounded-lg border border-amber-200 bg-amber-50 p-2 text-xs font-semibold text-amber-900">
                           {profile.warning || "Requiere revisión humana antes de entrenamiento."}
@@ -5542,7 +6061,10 @@ python -m uvicorn ml_api.main:app --host 127.0.0.1 --port 8010 --reload`}
                           <button type="button" onClick={() => applySmallBatchReviewToFolderBatch(profile.parameters, profile)} disabled={Boolean(profileBlockedReason)} title={profileBlockedReason || "Copiar parametros para muestra pequeña."} className="rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-xs font-semibold text-amber-900 disabled:opacity-50">
                             Usar en muestra pequeña
                           </button>
-                          <button type="button" onClick={openCalibrationPreviewsForReview} className="rounded-lg border border-indigo-300 bg-indigo-50 px-3 py-2 text-xs font-semibold text-indigo-900">
+                          <button type="button" onClick={() => applyCalibrationProfileToFolderBatch(profile)} className="rounded-lg border border-blue-300 bg-blue-50 px-3 py-2 text-xs font-semibold text-blue-800">
+                            Aplicar al procesamiento masivo
+                          </button>
+                          <button type="button" onClick={() => openCalibrationPreviewsForReview(profile.config)} className="rounded-lg border border-indigo-300 bg-indigo-50 px-3 py-2 text-xs font-semibold text-indigo-900">
                             Abrir previews
                           </button>
                         </div>
@@ -5650,6 +6172,38 @@ python -m uvicorn ml_api.main:app --host 127.0.0.1 --port 8010 --reload`}
         </div>
       </SectionCard>
 
+      <SectionCard title="Guia: del curado de audios al primer modelo" subtitle="Etapa de revision humana antes de crear datasets entrenables">
+        <div className="space-y-4 text-sm text-slate-700">
+          <div className="grid gap-3 md:grid-cols-3">
+            {[
+              "Escanear carpeta",
+              "Calibrar parametros",
+              "Procesar muestra pequena",
+              "Revisar candidatos",
+              "Confirmar positivos",
+              "Marcar negativos, contaminantes y dudosos",
+              "Crear dataset versionado",
+              "Separar train/validation/test por audio original",
+              "Entrenar modelo experimental",
+              "Evaluar precision, recall, F1, falsos positivos y falsos negativos",
+              "Registrar modelo",
+              "Usar modelo en nuevos lotes",
+            ].map((step, index) => (
+              <div key={step} className="rounded-lg border border-slate-200 bg-white p-3">
+                <div className="text-xs font-bold text-blue-700">Paso {index + 1}</div>
+                <div className="mt-1 font-semibold text-slate-900">{step}</div>
+              </div>
+            ))}
+          </div>
+          <div className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-amber-950">
+            <p className="font-semibold">No entrenar con detecciones automaticas sin revision humana.</p>
+            <p className="mt-1">Los audios originales no se modifican. Confirmar clips solo crea anotaciones revisadas para dataset; no inicia entrenamiento.</p>
+            <p className="mt-1">Los clips dudosos no entran a entrenamiento por defecto. Los falsos positivos sirven como hard negatives cuando se revisan.</p>
+            <p className="mt-1">Exportar dataset crea una copia de clips derivados o un manifiesto versionado, segun la opcion elegida.</p>
+          </div>
+        </div>
+      </SectionCard>
+
       <div ref={folderBatchSectionRef}>
         <SectionCard title="Procesamiento masivo por carpeta local" subtitle="Limpia, segmenta y filtra carpetas grandes sin subir archivos uno por uno">
           <div className="space-y-5">
@@ -5666,6 +6220,36 @@ python -m uvicorn ml_api.main:app --host 127.0.0.1 --port 8010 --reload`}
           </div>
 
           <div className="grid gap-4 xl:grid-cols-[minmax(0,0.85fr)_minmax(0,1.15fr)]">
+            <AudioLabFolderBatchForm
+              form={folderBatchForm}
+              mlUnavailable={mlStatus.state !== "connected"}
+              presets={folderBatchPresetItems}
+              presetSpeciesFilter={presetSpeciesFilter}
+              presetFavoritesOnly={presetFavoritesOnly}
+              calibrationModeInfo={folderBatchCalibrationModeInfo}
+              scanState={folderBatchScanState}
+              scanning={folderBatchScanning}
+              submitting={folderBatchSubmitting}
+              startDisabledReason={folderBatchStartDisabledReason}
+              activeJobFinished={activeFolderBatchJobFinished}
+              onCommitDraft={commitFolderBatchDraft}
+              onEditingFocus={pauseFolderBatchHeavyRefresh}
+              onEditingBlur={resumeFolderBatchHeavyRefreshSoon}
+              onApplyPreset={applyFolderBatchPreset}
+              onSavePreset={saveCurrentFolderBatchPreset}
+              onEditPreset={editSelectedFolderBatchPreset}
+              onDuplicatePreset={duplicateSelectedFolderBatchPreset}
+              onDeletePreset={deleteSelectedFolderBatchPreset}
+              onTogglePresetFavorite={toggleSelectedFolderBatchPresetFavorite}
+              onExportPresets={exportUserFolderBatchPresets}
+              onImportPresets={importUserFolderBatchPresets}
+              onPresetSpeciesFilterChange={setPresetSpeciesFilter}
+              onPresetFavoritesOnlyChange={setPresetFavoritesOnly}
+              onScan={scanFolderBatch}
+              onCancelScan={cancelFolderBatchScan}
+              onStart={startFolderBatchJob}
+            />
+            {false ? (
             <div className="space-y-4">
               <label className="block text-sm">
                 <span className="mb-1 block font-semibold text-slate-700">Ruta de carpeta local</span>
@@ -5717,15 +6301,40 @@ python -m uvicorn ml_api.main:app --host 127.0.0.1 --port 8010 --reload`}
 
               <div>
                 <div className="mb-2 text-sm font-semibold text-slate-700">Preset</div>
-                <div className="flex flex-wrap gap-2">
-                  {FOLDER_BATCH_PRESET_OPTIONS.map(([preset, label]) => (
+                <div className="mb-3 grid gap-2 md:grid-cols-[minmax(0,1fr)_auto_auto] md:items-end">
+                  <label className="text-xs font-semibold text-slate-600">
+                    Filtrar por especie
+                    <input value={presetSpeciesFilter} onChange={(event) => setPresetSpeciesFilter(event.target.value)} placeholder="Pristimantis, ave, insecto..." className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm font-normal" />
+                  </label>
+                  <label className="inline-flex items-center gap-2 rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm">
+                    <input type="checkbox" checked={presetFavoritesOnly} onChange={(event) => setPresetFavoritesOnly(event.target.checked)} />
+                    Favoritos
+                  </label>
+                  <div className="flex flex-wrap gap-2">
+                    <button type="button" onClick={saveCurrentFolderBatchPreset} className="rounded-lg bg-emerald-600 px-3 py-2 text-xs font-semibold text-white">Guardar preset actual</button>
+                    <button type="button" onClick={editSelectedFolderBatchPreset} className="rounded-lg border border-slate-300 px-3 py-2 text-xs font-semibold">Editar preset</button>
+                    <button type="button" onClick={duplicateSelectedFolderBatchPreset} className="rounded-lg border border-slate-300 px-3 py-2 text-xs font-semibold">Duplicar preset</button>
+                    <button type="button" onClick={deleteSelectedFolderBatchPreset} className="rounded-lg border border-red-300 bg-red-50 px-3 py-2 text-xs font-semibold text-red-700">Eliminar preset</button>
+                    <button type="button" onClick={toggleSelectedFolderBatchPresetFavorite} className="rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-xs font-semibold text-amber-900">Favorito</button>
+                  </div>
+                </div>
+                <div className="mb-3 flex flex-wrap gap-2">
+                  <button type="button" onClick={exportUserFolderBatchPresets} className="rounded-lg border border-blue-300 bg-blue-50 px-3 py-2 text-xs font-semibold text-blue-800">Exportar presets JSON</button>
+                  <label className="rounded-lg border border-blue-300 bg-white px-3 py-2 text-xs font-semibold text-blue-800">
+                    Importar presets JSON
+                    <input type="file" accept="application/json,.json" onChange={importUserFolderBatchPresets} className="hidden" />
+                  </label>
+                </div>
+                <div className="flex max-h-48 flex-wrap gap-2 overflow-auto rounded-lg border border-slate-200 bg-slate-50 p-2">
+                  {visibleFolderBatchPresetItems.map((preset) => (
                     <button
-                      key={preset}
+                      key={preset.id}
                       type="button"
                       onClick={() => applyFolderBatchPreset(preset)}
-                      className={`rounded-lg border px-3 py-2 text-sm font-semibold ${folderBatchForm.preset === preset ? "border-emerald-500 bg-emerald-50 text-emerald-900" : "border-slate-300 bg-white text-slate-700"}`}
+                      className={`rounded-lg border px-3 py-2 text-left text-sm font-semibold ${folderBatchForm.preset === preset.id ? "border-emerald-500 bg-emerald-50 text-emerald-900" : "border-slate-300 bg-white text-slate-700"}`}
                     >
-                      {label}
+                      <span className="block">{preset.favorite ? "* " : ""}{preset.name}</span>
+                      <span className="mt-1 block text-[11px] font-semibold text-slate-500">{preset.source === "system" ? "Sistema" : "Usuario"}{preset.species_label ? ` - ${preset.species_label}` : ""}</span>
                     </button>
                   ))}
                 </div>
@@ -5815,6 +6424,7 @@ python -m uvicorn ml_api.main:app --host 127.0.0.1 --port 8010 --reload`}
                 <p className="rounded-lg border border-blue-200 bg-blue-50 p-2 text-xs font-semibold text-blue-800">Este job ya terminó. Para iniciar uno nuevo, escanea la carpeta actual.</p>
               ) : null}
             </div>
+            ) : null}
 
             <div className="space-y-4">
               {folderBatchScan ? (
@@ -6014,10 +6624,46 @@ python -m uvicorn ml_api.main:app --host 127.0.0.1 --port 8010 --reload`}
                 </div>
               ) : null}
 
+              <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-700">
+                <span>
+                  Mostrando {paginatedFolderBatchOutputs.items.length} de {filteredFolderBatchOutputs.length} resultado(s)
+                  {paginatedFolderBatchOutputs.totalPages > 1 ? ` - pagina ${paginatedFolderBatchOutputs.page}/${paginatedFolderBatchOutputs.totalPages}` : ""}
+                </span>
+                <div className="flex flex-wrap items-center gap-2">
+                  <select value={folderBatchOutputPageSize} onChange={(event) => { setFolderBatchOutputPageSize(Number(event.target.value)); setFolderBatchOutputPage(1); }} className="rounded-lg border border-slate-300 px-2 py-1">
+                    <option value={25}>25 por pagina</option>
+                    <option value={50}>50 por pagina</option>
+                    <option value={100}>100 por pagina</option>
+                  </select>
+                  <button type="button" disabled={paginatedFolderBatchOutputs.page <= 1} onClick={() => setFolderBatchOutputPage((page) => Math.max(1, page - 1))} className="rounded-lg border border-slate-300 px-2 py-1 font-semibold disabled:opacity-50">Anterior</button>
+                  <button type="button" disabled={paginatedFolderBatchOutputs.page >= paginatedFolderBatchOutputs.totalPages} onClick={() => setFolderBatchOutputPage((page) => Math.min(paginatedFolderBatchOutputs.totalPages, page + 1))} className="rounded-lg border border-slate-300 px-2 py-1 font-semibold disabled:opacity-50">Siguiente</button>
+                </div>
+              </div>
+              <div className="rounded-lg border border-blue-200 bg-blue-50 p-3 text-xs text-blue-950">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <strong>{folderBatchSelectionLabel}</strong>
+                  <div className="flex flex-wrap gap-2">
+                    <button type="button" onClick={selectFolderBatchPage} disabled={!paginatedFolderBatchOutputs.items.length} className="rounded-lg border border-blue-300 bg-white px-2 py-1 font-semibold disabled:opacity-50">Seleccionar pagina actual</button>
+                    <button type="button" onClick={selectAllFilteredFolderBatchOutputs} disabled={!filteredFolderBatchOutputs.length} className="rounded-lg border border-blue-300 bg-white px-2 py-1 font-semibold disabled:opacity-50">Seleccionar todos los filtrados</button>
+                    <button type="button" onClick={() => setFolderBatchSelectedOutputIds(new Set())} disabled={!folderBatchSelectedOutputIds.size} className="rounded-lg border border-slate-300 bg-white px-2 py-1 font-semibold disabled:opacity-50">Limpiar seleccion</button>
+                    <button type="button" onClick={undoLastFolderBatchBulkAction} className="rounded-lg border border-amber-300 bg-white px-2 py-1 font-semibold text-amber-900">Deshacer ultima accion masiva</button>
+                    <button type="button" onClick={openDatasetExportDraft} className="rounded-lg border border-emerald-300 bg-white px-2 py-1 font-semibold text-emerald-900">Crear dataset desde revisados</button>
+                  </div>
+                </div>
+                <div className="mt-2 flex flex-wrap gap-2">
+                  {Object.entries(FOLDER_BATCH_BULK_ACTIONS).map(([key, action]) => (
+                    <button key={key} type="button" onClick={() => openFolderBatchBulkDraft(key)} disabled={!folderBatchSelectedOutputIds.size} className="rounded-lg border border-blue-300 bg-white px-2 py-1 font-semibold disabled:opacity-50">
+                      {action.label}
+                    </button>
+                  ))}
+                </div>
+                <p className="mt-2">Confirmar todos los filtrados usa los filtros actuales. No hay entrenamiento automatico desde esta pantalla.</p>
+              </div>
               <div className="max-h-96 overflow-auto rounded-lg border border-slate-200">
                 <table className="min-w-full text-left text-sm">
                   <thead className="sticky top-0 bg-slate-100 text-xs uppercase text-slate-500">
                     <tr>
+                      <th className="px-3 py-2">Sel.</th>
                       <th className="px-3 py-2">Audio original</th>
                       <th className="px-3 py-2">Segmento</th>
                       <th className="px-3 py-2">Score</th>
@@ -6029,9 +6675,12 @@ python -m uvicorn ml_api.main:app --host 127.0.0.1 --port 8010 --reload`}
                     </tr>
                   </thead>
                   <tbody>
-                    {filteredFolderBatchOutputs.length ? (
-                      filteredFolderBatchOutputs.map((output) => (
+                    {paginatedFolderBatchOutputs.items.length ? (
+                      paginatedFolderBatchOutputs.items.map((output) => (
                         <tr key={output.id} className="border-t border-slate-100">
+                          <td className="px-3 py-2">
+                            <input type="checkbox" checked={folderBatchSelectedOutputIds.has(output.id)} onChange={() => toggleFolderBatchOutputSelection(output.id)} aria-label={`Seleccionar ${getAudioName(output.original_audio_path)}`} />
+                          </td>
                           <td className="px-3 py-2">
                             <div className="max-w-56 truncate font-semibold" title={output.original_audio_path}>{getAudioName(output.original_audio_path)}</div>
                             <div className="max-w-56 truncate text-xs text-slate-500" title={output.original_audio_path}>{output.original_audio_path}</div>
@@ -6051,8 +6700,8 @@ python -m uvicorn ml_api.main:app --host 127.0.0.1 --port 8010 --reload`}
                               <button type="button" onClick={() => openFolderBatchFeedback(output, "confirmed_positive")} className="rounded-lg border border-emerald-300 px-2 py-1 text-xs font-semibold text-emerald-800">Confirmar</button>
                               <button type="button" onClick={() => openFolderBatchFeedback(output, "excluded_from_training", "ruido")} className="rounded-lg border border-red-300 px-2 py-1 text-xs font-semibold text-red-700">Excluir</button>
                               <button type="button" onClick={() => openFolderBatchFeedback(output, "excluded_from_training", "voz_humana")} className="rounded-lg border border-red-300 px-2 py-1 text-xs font-semibold text-red-700">Voz humana</button>
-                              <button type="button" onClick={() => openFolderBatchFeedback(output, "excluded_from_training", "ruido")} className="rounded-lg border border-red-300 px-2 py-1 text-xs font-semibold text-red-700">Carro/motor</button>
-                              <button type="button" onClick={() => openFolderBatchFeedback(output, "excluded_from_training", "otro")} className="rounded-lg border border-red-300 px-2 py-1 text-xs font-semibold text-red-700">Ave</button>
+                              <button type="button" onClick={() => openFolderBatchFeedback(output, "excluded_from_training", "carro_motor", "car_motor")} className="rounded-lg border border-red-300 px-2 py-1 text-xs font-semibold text-red-700">Carro/motor</button>
+                              <button type="button" onClick={() => openFolderBatchFeedback(output, "excluded_from_training", "ave", "bird")} className="rounded-lg border border-red-300 px-2 py-1 text-xs font-semibold text-red-700">Ave</button>
                               <button type="button" onClick={() => openFolderBatchFeedback(output, "uncertain")} className="rounded-lg border border-slate-300 px-2 py-1 text-xs font-semibold">Enviar a revisar</button>
                             </div>
                           </td>
@@ -6060,7 +6709,7 @@ python -m uvicorn ml_api.main:app --host 127.0.0.1 --port 8010 --reload`}
                       ))
                     ) : (
                       <tr>
-                        <td colSpan="8" className="px-3 py-8 text-center text-slate-500">Sin resultados con estos filtros todavia.</td>
+                        <td colSpan="9" className="px-3 py-8 text-center text-slate-500">Sin resultados con estos filtros todavia.</td>
                       </tr>
                     )}
                   </tbody>
@@ -6810,13 +7459,21 @@ python -m uvicorn ml_api.main:app --host 127.0.0.1 --port 8010 --reload`}
                   Descargar PNG
                 </a>
               ) : null}
+              {spectrogramError ? (
+                <button type="button" disabled={spectrogramLoading} onClick={() => generateSpectrogram(lastSpectrogramTarget)} className="rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-sm font-semibold text-amber-900 disabled:opacity-50">
+                  Reintentar espectrograma
+                </button>
+              ) : null}
             </div>
+            {spectrogramError ? (
+              <p className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm font-semibold text-amber-900">{spectrogramError}</p>
+            ) : null}
             <div className="flex min-h-80 items-center justify-center overflow-hidden rounded-lg border border-slate-200 bg-slate-950">
               {spectrogramUrl ? (
                 <img src={spectrogramUrl} alt="Espectrograma generado" className="h-auto w-full" />
               ) : (
                 <span className="px-6 text-center text-sm text-slate-300">
-                  {spectrogramLoading ? "Generando espectrograma..." : "Sin espectrograma generado."}
+                  {spectrogramLoading ? "Generando espectrograma..." : spectrogramError || "Sin espectrograma generado."}
                 </span>
               )}
             </div>
@@ -7257,6 +7914,100 @@ python -m uvicorn ml_api.main:app --host 127.0.0.1 --port 8010 --reload`}
         </div>
       ) : null}
 
+      {folderBatchBulkDraft ? (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 p-4">
+          <div className="w-full max-w-xl rounded-lg bg-white p-5 shadow-xl">
+            <div className="mb-4 flex items-start justify-between gap-3">
+              <div>
+                <h2 className="text-lg font-bold text-slate-900">Accion masiva de curacion</h2>
+                <p className="text-sm text-slate-600">{FOLDER_BATCH_BULK_ACTIONS[folderBatchBulkDraft.actionKey]?.label}</p>
+              </div>
+              <button type="button" onClick={() => setFolderBatchBulkDraft(null)} className="rounded-lg border border-slate-300 px-3 py-1 text-sm font-semibold">Cancelar</button>
+            </div>
+            <div className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-950">
+              {folderBatchBulkDraft.actionKey === "confirm" ? (
+                <p>Vas a confirmar {folderBatchSelectedOutputs.length} clips como {activeFolderBatchJob?.target_label || folderBatchForm.target_label}. Esto los marcara como revisados para dataset, pero no entrenara ningun modelo.</p>
+              ) : (
+                <p>Vas a marcar {folderBatchSelectedOutputs.length} clips. Se guardaran anotaciones revisadas y los audios originales no se modificaran.</p>
+              )}
+            </div>
+            {folderBatchBulkDraft.actionKey === "confirm" ? (
+              <label className="mt-4 block text-sm">
+                <span className="mb-1 block font-semibold">Escribe CONFIRMAR para continuar</span>
+                <input value={folderBatchBulkDraft.confirmationText} onChange={(event) => setFolderBatchBulkDraft((draft) => ({ ...draft, confirmationText: event.target.value }))} className="w-full rounded-lg border border-slate-300 px-3 py-2" />
+              </label>
+            ) : null}
+            <label className="mt-4 block text-sm">
+              <span className="mb-1 block font-semibold">Notas</span>
+              <textarea value={folderBatchBulkDraft.notes} onChange={(event) => setFolderBatchBulkDraft((draft) => ({ ...draft, notes: event.target.value }))} className="min-h-20 w-full rounded-lg border border-slate-300 px-3 py-2" />
+            </label>
+            <div className="mt-4 flex justify-end gap-2">
+              <button type="button" onClick={() => setFolderBatchBulkDraft(null)} className="rounded-lg border border-slate-300 px-4 py-2 text-sm font-semibold">Cancelar</button>
+              <button type="button" onClick={saveFolderBatchBulkDraft} disabled={folderBatchBulkSaving} className="rounded-lg bg-emerald-600 px-4 py-2 text-sm font-semibold text-white disabled:opacity-50">Guardar anotaciones</button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {datasetExportDraft ? (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 p-4">
+          <div className="max-h-[calc(100vh-2rem)] w-full max-w-3xl overflow-y-auto rounded-lg bg-white p-5 shadow-xl">
+            <div className="mb-4 flex items-start justify-between gap-3">
+              <div>
+                <h2 className="text-lg font-bold text-slate-900">Crear dataset desde revisados</h2>
+                <p className="text-sm text-slate-600">Exporta una copia de clips derivados o un manifiesto versionado. No entrena modelos.</p>
+              </div>
+              <button type="button" onClick={() => setDatasetExportDraft(null)} className="rounded-lg border border-slate-300 px-3 py-1 text-sm font-semibold">Cerrar</button>
+            </div>
+            <div className="grid gap-3 md:grid-cols-3">
+              <label className="text-sm"><span className="mb-1 block font-semibold">Nombre dataset</span><input value={datasetExportDraft.dataset_name} onChange={(event) => setDatasetExportDraft((draft) => ({ ...draft, dataset_name: event.target.value }))} className="w-full rounded-lg border border-slate-300 px-3 py-2" /></label>
+              <label className="text-sm"><span className="mb-1 block font-semibold">Especie objetivo</span><input value={datasetExportDraft.species_label} onChange={(event) => setDatasetExportDraft((draft) => ({ ...draft, species_label: event.target.value }))} className="w-full rounded-lg border border-slate-300 px-3 py-2" /></label>
+              <label className="text-sm"><span className="mb-1 block font-semibold">Version</span><input value={datasetExportDraft.version} onChange={(event) => setDatasetExportDraft((draft) => ({ ...draft, version: event.target.value }))} className="w-full rounded-lg border border-slate-300 px-3 py-2" /></label>
+            </div>
+            <div className="mt-4 grid gap-2 md:grid-cols-2">
+              {[
+                ["include_confirmed_positives", "Incluir positivos confirmados"],
+                ["include_negatives_excluded", "Incluir negativos/excluidos"],
+                ["include_hard_negatives", "Incluir hard negatives"],
+                ["exclude_unsure", "Excluir dudosos de train"],
+                ["include_contaminants", "Incluir contaminantes"],
+                ["contaminants_as_negative", "Usar contaminantes como negativos"],
+                ["copy_clips", "Copiar clips derivados"],
+                ["split_by_source_audio_path", "Separar train/validation/test por archivo original"],
+              ].map(([key, label]) => (
+                <label key={key} className="flex items-center gap-2 rounded-lg border border-slate-200 p-2 text-sm">
+                  <input type="checkbox" checked={Boolean(datasetExportDraft[key])} onChange={(event) => setDatasetExportDraft((draft) => ({ ...draft, [key]: event.target.checked }))} />
+                  <span>{label}</span>
+                </label>
+              ))}
+            </div>
+            <p className="mt-4 rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-950">
+              Para evitar fuga de datos, los clips del mismo audio original deben ir al mismo split.
+            </p>
+            {datasetExportSummary?.summary ? (
+              <div className="mt-4 rounded-lg border border-emerald-200 bg-emerald-50 p-3 text-sm text-emerald-950">
+                <div className="font-bold">Resumen del dataset</div>
+                <div className="mt-2 grid gap-2 md:grid-cols-3">
+                  <span>positivos: {datasetExportSummary.summary.positives}</span>
+                  <span>negativos: {datasetExportSummary.summary.negatives}</span>
+                  <span>hard negatives: {datasetExportSummary.summary.hard_negatives}</span>
+                  <span>contaminantes: {datasetExportSummary.summary.contaminants}</span>
+                  <span>dudosos excluidos: {datasetExportSummary.summary.unsure_excluded}</span>
+                  <span>audios unicos: {datasetExportSummary.summary.unique_source_audios}</span>
+                </div>
+                <p className="mt-2">Split: train {datasetExportSummary.summary.split?.train || 0}, validation {datasetExportSummary.summary.split?.validation || 0}, test {datasetExportSummary.summary.split?.test || 0}</p>
+                {datasetExportSummary.summary.warnings?.length ? <p className="mt-2">Advertencias: {datasetExportSummary.summary.warnings.join(", ")}</p> : null}
+                <p className="mt-2 text-xs">Semilla: 30-100 positivos, 100-300 negativos. Experimental: 100+ positivos, 300+ negativos, 50+ hard negatives. Util: 300+ positivos, 1000+ negativos, 200+ hard negatives.</p>
+              </div>
+            ) : null}
+            <div className="mt-4 flex justify-end gap-2">
+              <button type="button" onClick={() => setDatasetExportDraft(null)} className="rounded-lg border border-slate-300 px-4 py-2 text-sm font-semibold">Cerrar</button>
+              <button type="button" onClick={saveDatasetExportDraft} disabled={datasetExportSaving} className="rounded-lg bg-emerald-600 px-4 py-2 text-sm font-semibold text-white disabled:opacity-50">Crear dataset</button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
       {feedbackDraft ? (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 p-4">
           <div className="w-full max-w-2xl rounded-lg bg-white p-5 shadow-xl">
@@ -7321,7 +8072,7 @@ python -m uvicorn ml_api.main:app --host 127.0.0.1 --port 8010 --reload`}
                 <label className="text-sm">
                   <span className="mb-1 block font-semibold">Razon</span>
                   <select value={feedbackDraft.exclusionReason || "voz_humana"} onChange={(event) => setFeedbackDraft((draft) => ({ ...draft, exclusionReason: event.target.value }))} className="w-full rounded-lg border border-slate-300 px-3 py-2">
-                    {["voz_humana", "ruido", "sin_vocalizacion", "audio_equivocado", "etiqueta_incorrecta", "otro"].map((reason) => (
+                    {["voz_humana", "carro_motor", "ave", "ruido", "sin_vocalizacion", "audio_equivocado", "etiqueta_incorrecta", "otro"].map((reason) => (
                       <option key={reason} value={reason}>{reason}</option>
                     ))}
                   </select>
@@ -7451,6 +8202,11 @@ python -m uvicorn ml_api.main:app --host 127.0.0.1 --port 8010 --reload`}
                   </p>
                 ) : null}
                 <p className="text-sm text-slate-500">Comparacion automatica; no reemplaza revision humana.</p>
+                {qualityReportHasMissingMetrics(qualityReport) ? (
+                  <p className="mt-2 rounded-lg border border-amber-200 bg-amber-50 p-2 text-sm font-semibold text-amber-900">
+                    Metricas no calculadas para este clip. Puedes calcularlas bajo demanda.
+                  </p>
+                ) : null}
                 <div className="mt-2 grid gap-1 text-sm">
                   <div><span className="text-slate-500">Original:</span> <strong>{qualityReport.source_audio_name || getAudioName(qualityReport.source_audio_path)}</strong></div>
                   <div><span className="text-slate-500">Procesado:</span> <strong>{qualityReport.display_label || qualityReport.processed_audio_name || getAudioName(qualityReport.processed_audio_path)}</strong></div>
@@ -7462,25 +8218,25 @@ python -m uvicorn ml_api.main:app --host 127.0.0.1 --port 8010 --reload`}
             <div className="mt-4 grid gap-3 md:grid-cols-3">
               <div className="rounded-lg bg-slate-50 p-3">
                 <div className="text-xs text-slate-500">Nivel general</div>
-                <strong>{formatNumber(qualityReport.rms_db_source, 1)} &rarr; {formatNumber(qualityReport.rms_db_processed, 1)} dBFS</strong>
+                <strong>{formatMetricOrUnavailable(qualityReport.rms_db_source, 1, " dBFS")} &rarr; {formatMetricOrUnavailable(qualityReport.rms_db_processed, 1, " dBFS")}</strong>
               </div>
               <div className="rounded-lg bg-slate-50 p-3">
                 <div className="text-xs text-slate-500">Ruido de fondo</div>
-                <strong>{formatNumber(qualityReport.noise_floor_db_source, 1)} &rarr; {formatNumber(qualityReport.noise_floor_db_processed, 1)} dBFS</strong>
+                <strong>{formatMetricOrUnavailable(qualityReport.noise_floor_db_source, 1, " dBFS")} &rarr; {formatMetricOrUnavailable(qualityReport.noise_floor_db_processed, 1, " dBFS")}</strong>
               </div>
               <div className="rounded-lg bg-slate-50 p-3">
                 <div className="text-xs text-slate-500">Contraste</div>
-                <strong>{formatNumber(qualityReport.contrast_db_source, 1)} &rarr; {formatNumber(qualityReport.contrast_db_processed, 1)} dB</strong>
-                <div className="text-xs text-slate-500">Mejora {formatNumber(qualityReport.contrast_improvement_db, 2)} dB</div>
+                <strong>{formatMetricOrUnavailable(qualityReport.contrast_db_source, 1, " dB")} &rarr; {formatMetricOrUnavailable(qualityReport.contrast_db_processed, 1, " dB")}</strong>
+                <div className="text-xs text-slate-500">Mejora {formatMetricOrUnavailable(qualityReport.contrast_improvement_db, 2, " dB")}</div>
               </div>
               <div className="rounded-lg bg-slate-50 p-3">
                 <div className="text-xs text-slate-500">Clipping procesado</div>
-                <strong>{formatNumber(qualityReport.clipping_processed_ratio, 6)}</strong>
+                <strong>{formatMetricOrUnavailable(qualityReport.clipping_processed_ratio, 6)}</strong>
               </div>
               <div className="rounded-lg bg-slate-50 p-3">
                 <div className="text-xs text-slate-500">Detector rana/sapo</div>
-                <strong>{formatNumber(qualityReport.frog_detector?.source_score, 3)} &rarr; {formatNumber(qualityReport.frog_detector?.processed_score, 3)}</strong>
-                <div className="text-xs text-slate-500">Delta {formatNumber(qualityReport.frog_detector?.delta_score, 3)}</div>
+                <strong>{formatMetricOrUnavailable(qualityReport.frog_detector?.source_score, 3)} &rarr; {formatMetricOrUnavailable(qualityReport.frog_detector?.processed_score, 3)}</strong>
+                <div className="text-xs text-slate-500">Delta {formatMetricOrUnavailable(qualityReport.frog_detector?.delta_score, 3)}</div>
               </div>
               <div className="rounded-lg bg-slate-50 p-3">
                 <div className="text-xs text-slate-500">Recomendacion</div>
@@ -7503,15 +8259,19 @@ python -m uvicorn ml_api.main:app --host 127.0.0.1 --port 8010 --reload`}
                     </tr>
                   </thead>
                   <tbody>
-                    {(qualityReport.band_energy || []).map((band) => (
+                    {(qualityReport.band_energy || []).length ? (qualityReport.band_energy || []).map((band) => (
                       <tr key={band.band_hz} className="border-t border-slate-100">
                         <td className="px-3 py-2">{band.band_hz} Hz</td>
-                        <td className="px-3 py-2">{formatNumber(band.source_db, 1)} dB</td>
-                        <td className="px-3 py-2">{formatNumber(band.processed_db, 1)} dB</td>
-                        <td className="px-3 py-2">{formatNumber(band.delta_db, 1)} dB</td>
+                        <td className="px-3 py-2">{formatMetricOrUnavailable(band.source_db, 1, " dB")}</td>
+                        <td className="px-3 py-2">{formatMetricOrUnavailable(band.processed_db, 1, " dB")}</td>
+                        <td className="px-3 py-2">{formatMetricOrUnavailable(band.delta_db, 1, " dB")}</td>
                         <td className="px-3 py-2">{band.interpretation}</td>
                       </tr>
-                    ))}
+                    )) : (
+                      <tr className="border-t border-slate-100">
+                        <td className="px-3 py-2" colSpan="5">No disponible</td>
+                      </tr>
+                    )}
                   </tbody>
                 </table>
               </div>
@@ -7528,6 +8288,9 @@ python -m uvicorn ml_api.main:app --host 127.0.0.1 --port 8010 --reload`}
             </div>
 
             <div className="mt-4 flex flex-wrap gap-2">
+              <button type="button" disabled={qualityReportLoading === "modal"} onClick={calculateQualityReportFromModal} className="rounded-lg border border-blue-300 bg-blue-50 px-3 py-2 text-sm font-semibold text-blue-800 disabled:opacity-50">
+                {qualityReportLoading === "modal" ? "Calculando..." : "Calcular reporte de calidad"}
+              </button>
               <button type="button" onClick={copyQualityReport} className="rounded-lg border border-slate-300 px-3 py-2 text-sm font-semibold">Copiar reporte</button>
               <button type="button" onClick={downloadQualityReportJson} className="rounded-lg bg-blue-600 px-3 py-2 text-sm font-semibold text-white">Descargar JSON</button>
               <button type="button" onClick={() => generateSpectrogram({ audio_path: qualityReport.processed_audio_path, start_seconds: 0, end_seconds: undefined })} className="rounded-lg border border-slate-300 px-3 py-2 text-sm font-semibold">Ver espectrograma procesado</button>

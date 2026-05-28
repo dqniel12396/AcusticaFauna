@@ -564,7 +564,12 @@ export async function fetchMlSpectrogramBlob(payload) {
     let message = "No fue posible generar el espectrograma.";
     try {
       const data = await response.json();
-      message = data.detail || message;
+      const detail = data.detail;
+      if (response.status === 503 || detail?.detail === "ml_service_unavailable") {
+        message = "El servicio de espectrograma no est\u00e1 disponible. Inicia acusticafauna-ml-api o revisa ML_API_BASE_URL.";
+      } else {
+        message = detail?.message || detail || data.message || message;
+      }
     } catch {
       // Keep generic message for non-JSON errors.
     }
@@ -583,13 +588,43 @@ export async function createAudioLabAnnotation(payload) {
   return handleResponse(response);
 }
 
-export async function fetchAudioLabAnnotations(audioPath) {
+export async function fetchAudioLabAnnotations(audioPathOrFilters) {
   const params = new URLSearchParams();
-  if (audioPath) {
-    params.set("audio_path", audioPath);
+  if (typeof audioPathOrFilters === "string") {
+    if (audioPathOrFilters) params.set("audio_path", audioPathOrFilters);
+  } else if (audioPathOrFilters && typeof audioPathOrFilters === "object") {
+    Object.entries(audioPathOrFilters).forEach(([key, value]) => {
+      if (value !== undefined && value !== null && value !== "") params.set(key, value);
+    });
   }
   const suffix = params.toString() ? `?${params.toString()}` : "";
   const response = await fetch(`${API_BASE}/audio-lab/annotations${suffix}`);
+  return handleResponse(response);
+}
+
+export async function createAudioLabAnnotationsBulk(payload) {
+  const response = await fetch(`${API_BASE}/audio-lab/annotations/bulk`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  return handleResponse(response);
+}
+
+export async function undoLastAudioLabBulkAnnotation(jobId = "") {
+  const suffix = jobId ? `?job_id=${encodeURIComponent(jobId)}` : "";
+  const response = await fetch(`${API_BASE}/audio-lab/annotations/undo-last-bulk${suffix}`, {
+    method: "POST",
+  });
+  return handleResponse(response);
+}
+
+export async function createAudioLabCuratedDataset(payload) {
+  const response = await fetch(`${API_BASE}/audio-lab/curated-datasets`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
   return handleResponse(response);
 }
 
@@ -722,8 +757,11 @@ export async function cancelAudioLabFolderBatchJob(jobId) {
   return handleResponse(response);
 }
 
-export async function fetchAudioLabFolderBatchOutputs(jobId) {
-  const response = await fetch(`${API_BASE}/audio-lab/folder-batch/jobs/${encodeURIComponent(jobId)}/outputs`);
+export async function fetchAudioLabFolderBatchOutputs(jobId, options = {}) {
+  const params = new URLSearchParams();
+  if (options.limit) params.set("limit", options.limit);
+  const suffix = params.toString() ? `?${params.toString()}` : "";
+  const response = await fetch(`${API_BASE}/audio-lab/folder-batch/jobs/${encodeURIComponent(jobId)}/outputs${suffix}`);
   return handleResponse(response);
 }
 

@@ -1,6 +1,59 @@
 export const FOLDER_BATCH_APPLIED_MESSAGE =
   "Parámetros aplicados al procesamiento masivo. Escanea la carpeta para iniciar un nuevo job.";
 
+export const ADVANCED_SWEEP_APPLIED_MESSAGE =
+  "Par\u00e1metros aplicados. Escanea la carpeta y ejecuta un nuevo job.";
+
+export const USER_AUDIO_BATCH_PRESETS_STORAGE_KEY = "user_audio_batch_presets";
+
+export const ADVANCED_SWEEP_PROFILE_CONFIGS = [
+  ["high_confidence_config", "Alta confianza", 2300, 3300, -50, 0.27],
+  ["balanced_config", "Equilibrada recomendada", 2200, 3200, -50, 0.25],
+  ["high_recall_config", "Mayor cobertura", 2200, 3300, -51, 0.23],
+  ["exploratory_config", "Exploratoria", 2000, 3500, -52, 0.2],
+].map(([name, label, frequency_min_hz, frequency_max_hz, threshold_dbfs, min_band_ratio]) => ({
+  name,
+  label,
+  frequency_min_hz,
+  frequency_max_hz,
+  threshold_dbfs,
+  min_band_energy_ratio: min_band_ratio,
+  min_band_ratio,
+  min_activity_seconds: 0.25,
+  min_silence_seconds: 0.35,
+  padding_seconds: 0.12,
+  clip_duration_seconds: 3,
+  max_segment_seconds: 5,
+  bandpass: true,
+  noise_reduce: false,
+  normalize: false,
+  preset: "personalizado",
+  detection_only: false,
+}));
+
+export function advancedSweepPayloadForType(basePayload = {}, sweepType = "adaptive_general") {
+  if (sweepType === "pristimantis_simoterus_rain_wind") {
+    return {
+      ...basePayload,
+      mode: "advanced_sweep",
+      calibration_mode: "advanced_sweep",
+      species_profile: "pristimantis_simoterus_rain_wind",
+      configs: [],
+      detection_only: false,
+    };
+  }
+  if (sweepType === "custom") {
+    return { ...basePayload, mode: "adaptive_advanced_sweep", calibration_mode: "adaptive_advanced_sweep", configs: [], detection_only: false };
+  }
+  return {
+    ...basePayload,
+    mode: "adaptive_advanced_sweep",
+    calibration_mode: "adaptive_advanced_sweep",
+    configs: [],
+    detection_only: false,
+  };
+}
+
 export const ZERO_CANDIDATE_VARIANTS = {
   sensitive: {
     name: "more_sensitive_variant",
@@ -150,6 +203,100 @@ export function normalizeFolderBatchOutputsResponse(payload = {}) {
     total: Number(source.total ?? source.count ?? outputs.length),
     empty: outputs.length === 0,
     message: source.message || (outputs.length === 0 ? "No hay clips generados para este job. La configuracion no produjo candidatos." : ""),
+  };
+}
+
+export const FOLDER_BATCH_BULK_ACTIONS = {
+  confirm: {
+    review_status: "confirmed",
+    label: "Confirmar seleccionados como especie objetivo",
+    requiresStrongConfirmation: true,
+  },
+  exclude: {
+    review_status: "excluded",
+    label: "Excluir seleccionados",
+    requiresStrongConfirmation: false,
+  },
+  human_voice: {
+    review_status: "human_voice",
+    label: "Marcar como voz humana",
+    requiresStrongConfirmation: false,
+  },
+  car_motor: {
+    review_status: "car_motor",
+    label: "Marcar como carro/motor",
+    requiresStrongConfirmation: false,
+  },
+  bird: {
+    review_status: "bird",
+    label: "Marcar como ave",
+    requiresStrongConfirmation: false,
+  },
+  unsure: {
+    review_status: "unsure",
+    label: "Enviar seleccionados a revisar",
+    requiresStrongConfirmation: false,
+  },
+};
+
+export function selectedFolderBatchOutputs(outputs = [], selectedIds = new Set()) {
+  const selected = selectedIds instanceof Set ? selectedIds : new Set(selectedIds || []);
+  return outputs.filter((output) => selected.has(output.id));
+}
+
+export function folderBatchSelectionCountLabel(selectedIds = new Set(), filteredCount = 0, allFilteredSelected = false) {
+  const count = selectedIds instanceof Set ? selectedIds.size : Number(selectedIds?.length || 0);
+  if (allFilteredSelected) return `${filteredCount} seleccionados filtrados`;
+  return `${count} seleccionados`;
+}
+
+export function folderBatchSelectionAfterPageSelect(current = new Set(), pageItems = []) {
+  const next = new Set(current);
+  pageItems.forEach((item) => {
+    if (item?.id) next.add(item.id);
+  });
+  return next;
+}
+
+export function folderBatchSelectionAfterFilteredSelect(filteredItems = []) {
+  return new Set(filteredItems.map((item) => item?.id).filter(Boolean));
+}
+
+export function buildFolderBatchBulkPayload({
+  actionKey,
+  jobId,
+  selectedOutputs = [],
+  speciesLabel = "",
+  reviewer = "web",
+  notes = "",
+  confirmationText = "",
+} = {}) {
+  const action = FOLDER_BATCH_BULK_ACTIONS[actionKey];
+  if (!action) throw new Error("Accion masiva no soportada.");
+  return {
+    job_id: jobId,
+    output_ids: selectedOutputs.map((output) => output.id).filter(Boolean),
+    review_status: action.review_status,
+    species_label: speciesLabel,
+    reviewer,
+    notes,
+    confirmation_text: confirmationText,
+  };
+}
+
+export function defaultAudioLabDatasetExportForm(speciesLabel = "") {
+  return {
+    dataset_name: `${speciesLabel || "dataset"}_semilla`,
+    species_label: speciesLabel || "",
+    version: "v0.1",
+    include_confirmed_positives: true,
+    include_negatives_excluded: true,
+    include_hard_negatives: true,
+    exclude_unsure: true,
+    include_contaminants: true,
+    contaminants_as_negative: false,
+    copy_clips: false,
+    split_by_source_audio_path: true,
   };
 }
 
@@ -487,5 +634,129 @@ export function buildFolderBatchFormFromCalibration({
     create_manifest: true,
     exploratory_mode: Boolean(exploratory),
     calibration_mode_tag: exploratory ? configName : "",
+  };
+}
+
+const USER_PRESET_FIELDS = [
+  "frequency_min_hz",
+  "frequency_max_hz",
+  "threshold_dbfs",
+  "min_band_ratio",
+  "min_band_energy_ratio",
+  "min_activity_seconds",
+  "min_silence_seconds",
+  "padding_seconds",
+  "clip_duration_seconds",
+  "max_segment_seconds",
+  "bandpass",
+  "noise_reduce",
+  "normalize",
+  "create_clips",
+  "create_manifest",
+  "discard_empty",
+  "mark_contaminants",
+  "detect_contaminants_heuristic",
+];
+
+export function sanitizeUserPreset(raw = {}) {
+  const now = new Date().toISOString();
+  const preset = {
+    id: String(raw.id || `preset_${Date.now()}`),
+    name: String(raw.name || "Preset usuario").trim() || "Preset usuario",
+    species_label: String(raw.species_label || raw.target_label || "").trim(),
+    description: String(raw.description || "").trim(),
+    favorite: Boolean(raw.favorite),
+    source: "user",
+    created_at: raw.created_at || now,
+    updated_at: raw.updated_at || now,
+  };
+  for (const key of USER_PRESET_FIELDS) {
+    if (raw[key] !== undefined && raw[key] !== null && raw[key] !== "") preset[key] = raw[key];
+  }
+  if (preset.min_band_energy_ratio === undefined && preset.min_band_ratio !== undefined) preset.min_band_energy_ratio = preset.min_band_ratio;
+  if (preset.min_band_ratio === undefined && preset.min_band_energy_ratio !== undefined) preset.min_band_ratio = preset.min_band_energy_ratio;
+  return preset;
+}
+
+export function buildUserPresetFromFolderBatchForm(form = {}, overrides = {}) {
+  const picked = {};
+  for (const key of USER_PRESET_FIELDS) {
+    if (form[key] !== undefined && form[key] !== null) picked[key] = form[key];
+  }
+  return sanitizeUserPreset({
+    ...picked,
+    id: overrides.id,
+    name: overrides.name || "Preset usuario",
+    species_label: overrides.species_label ?? form.target_label,
+    description: overrides.description,
+    favorite: overrides.favorite,
+    mark_contaminants: form.detect_contaminants_heuristic,
+  });
+}
+
+export function applyAudioBatchPresetToForm(currentForm = {}, preset = {}) {
+  const picked = {};
+  for (const key of USER_PRESET_FIELDS) {
+    if (preset[key] !== undefined && preset[key] !== null) picked[key] = preset[key];
+  }
+  return {
+    ...currentForm,
+    ...picked,
+    preset: preset.id || preset.name || "personalizado",
+    target_label: preset.species_label || currentForm.target_label,
+    detect_contaminants_heuristic: valueOrFallback(preset, "mark_contaminants", valueOrFallback(preset, "detect_contaminants_heuristic", currentForm.detect_contaminants_heuristic)),
+  };
+}
+
+export function upsertUserPreset(presets = [], preset = {}) {
+  const normalized = sanitizeUserPreset(preset);
+  return [...presets.filter((item) => item.id !== normalized.id), { ...normalized, updated_at: new Date().toISOString() }];
+}
+
+export function deleteUserPreset(presets = [], preset = {}) {
+  if (preset.source === "system" || preset.system) return presets;
+  return presets.filter((item) => item.id !== preset.id);
+}
+
+export function duplicateAudioBatchPreset(preset = {}, overrides = {}) {
+  return sanitizeUserPreset({
+    ...preset,
+    ...overrides,
+    id: overrides.id || `preset_${Date.now()}`,
+    name: overrides.name || `${preset.name || "Preset"} copia`,
+    source: "user",
+    created_at: undefined,
+    updated_at: undefined,
+  });
+}
+
+export function updateFolderBatchDraftField(draft = {}, key, value) {
+  const next = { ...draft, [key]: value };
+  if (key === "min_band_ratio") next.min_band_energy_ratio = value;
+  if (key === "min_band_energy_ratio") next.min_band_ratio = value;
+  return next;
+}
+
+export function applyPresetToFolderBatchDraft(draft = {}, preset = {}) {
+  return applyAudioBatchPresetToForm(draft, preset);
+}
+
+export function shouldSkipHeavyFolderBatchRefresh({ batchEditing = false, quiet = false, forceHeavy = false, status = "" } = {}) {
+  if (forceHeavy) return false;
+  return Boolean(batchEditing && quiet && ["pending", "running", "paused"].includes(String(status || "")));
+}
+
+export function paginateFolderBatchOutputs(outputs = [], page = 1, pageSize = 50) {
+  const safeOutputs = Array.isArray(outputs) ? outputs : [];
+  const safePageSize = Math.max(1, Number(pageSize) || 50);
+  const totalPages = Math.max(1, Math.ceil(safeOutputs.length / safePageSize));
+  const safePage = Math.min(Math.max(1, Number(page) || 1), totalPages);
+  const start = (safePage - 1) * safePageSize;
+  return {
+    items: safeOutputs.slice(start, start + safePageSize),
+    page: safePage,
+    pageSize: safePageSize,
+    total: safeOutputs.length,
+    totalPages,
   };
 }
